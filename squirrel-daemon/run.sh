@@ -1,0 +1,2 @@
+sudo pigpiod
+# uv run 
