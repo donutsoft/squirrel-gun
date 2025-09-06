@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, send_file
+from flask import Flask, render_template, request, jsonify, send_file, Response
 from hardware_controllers.PanTiltController import PanTiltController
 from hardware_controllers.WebcamController import WebcamController
 from pathlib import Path
@@ -39,3 +39,10 @@ def webcam_capture():
         return jsonify({"error": str(e)}), 500
     # Return the image directly so visiting the endpoint displays it
     return send_file(saved, mimetype='image/jpeg')
+
+
+@app.get('/webcam/stream')
+def webcam_stream():
+    # Delegate streaming logic to the WebcamController
+    return Response(webcam.mjpeg(fps=15, quality=80, boundary='frame'),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
