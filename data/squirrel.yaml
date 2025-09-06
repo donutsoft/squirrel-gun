@@ -1,0 +1,9 @@
+path: dataset
+train: images/train
+val: images/val
+# Optional test set; comment out if unused
+# test: images/test
+
+# Single-class: squirrel
+names: [squirrel]
+
