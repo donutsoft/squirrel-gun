@@ -16,7 +16,8 @@ class PanTiltController:
 
     
     def setPan(self, angle):
-        self._setAngle(self.pan_pin, angle)
+        # Invert pan so UI left/right match physical movement
+        self._setAngle(self.pan_pin, 180 - angle)
 
     def setTilt(self, angle):
         self._setAngle(self.tilt_pin, angle)

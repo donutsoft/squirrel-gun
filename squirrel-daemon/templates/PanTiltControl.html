@@ -47,12 +47,38 @@
         <section class="panel">
           <h2>Webcam</h2>
           <div>
+            <label style="display:inline-flex; align-items:center; gap:6px; margin-bottom:6px;">
+              <input id="record-clicks" type="checkbox" checked />
+              <span>Record clicks (save degrees)</span>
+            </label>
             <img id="webcam-stream" src="/webcam/stream" alt="Live Webcam Stream"
-                 style="width:200%; max-height: 720px; object-fit: contain; background:#000; border-radius:10px; border:1px solid #111827;" />
+                 style="width:200%; max-height: 720px; object-fit: contain; background:#000; border-radius:10px; border:1px solid #111827; cursor: crosshair;" />
             <div class="hint">Live MJPEG stream. If blank, check camera connection.</div>
           </div>
         </section>
       </div>
+
+      <section class="panel" style="margin-top: 16px;">
+        <h2>Recent Clicks</h2>
+        <div class="hint">Latest recorded clicks with angles and coordinates.</div>
+        <div class="actions" style="margin: 8px 0; display:flex; gap:8px;">
+          <button id="clear-clicks" class="danger">Clear Clicks</button>
+        </div>
+        <div style="overflow:auto; max-height: 300px; border:1px solid #111827; border-radius:8px;">
+          <table style="width:100%; border-collapse:collapse;">
+            <thead>
+              <tr>
+                <th style="text-align:left; padding:6px;">Time</th>
+                <th style="text-align:right; padding:6px;">Pan</th>
+                <th style="text-align:right; padding:6px;">Tilt</th>
+                <th style="text-align:right; padding:6px;">X,Y</th>
+                <th style="text-align:right; padding:6px;">W×H</th>
+              </tr>
+            </thead>
+            <tbody id="clicks-body"></tbody>
+          </table>
+        </div>
+      </section>
     </div>
 
     <script>
@@ -88,6 +114,108 @@
       // Send when manually editing inputs
       pan.addEventListener('change', send);
       tilt.addEventListener('change', send);
+
+      // Record clicks on the webcam image with coordinates and current angles
+      const img = byId('webcam-stream');
+      const recordToggle = byId('record-clicks');
+      img.addEventListener('click', async (e) => {
+        const rect = img.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        // For aiming, send normalized coordinates only (0..1)
+        const aimPayload = {
+          x: Math.min(1, Math.max(0, x / rect.width)),
+          y: Math.min(1, Math.max(0, y / rect.height))
+        };
+        // For click logging, send pixel coords and element size
+        const clickPayload = {
+          x: Math.round(x),
+          y: Math.round(y),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height)
+        };
+        try {
+          if (recordToggle.checked) {
+            // Only record click; do NOT move servos
+            const recRes = await fetch('/api/click', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(clickPayload)
+            });
+            if (!recRes.ok) {
+              console.error('Failed to record click');
+            }
+            await refreshClicks();
+          } else {
+            // Aim the system and update inputs from the response
+            const aimRes = await fetch('/api/aim', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(aimPayload)
+            });
+            if (!aimRes.ok) {
+              console.error('Failed to aim');
+            } else {
+              const data = await aimRes.json();
+              if (typeof data.pan === 'number') pan.value = data.pan.toFixed(1);
+              if (typeof data.tilt === 'number') tilt.value = data.tilt.toFixed(1);
+            }
+          }
+        } catch (err) {
+          console.error('Error handling click', err);
+        }
+      });
+
+      async function fetchClicks(limit = 100) {
+        try {
+          const res = await fetch(`/api/clicks?limit=${limit}`);
+          if (!res.ok) return { rows: [] };
+          return await res.json();
+        } catch (_) {
+          return { rows: [] };
+        }
+      }
+
+      function formatTime(ts) {
+        try { return new Date(ts * 1000).toLocaleString(); } catch { return String(ts); }
+      }
+
+      async function refreshClicks() {
+        const { rows } = await fetchClicks(100);
+        const tb = document.getElementById('clicks-body');
+        tb.innerHTML = '';
+        for (const r of rows) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td style="padding:6px;">${formatTime(r.created_at)}</td>
+            <td style="padding:6px; text-align:right;">${r.pan?.toFixed?.(1) ?? r.pan}</td>
+            <td style="padding:6px; text-align:right;">${r.tilt?.toFixed?.(1) ?? r.tilt}</td>
+            <td style="padding:6px; text-align:right;">${r.x_px}, ${r.y_px}</td>
+            <td style="padding:6px; text-align:right;">${r.img_w} × ${r.img_h}</td>
+          `;
+          tb.appendChild(tr);
+        }
+      }
+
+      // Initial load
+      refreshClicks();
+
+      // Clear clicks handler
+      const clearBtn = document.getElementById('clear-clicks');
+      clearBtn?.addEventListener('click', async () => {
+        const yes = confirm('Clear all recorded clicks? This cannot be undone.');
+        if (!yes) return;
+        clearBtn.disabled = true;
+        try {
+          const res = await fetch('/api/clicks/clear', { method: 'POST' });
+          if (!res.ok) console.error('Failed to clear clicks');
+        } catch (e) {
+          console.error('Error clearing clicks', e);
+        } finally {
+          clearBtn.disabled = false;
+          await refreshClicks();
+        }
+      });
     </script>
   </body>
   </html>

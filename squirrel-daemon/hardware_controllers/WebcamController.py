@@ -49,10 +49,8 @@ class WebcamController:
     def capture(self, outfile: Path) -> Path:
         outfile = outfile.resolve()
         outfile.parent.mkdir(parents=True, exist_ok=True)
-        data: Optional[bytes] = None
-        with self._cond:
-            if self._latest:
-                data = self._latest
+        # Fast path: if we already have a recent frame, use it without locking
+        data: Optional[bytes] = self._latest if self._latest else None
         if data:
             with open(outfile, 'wb') as f:
                 f.write(data)
