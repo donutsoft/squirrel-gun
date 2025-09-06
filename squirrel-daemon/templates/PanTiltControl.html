@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Squirrel Control</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <div class="card">
+      <header>
+        <img src="{{ url_for('static', filename='logo.svg') }}" alt="Sad Squirrel Logo" />
+        <div>
+          <h1>Squirrel Pan/Tilt</h1>
+          <div class="sub">Control panel with pan/tilt and a sad squirrel.</div>
+        </div>
+      </header>
+
+      <div class="grid">
+        <section class="panel">
+          <h2>Direction</h2>
+          <div class="control-pad">
+            <button class="up accent" id="btn-up" aria-label="Up">Up ⬆</button>
+            <button class="left" id="btn-left" aria-label="Left">Left ⬅</button>
+            <button class="right" id="btn-right" aria-label="Right">Right ➡</button>
+            <button class="down accent" id="btn-down" aria-label="Down">Down ⬇</button>
+          </div>
+          <div class="hint">Buttons nudge values by 5° (0–180).</div>
+        </section>
+
+        <section class="panel">
+          <h2>Angles</h2>
+          <div class="inputs">
+            <label>
+              Pan Angle (°)
+              <input id="pan" type="number" min="0" max="180" value="90" />
+            </label>
+            <label>
+              Tilt Angle (°)
+              <input id="tilt" type="number" min="0" max="180" value="90" />
+            </label>
+          </div>
+          <div class="actions">
+            <button id="reset" class="danger">Center (90/90)</button>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <script>
+      const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
+      const byId = (id) => document.getElementById(id);
+      const pan = byId('pan');
+      const tilt = byId('tilt');
+      const step = 5;
+
+      const send = async () => {
+        const body = { pan: clamp(Number(pan.value), 0, 180), tilt: clamp(Number(tilt.value), 0, 180) };
+        try {
+          const res = await fetch('/api/pan-tilt', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+          });
+          if (!res.ok) console.error('Failed to set pan/tilt');
+        } catch (e) {
+          console.error('Error setting pan/tilt', e);
+        }
+      };
+
+      const setPan = (v) => { pan.value = clamp(Number(v), 0, 180); send(); };
+      const setTilt = (v) => { tilt.value = clamp(Number(v), 0, 180); send(); };
+
+      byId('btn-left').addEventListener('click', () => setPan(Number(pan.value) - step));
+      byId('btn-right').addEventListener('click', () => setPan(Number(pan.value) + step));
+      byId('btn-up').addEventListener('click', () => setTilt(Number(tilt.value) - step));
+      byId('btn-down').addEventListener('click', () => setTilt(Number(tilt.value) + step));
+      byId('reset').addEventListener('click', () => { setPan(90); setTilt(90); });
+
+      // Send when manually editing inputs
+      pan.addEventListener('change', send);
+      tilt.addEventListener('change', send);
+    </script>
+  </body>
+  </html>

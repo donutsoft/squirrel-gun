@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Sad squirrel logo">
+  <defs>
+    <linearGradient id="g1" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0%" stop-color="#f5f3ff" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#e5e7eb" stop-opacity="0.8"/>
+    </linearGradient>
+    <linearGradient id="fur" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#9ca3af"/>
+      <stop offset="100%" stop-color="#6b7280"/>
+    </linearGradient>
+    <filter id="soft">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="0.8"/>
+    </filter>
+  </defs>
+
+  <rect width="512" height="512" rx="32" fill="#0f172a"/>
+  <g transform="translate(256,270)">
+    <!-- Tail -->
+    <path d="M 140 -40 C 110 -110, 40 -140, -10 -130 C -40 -126, -60 -110, -64 -80 C -70 -30, -28 -20, -12 -44 C 10 -74, 56 -58, 78 -32 C 102 -4, 92 26, 68 40 C 42 56, 6 42, -6 16 C -12 2, -28 -4, -40 4 C -18 66, 66 84, 112 52 C 164 16, 174 -6, 140 -40 Z" fill="url(#fur)"/>
+
+    <!-- Body -->
+    <ellipse cx="-40" cy="10" rx="90" ry="70" fill="url(#fur)"/>
+    <!-- Head -->
+    <ellipse cx="-90" cy="-36" rx="54" ry="48" fill="url(#fur)"/>
+    <!-- Ear -->
+    <path d="M -120 -82 C -130 -110, -96 -116, -86 -92 Z" fill="#6b7280"/>
+    <path d="M -72 -86 C -70 -110, -100 -118, -110 -92 Z" fill="#6b7280" opacity="0.9"/>
+
+    <!-- Eyes (sad) -->
+    <circle cx="-108" cy="-44" r="7" fill="#111827"/>
+    <circle cx="-78" cy="-46" r="7" fill="#111827"/>
+    <path d="M -118 -56 Q -108 -64 -98 -56" stroke="#111827" stroke-width="3" fill="none"/>
+    <path d="M -90 -58 Q -80 -66 -70 -58" stroke="#111827" stroke-width="3" fill="none"/>
+
+    <!-- Nose/Mouth (frown) -->
+    <circle cx="-92" cy="-30" r="4" fill="#1f2937"/>
+    <path d="M -104 -18 Q -92 -28 -80 -18" stroke="#1f2937" stroke-width="4" fill="none"/>
+
+    <!-- Belly -->
+    <ellipse cx="-44" cy="18" rx="44" ry="40" fill="url(#g1)" opacity="0.7"/>
+
+    <!-- Paws -->
+    <circle cx="-10" cy="46" r="12" fill="#6b7280"/>
+    <circle cx="-64" cy="58" r="10" fill="#6b7280"/>
+
+    <!-- Ground shadow -->
+    <ellipse cx="-10" cy="90" rx="140" ry="18" fill="#000" opacity="0.25" filter="url(#soft)"/>
+  </g>
+
+  <!-- Title text -->
+  <g transform="translate(24,40)">
+    <text x="0" y="0" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto" font-size="28" fill="#e5e7eb" opacity="0.9">Squirrel</text>
+    <text x="0" y="26" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto" font-size="16" fill="#9ca3af">Feeling a little blue</text>
+  </g>
+</svg>
+
