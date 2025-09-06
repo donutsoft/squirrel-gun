@@ -44,5 +44,5 @@ def webcam_capture():
 @app.get('/webcam/stream')
 def webcam_stream():
     # Delegate streaming logic to the WebcamController
-    return Response(webcam.mjpeg(fps=15, quality=80, boundary='frame'),
+    return Response(webcam.mjpeg(fps=60, quality=80, boundary='frame'),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
