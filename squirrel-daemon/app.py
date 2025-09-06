@@ -1,9 +1,12 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, send_file
 from hardware_controllers.PanTiltController import PanTiltController
+from hardware_controllers.WebcamController import WebcamController
+from pathlib import Path
 
 # Serve static files from root (e.g., "/logo.svg").
 app = Flask(__name__, static_url_path='')
 pantilt = PanTiltController()
+webcam = WebcamController()
 
 
 @app.route('/')
@@ -24,3 +27,15 @@ def set_pan_tilt():
 
     pantilt.setPanTilt(pan, tilt)
     return jsonify({"status": "ok", "pan": pan, "tilt": tilt})
+
+
+@app.get('/webcam/capture')
+def webcam_capture():
+    # Save latest capture in static folder so it can also be served directly if desired
+    out_path = Path(__file__).parent / 'static' / 'webcam.jpg'
+    try:
+        saved = webcam.capture(out_path)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    # Return the image directly so visiting the endpoint displays it
+    return send_file(saved, mimetype='image/jpeg')
