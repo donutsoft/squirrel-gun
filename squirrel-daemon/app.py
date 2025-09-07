@@ -14,7 +14,13 @@ store = ClickStore()
 # Track current angles in-process (servos don't report position)
 # Store current angles as a single immutable tuple so reads/writes are atomic
 global current
-current = (90.0, 90.0)
+current = (135.0, 90.0)
+
+# Attempt to center hardware on startup; ignore failures if hardware not present
+try:
+    pantilt.setPanTilt(current[0], current[1])
+except Exception as e:
+    print(f"Warning: Failed to center pan/tilt on startup: {e}")
 
 def _build_aimer(min_rows: int = 10) -> tuple[LinearAimer, int, bool]:
     """Create a fresh LinearAimer from click data in the DB.
@@ -52,6 +58,9 @@ def set_pan_tilt():
     except (ValueError, TypeError):
         return jsonify({"error": "pan/tilt must be numbers"}), 400
 
+    # Clamp to hardware limits before applying and storing
+    pan = _clamp(pan, 0.0, float(getattr(pantilt, 'PAN_MAX_DEG', 180)))
+    tilt = _clamp(tilt, 0.0, float(getattr(pantilt, 'TILT_MAX_DEG', 180)))
     pantilt.setPanTilt(pan, tilt)
     # Atomic replace of the tuple; avoids the need for locks
     global current
@@ -135,8 +144,8 @@ def aim_to_click():
     # Predict absolute pan/tilt from (u,v) using a fresh model from DB
     aimer, n_rows, trained = _build_aimer()
     pred_pan, pred_tilt = aimer.predict(u, v)
-    new_pan = _clamp(pred_pan, 0.0, 180.0)
-    new_tilt = _clamp(pred_tilt, 0.0, 180.0)
+    new_pan = _clamp(pred_pan, 0.0, float(getattr(pantilt, 'PAN_MAX_DEG', 180)))
+    new_tilt = _clamp(pred_tilt, 0.0, float(getattr(pantilt, 'TILT_MAX_DEG', 180)))
 
     pantilt.setPanTilt(new_pan, new_tilt)
     current = (new_pan, new_tilt)
