@@ -1,0 +1,7 @@
+train: dataset/images/train
+val: dataset/images/train
+# Optional test split
+# test: dataset/images/test
+
+# Single-class: squirrel
+names: [squirrel]
