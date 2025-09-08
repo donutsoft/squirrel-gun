@@ -1,1 +1,4 @@
 .venv/
+dataset_v0/
+squirrel_yolo/
+runs/
