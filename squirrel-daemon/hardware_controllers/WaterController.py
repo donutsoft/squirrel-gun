@@ -1,11 +1,17 @@
+from .MqttClient import MqttClient
+import time
+
 class WaterController:
     def __init__(self):
-        pass
+        self.mqtt = MqttClient()
 
-    def start_watering(self, duration):
+    def startWatering(self, duration):
         print(f"Starting watering for {duration} seconds.")
+        self.mqtt.publish("zigbee2mqtt/hose/set", '{"state": "ON"}')
+        time.sleep(duration)
+        self.mqtt.publish("zigbee2mqtt/hose/set", '{"state": "OFF"}')
         # Code to activate water pump for 'duration' seconds
 
-    def stop_watering(self):
+    def stopWatering(self):
         print("Stopping watering.")
-        # Code to deactivate water pump
+        self.mqtt.publish("zigbee2mqtt/hose/set", '{"state": "OFF"}')
