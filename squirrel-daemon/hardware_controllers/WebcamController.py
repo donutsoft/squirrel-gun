@@ -27,11 +27,32 @@ class WebcamController:
         return index
 
     def _open_capture(self) -> "cv2.VideoCapture":
-        cap = cv2.VideoCapture(self._device_index())
+        """Open the camera with settings that favor low latency.
+
+        - Request V4L2 backend when available.
+        - Set small internal buffer to avoid buildup.
+        - Prefer MJPG fourcc to reduce encode latency on UVC cams.
+        """
+        try:
+            cap = cv2.VideoCapture(self._device_index(), cv2.CAP_V4L2)
+        except Exception:
+            cap = cv2.VideoCapture(self._device_index())
+
         if self.width:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.width))
         if self.height:
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.height))
+        # Hint the backend to keep a tiny buffer (best-effort; some backends ignore it)
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        # Prefer MJPG if the camera supports it; this often drops latency on UVC devices
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+        except Exception:
+            pass
         return cap
 
     def _capture_with_opencv(self, outfile: Path) -> bool:
@@ -66,31 +87,48 @@ class WebcamController:
         self._running = True
 
         def _producer() -> None:
-            delay = 1.0 / self._fps
+            # Emit at configured FPS, but always publish the freshest frame.
+            # Reads run in a tight loop; only latest frame at each tick is encoded.
+            target_dt = 1.0 / self._fps
+            next_emit = time.monotonic()
             cap = self._open_capture()
             failures = 0
+            last_frame = None
             try:
                 while self._running:
                     ok, frame = cap.read()
-                    if not ok or frame is None:
+                    if ok and frame is not None:
+                        last_frame = frame
+                        failures = 0
+                    else:
                         failures += 1
-                        time.sleep(0.05)
+                        time.sleep(0.005)
                         if failures >= 40:
                             cap.release()
                             cap = self._open_capture()
                             failures = 0
-                        continue
-                    failures = 0
-                    ok, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), self._quality])
-                    if not ok:
-                        time.sleep(delay)
-                        continue
-                    jpg = encoded.tobytes()
-                    with self._cond:
-                        self._latest = jpg
-                        self._seq += 1
-                        self._cond.notify_all()
-                    time.sleep(delay)
+                        # Even on failure, check if it's time to emit (we'll skip if no frame)
+
+                    now = time.monotonic()
+                    if now >= next_emit:
+                        if last_frame is not None:
+                            ok2, encoded = cv2.imencode(
+                                '.jpg', last_frame, [int(cv2.IMWRITE_JPEG_QUALITY), self._quality]
+                            )
+                            if ok2:
+                                jpg = encoded.tobytes()
+                                with self._cond:
+                                    self._latest = jpg
+                                    self._seq += 1
+                                    self._cond.notify_all()
+                        # Schedule next emit; if we're behind, skip ahead without sleeping
+                        next_emit += target_dt
+                        # Avoid runaway if system time drifted or we were paused
+                        if now - next_emit > 2 * target_dt:
+                            next_emit = now + target_dt
+
+                    # Light backoff to avoid pegging CPU while still keeping latency low
+                    time.sleep(0.001)
             finally:
                 cap.release()
 

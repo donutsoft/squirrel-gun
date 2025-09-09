@@ -1,6 +1,7 @@
 from flask import Flask, render_template, request, jsonify, send_file, Response
 from hardware_controllers.PanTiltController import PanTiltController
 from hardware_controllers.WebcamController import WebcamController
+from hardware_controllers.WaterController import WaterController
 from pathlib import Path
 from db import ClickStore
 from aim_model import LinearAimer
@@ -10,6 +11,7 @@ app = Flask(__name__, static_url_path='')
 pantilt = PanTiltController()
 webcam = WebcamController()
 store = ClickStore()
+water = WaterController()
 
 # Track current angles in-process (servos don't report position)
 # Store current angles as a single immutable tuple so reads/writes are atomic
@@ -82,9 +84,45 @@ def webcam_capture():
 
 @app.get('/webcam/stream')
 def webcam_stream():
+    """MJPEG stream with low-latency defaults and tunable params.
+
+    Query params:
+      - fps: int, frames per second (default 5)
+      - quality: int 1-100, JPEG quality (default 75)
+      - width, height: ints; if provided, update controller target resolution
+    """
+    try:
+        fps = int(request.args.get('fps', '5'))
+    except ValueError:
+        fps = 5
+    try:
+        quality = int(request.args.get('quality', '75'))
+    except ValueError:
+        quality = 75
+    # Optional resolution hints
+    try:
+        w = int(request.args['width']) if 'width' in request.args else None
+    except ValueError:
+        w = None
+    try:
+        h = int(request.args['height']) if 'height' in request.args else None
+    except ValueError:
+        h = None
+    if w and w > 0:
+        webcam.width = w
+    if h and h > 0:
+        webcam.height = h
+
     # Delegate streaming logic to the WebcamController
-    return Response(webcam.mjpeg(fps=5, quality=80, boundary='frame'),
+    resp = Response(webcam.mjpeg(fps=fps, quality=quality, boundary='frame'),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
+    # Disable buffering/caching in browsers and proxies to avoid growing delay
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    # If behind nginx, this disables proxy buffering for this response
+    resp.headers['X-Accel-Buffering'] = 'no'
+    return resp
 
 
 @app.post('/api/click')
@@ -191,3 +229,20 @@ def train_model():
     if not trained:
         return jsonify({"error": "not enough clicks to train (need >= 10)", "n_rows": n_rows}), 400
     return jsonify({"status": "ok", "model": model.to_dict(), "n_rows": n_rows, "trained": trained})
+
+
+@app.post('/api/water/fire')
+def water_fire():
+    """Fire water for a short duration (default 2s)."""
+    data = request.get_json(silent=True) or {}
+    try:
+        duration = float(data.get('duration', 2))
+    except (TypeError, ValueError):
+        duration = 2.0
+    # Clamp to a reasonable range to avoid accidents
+    duration = _clamp(duration, 0.1, 10.0)
+    try:
+        water.startWatering(duration)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"status": "ok", "duration": duration})

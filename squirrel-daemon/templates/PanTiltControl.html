@@ -59,6 +59,14 @@
       </div>
 
       <section class="panel" style="margin-top: 16px;">
+        <h2>Water</h2>
+        <div class="actions" style="display:flex; gap:8px; align-items:center;">
+          <button id="fire-water" class="accent danger">Fire 💦 (2s)</button>
+          <div class="hint">Sends a command to spray water for 2 seconds.</div>
+        </div>
+      </section>
+
+      <section class="panel" style="margin-top: 16px;">
         <h2>Recent Clicks</h2>
         <div class="hint">Latest recorded clicks with angles and coordinates.</div>
         <div class="actions" style="margin: 8px 0; display:flex; gap:8px;">
@@ -214,6 +222,26 @@
         } finally {
           clearBtn.disabled = false;
           await refreshClicks();
+        }
+      });
+
+      // Fire water (2 seconds)
+      const fireBtn = document.getElementById('fire-water');
+      fireBtn?.addEventListener('click', async () => {
+        fireBtn.disabled = true;
+        try {
+          const res = await fetch('/api/water/fire', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ duration: 2 })
+          });
+          if (!res.ok) console.error('Failed to fire water');
+          await res.json().catch(() => ({}));
+        } catch (e) {
+          console.error('Error firing water', e);
+        } finally {
+          // Ensure button re-enables even if the request blocks briefly
+          setTimeout(() => { fireBtn.disabled = false; }, 2100);
         }
       });
     </script>
