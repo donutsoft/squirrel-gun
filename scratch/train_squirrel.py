@@ -141,7 +141,6 @@ def main(argv: list[str] | None = None) -> None:
         amp=args.amp,
     )
 
-
 if __name__ == "__main__":
     main()
 
