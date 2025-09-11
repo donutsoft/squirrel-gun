@@ -51,6 +51,20 @@
               <input id="record-clicks" type="checkbox" checked />
               <span>Record clicks (save degrees)</span>
             </label>
+            <div style="display:flex; gap:12px; align-items:center; margin:6px 0; flex-wrap:wrap;">
+              <label style="display:inline-flex; align-items:center; gap:6px;">
+                <input id="motion-enable" type="checkbox" />
+                <span>Enable motion overlay</span>
+              </label>
+              <label style="display:inline-flex; align-items:center; gap:6px;">
+                <input id="motion-follow" type="checkbox" />
+                <span>Follow motion with laser</span>
+              </label>
+              <label style="display:inline-flex; align-items:center; gap:6px;">
+                <span>Min area (px)</span>
+                <input id="motion-min-area" type="number" min="1" step="1" value="800" style="width: 100px;" />
+              </label>
+            </div>
             <img id="webcam-stream" src="/webcam/stream" alt="Live Webcam Stream"
                  style="width:200%; max-height: 720px; object-fit: contain; background:#000; border-radius:10px; border:1px solid #111827; cursor: crosshair;" />
             <div class="hint">Live MJPEG stream. If blank, check camera connection.</div>
@@ -126,6 +140,9 @@
       // Record clicks on the webcam image with coordinates and current angles
       const img = byId('webcam-stream');
       const recordToggle = byId('record-clicks');
+      const motionEnable = byId('motion-enable');
+      const motionFollow = byId('motion-follow');
+      const motionMinArea = byId('motion-min-area');
       img.addEventListener('click', async (e) => {
         const rect = img.getBoundingClientRect();
         const x = e.clientX - rect.left;
@@ -207,6 +224,75 @@
 
       // Initial load
       refreshClicks();
+
+      // Motion config and follow
+      async function setMotionConfig({ enabled, min_area, alpha } = {}) {
+        try {
+          await fetch('/api/motion/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled, min_area, alpha })
+          });
+        } catch (e) {
+          console.error('Failed to set motion config', e);
+        }
+      }
+
+      async function setFollowEnabled(enabled) {
+        try {
+          if (enabled && !motionEnable.checked) {
+            motionEnable.checked = true;
+            await setMotionConfig({ enabled: true, min_area: Number(motionMinArea.value) || 800 });
+          }
+          await fetch('/api/motion/follow', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: !!enabled })
+          });
+        } catch (e) {
+          console.error('Failed to set follow', e);
+        }
+      }
+
+      motionEnable.addEventListener('change', () => {
+        setMotionConfig({ enabled: motionEnable.checked, min_area: Number(motionMinArea.value) || 800 });
+      });
+      motionFollow.addEventListener('change', () => setFollowEnabled(motionFollow.checked));
+
+      function debounce(fn, ms) {
+        let t = null;
+        return (...args) => {
+          if (t) clearTimeout(t);
+          t = setTimeout(() => fn(...args), ms);
+        };
+      }
+
+      const sendMinArea = debounce(() => {
+        const minArea = Math.max(1, Math.floor(Number(motionMinArea.value) || 800));
+        motionMinArea.value = String(minArea);
+        setMotionConfig({ enabled: motionEnable.checked, min_area: minArea });
+      }, 250);
+      motionMinArea.addEventListener('change', sendMinArea);
+      motionMinArea.addEventListener('input', sendMinArea);
+
+      // Initialize UI from backend config
+      (async function initMotionConfig() {
+        try {
+          const res = await fetch('/api/motion/config');
+          if (res.ok) {
+            const cfg = await res.json();
+            if (typeof cfg.enabled === 'boolean') motionEnable.checked = cfg.enabled;
+            if (typeof cfg.min_area === 'number') motionMinArea.value = String(cfg.min_area);
+          }
+        } catch (_) {}
+        try {
+          const r2 = await fetch('/api/motion/follow');
+          if (r2.ok) {
+            const f = await r2.json();
+            if (typeof f.enabled === 'boolean') motionFollow.checked = f.enabled;
+          }
+        } catch (_) {}
+      })();
 
       // Clear clicks handler
       const clearBtn = document.getElementById('clear-clicks');

@@ -5,6 +5,8 @@ from hardware_controllers.WaterController import WaterController
 from pathlib import Path
 from db import ClickStore
 from aim_model import LinearAimer
+from event_bus import EventBus
+import time
 
 # Serve static files from root (e.g., "/logo.svg").
 app = Flask(__name__, static_url_path='')
@@ -12,11 +14,20 @@ pantilt = PanTiltController()
 webcam = WebcamController()
 store = ClickStore()
 water = WaterController()
+bus = EventBus()
+
+# Wire WebcamController to publish motion events to the bus
+try:
+    webcam.set_motion_publisher(bus.publish)
+except Exception:
+    pass
 
 # Track current angles in-process (servos don't report position)
 # Store current angles as a single immutable tuple so reads/writes are atomic
 global current
 current = (135.0, 90.0)
+follow_motion_enabled = True
+_last_follow_ts = 0.0
 
 # Attempt to center hardware on startup; ignore failures if hardware not present
 try:
@@ -113,6 +124,57 @@ def webcam_stream():
     if h and h > 0:
         webcam.height = h
 
+    # Optional motion detection controls
+    motion_q = request.args.get('motion')
+    min_area_q = request.args.get('motion_min_area')
+    alpha_q = request.args.get('motion_alpha')
+    bg_mode_q = request.args.get('bg_mode')
+    prefer_tracking_q = request.args.get('prefer_tracking')
+    frame_skip_q = request.args.get('frame_skip')
+    scale_q = request.args.get('scale')
+    if (motion_q is not None or min_area_q is not None or alpha_q is not None or
+        bg_mode_q is not None or prefer_tracking_q is not None or frame_skip_q is not None or scale_q is not None):
+        try:
+            enabled = (str(motion_q).strip() not in ('0', 'false', 'False', 'None', '')) if motion_q is not None else getattr(webcam, '_motion_enabled', False)
+        except Exception:
+            enabled = True
+        min_area = None
+        alpha = None
+        try:
+            if min_area_q is not None:
+                min_area = int(min_area_q)
+        except Exception:
+            pass
+        try:
+            if alpha_q is not None:
+                alpha = float(alpha_q)
+        except Exception:
+            pass
+        bg_mode = None
+        if bg_mode_q is not None:
+            bg_mode = str(bg_mode_q)
+        prefer_tracking = None
+        if prefer_tracking_q is not None:
+            prefer_tracking = not (str(prefer_tracking_q).strip() in ('0', 'false', 'False'))
+        frame_skip = None
+        try:
+            if frame_skip_q is not None:
+                frame_skip = int(frame_skip_q)
+        except Exception:
+            frame_skip = None
+        scale = None
+        try:
+            if scale_q is not None:
+                scale = float(scale_q)
+        except Exception:
+            scale = None
+        try:
+            webcam.set_motion_detection(enabled=enabled, min_area=min_area, alpha=alpha,
+                                        bg_mode=bg_mode, prefer_tracking=prefer_tracking,
+                                        frame_skip=frame_skip, scale=scale)
+        except Exception:
+            pass
+
     # Delegate streaming logic to the WebcamController
     resp = Response(webcam.mjpeg(fps=fps, quality=quality, boundary='frame'),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
@@ -123,6 +185,75 @@ def webcam_stream():
     # If behind nginx, this disables proxy buffering for this response
     resp.headers['X-Accel-Buffering'] = 'no'
     return resp
+
+
+@app.post('/api/motion/config')
+def motion_config():
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get('enabled', True))
+    min_area = data.get('min_area')
+    alpha = data.get('alpha')
+    persist_ms = data.get('persist_ms')
+    bg_mode = data.get('bg_mode')
+    prefer_tracking = data.get('prefer_tracking')
+    frame_skip = data.get('frame_skip')
+    scale = data.get('scale')
+    try:
+        webcam.set_motion_detection(enabled=enabled, min_area=min_area, alpha=alpha, persist_ms=persist_ms,
+                                    bg_mode=bg_mode, prefer_tracking=prefer_tracking,
+                                    frame_skip=frame_skip, scale=scale)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({
+        "status": "ok",
+        "enabled": enabled,
+        "min_area": min_area,
+        "alpha": alpha,
+        "persist_ms": persist_ms,
+        "bg_mode": bg_mode,
+        "prefer_tracking": prefer_tracking,
+        "frame_skip": frame_skip,
+        "scale": scale,
+    })
+
+
+@app.get('/api/motion/center')
+def motion_center():
+    info = webcam.motion_info()
+    present = info.get('rect') is not None and info.get('enabled')
+    return jsonify({
+        'present': bool(present),
+        'enabled': bool(info.get('enabled')),
+        'rect': info.get('rect'),
+        'center': info.get('center'),
+        'u': info.get('u'),
+        'v': info.get('v'),
+        'width': info.get('width'),
+        'height': info.get('height'),
+    })
+
+
+@app.get('/api/motion/config')
+def motion_config_get():
+    try:
+        cfg = webcam.motion_config()
+        return jsonify(cfg)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post('/api/motion/follow')
+def motion_follow_set():
+    global follow_motion_enabled
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get('enabled', False))
+    follow_motion_enabled = enabled
+    return jsonify({"status": "ok", "enabled": enabled})
+
+
+@app.get('/api/motion/follow')
+def motion_follow_get():
+    return jsonify({"enabled": bool(globals().get('follow_motion_enabled', False))})
 
 
 @app.post('/api/click')
@@ -197,6 +328,41 @@ def aim_to_click():
         "model": aimer.to_dict(),
         "n_rows": n_rows, "trained": trained,
     })
+
+
+# Subscribe to motion events and aim when enabled (throttled)
+def _on_motion(evt: dict) -> None:
+    global follow_motion_enabled, _last_follow_ts, current
+    try:
+        if not follow_motion_enabled:
+            return
+        u = evt.get('u')
+        v = evt.get('v')
+        if u is None or v is None:
+            return
+        now = time.time()
+        # Throttle movements to ~5 Hz
+        if (now - _last_follow_ts) < 0.18:
+            return
+        _last_follow_ts = now
+
+        aimer, _n, _trained = _build_aimer()
+        pred_pan, pred_tilt = aimer.predict(float(u), float(v))
+        new_pan = _clamp(pred_pan, 0.0, float(getattr(pantilt, 'PAN_MAX_DEG', 180)))
+        new_tilt = _clamp(pred_tilt, 0.0, float(getattr(pantilt, 'TILT_MAX_DEG', 180)))
+        pantilt.setPanTilt(new_pan, new_tilt)
+        # Briefly suppress motion to avoid feedback from the laser dot and servo motion
+        try:
+            webcam.suppress_motion(0.5)
+        except Exception:
+            pass
+        current = (new_pan, new_tilt)
+    except Exception:
+        # Avoid crashing the bus on handler errors
+        pass
+
+
+bus.subscribe('motion', _on_motion)
 
 
 @app.get('/api/clicks')
