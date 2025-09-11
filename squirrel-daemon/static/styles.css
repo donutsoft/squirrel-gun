@@ -53,8 +53,16 @@ header .sub {
   grid-template-columns: 1fr 1fr;
   gap: 16px;
 }
+/* Place controls on the left (stacked) and webcam on the right spanning rows */
+.grid .controls-direction { grid-column: 1; grid-row: 1; }
+.grid .controls-angles { grid-column: 1; grid-row: 2; }
+.grid .webcam-panel { grid-column: 2; grid-row: 1 / span 2; display: flex; flex-direction: column; }
 @media (max-width: 720px) {
   .grid { grid-template-columns: 1fr; }
+  /* On small screens, stack naturally */
+  .grid .controls-direction,
+  .grid .controls-angles,
+  .grid .webcam-panel { grid-column: 1; grid-row: auto; }
 }
 .panel {
   background: #0b1220cc;

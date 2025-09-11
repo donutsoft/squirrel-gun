@@ -5,6 +5,7 @@ from pathlib import Path
 import sqlite3
 import time
 from typing import Iterable, List, Dict, Any, Optional
+import json
 
 
 @dataclass
@@ -65,6 +66,14 @@ class ClickStore:
                 """
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_aim_created_at ON aim_logs(created_at DESC)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
 
     def record(self, pan: float, tilt: float, x_px: float, y_px: float, img_w: float, img_h: float) -> int:
         with self._connect() as conn:
@@ -107,3 +116,38 @@ class ClickStore:
                 (limit, offset),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # --- Settings ---
+    def set_setting(self, key: str, value: Any) -> None:
+        data = json.dumps(value)
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(key), data),
+            )
+
+    def get_setting(self, key: str, default: Any = None) -> Any:
+        with self._connect() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key = ?", (str(key),)).fetchone()
+        if not row:
+            return default
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return default
+
+    def get_settings(self, keys: Iterable[str]) -> Dict[str, Any]:
+        ks = list(keys)
+        if not ks:
+            return {}
+        placeholders = ",".join(["?"] * len(ks))
+        with self._connect() as conn:
+            rows = conn.execute(f"SELECT key, value FROM settings WHERE key IN ({placeholders})", ks).fetchall()
+        out: Dict[str, Any] = {}
+        for r in rows:
+            k = r[0]
+            try:
+                out[k] = json.loads(r[1])
+            except Exception:
+                pass
+        return out

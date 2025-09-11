@@ -25,7 +25,41 @@ except Exception:
 
 # Subscribe webcam controller to the bus to start/extend recording on motion
 try:
+    # Initial values will be overridden by persisted settings load below if present
     webcam.set_event_bus(bus, record_on_motion=True, duration_sec=30.0)
+except Exception:
+    pass
+
+# Load persisted settings and apply to webcam and follow-motion
+try:
+    persisted = store.get_settings([
+        'motion.enabled', 'motion.min_area', 'motion.alpha', 'motion.persist_ms', 'motion.bg_mode',
+        'motion.prefer_tracking', 'motion.frame_skip', 'motion.scale',
+        'record.record_on_motion', 'record.duration_sec', 'record.snapshot_on_motion',
+        'follow_motion.enabled',
+    ])
+    # Apply motion settings (use current config as defaults)
+    cur_motion = webcam.motion_config()
+    webcam.set_motion_detection(
+        enabled=bool(persisted.get('motion.enabled', cur_motion.get('enabled'))),
+        min_area=persisted.get('motion.min_area', cur_motion.get('min_area')),
+        alpha=persisted.get('motion.alpha', cur_motion.get('alpha')),
+        persist_ms=persisted.get('motion.persist_ms', cur_motion.get('persist_ms')),
+        bg_mode=persisted.get('motion.bg_mode', cur_motion.get('bg_mode')),
+        prefer_tracking=persisted.get('motion.prefer_tracking', cur_motion.get('prefer_tracking')),
+        frame_skip=persisted.get('motion.frame_skip', cur_motion.get('frame_skip')),
+        scale=persisted.get('motion.scale', cur_motion.get('scale')),
+    )
+    # Apply recording settings
+    cur_rec = webcam.get_recording_config()
+    webcam.set_recording_config(
+        record_on_motion=persisted.get('record.record_on_motion', cur_rec.get('record_on_motion')),
+        duration_sec=persisted.get('record.duration_sec', cur_rec.get('duration_sec')),
+        snapshot_on_motion=persisted.get('record.snapshot_on_motion', cur_rec.get('snapshot_on_motion')),
+    )
+    # Apply follow motion flag
+    if 'follow_motion.enabled' in persisted:
+        follow_motion_enabled = bool(persisted['follow_motion.enabled'])
 except Exception:
     pass
 
@@ -33,7 +67,8 @@ except Exception:
 # Store current angles as a single immutable tuple so reads/writes are atomic
 global current
 current = (135.0, 90.0)
-follow_motion_enabled = True
+# Default: don't aim the laser on motion (can be overridden by persisted setting)
+follow_motion_enabled = False
 _last_follow_ts = 0.0
 
 # Attempt to center hardware on startup; ignore failures if hardware not present
@@ -115,14 +150,121 @@ def recordings_api():
     return jsonify({'files': files})
 
 
-_REC_NAME_RE = re.compile(r'^rec_\d{8}_\d{6}\.mp4$')
+@app.get('/snapshots')
+def snapshots_page():
+    base = Path(__file__).parent / 'static' / 'recordings' / 'shots'
+    files = []
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        for p in base.glob('*.jpg'):
+            try:
+                stat = p.stat()
+                files.append({
+                    'name': p.name,
+                    'url': f"/recordings/shots/{p.name}",
+                    'size': stat.st_size,
+                    'mtime': stat.st_mtime,
+                    'display_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime)),
+                })
+            except Exception:
+                pass
+        files.sort(key=lambda x: x['mtime'], reverse=True)
+    except Exception:
+        pass
+    return render_template('Snapshots.html', files=files)
+
+
+@app.get('/api/recording/config')
+def recording_config_get():
+    try:
+        cfg = webcam.get_recording_config()
+        return jsonify(cfg)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post('/api/recording/config')
+def recording_config_set():
+    data = request.get_json(silent=True) or {}
+    record_on_motion = data.get('record_on_motion')
+    duration_sec = data.get('duration_sec')
+    snapshot_on_motion = data.get('snapshot_on_motion')
+    try:
+        webcam.set_recording_config(record_on_motion=record_on_motion, duration_sec=duration_sec, snapshot_on_motion=snapshot_on_motion)
+        try:
+            if record_on_motion is not None: store.set_setting('record.record_on_motion', bool(record_on_motion))
+            if duration_sec is not None: store.set_setting('record.duration_sec', float(duration_sec))
+            if snapshot_on_motion is not None: store.set_setting('record.snapshot_on_motion', bool(snapshot_on_motion))
+        except Exception:
+            pass
+        return jsonify({"status": "ok", **webcam.get_recording_config()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get('/api/recording/status')
+def recording_status():
+    try:
+        active = webcam.is_recording()
+        ends_at = None
+        seconds_left = None
+        path = None
+        try:
+            ends_at = getattr(webcam, '_recording_end_ts', 0.0)
+            seconds_left = max(0.0, float(ends_at - time.time())) if active else 0.0
+        except Exception:
+            pass
+        try:
+            p = getattr(webcam, '_recording_path', None)
+            path = str(p) if p else None
+        except Exception:
+            path = None
+        return jsonify({
+            'active': bool(active),
+            'ends_at': ends_at,
+            'seconds_left': seconds_left,
+            'path': path,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post('/api/recording/start')
+def recording_start():
+    data = request.get_json(silent=True) or {}
+    try:
+        duration = float(data.get('duration', 10))
+    except Exception:
+        duration = 10.0
+    try:
+        p = webcam.start_recording(duration_sec=max(1.0, duration), extend=False)
+        return jsonify({
+            'status': 'ok',
+            'started': bool(p is not None),
+            'path': str(p) if p else getattr(webcam, '_recording_path', None),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post('/api/recording/stop')
+def recording_stop():
+    try:
+        webcam.stop_recording()
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+_REC_NAME_RE = re.compile(r'^(rec_(\d{8}_\d{6}))\.mp4$')
 
 
 @app.post('/api/recordings/delete')
 def recordings_delete():
     data = request.get_json(silent=True) or {}
     name = str(data.get('name', '')).strip()
-    if not _REC_NAME_RE.match(name):
+    m = _REC_NAME_RE.match(name)
+    if not m:
         return jsonify({"error": "invalid filename"}), 400
     base = Path(__file__).parent / 'static' / 'recordings'
     path = base / name
@@ -131,7 +273,19 @@ def recordings_delete():
         if not path.resolve().is_file() or base.resolve() not in path.resolve().parents:
             return jsonify({"error": "file not found"}), 404
         path.unlink()
-        return jsonify({"status": "ok", "deleted": name})
+        # Also delete associated snapshots (same timestamp)
+        ts = m.group(2)
+        shots_dir = base / 'shots'
+        deleted_shots = []
+        # Delete the exact match and any suffix variants (older naming)
+        for sp in [shots_dir / f'snap_{ts}.jpg'] + list(shots_dir.glob(f'snap_{ts}*.jpg')):
+            try:
+                if sp.is_file():
+                    sp.unlink()
+                    deleted_shots.append(sp.name)
+            except Exception:
+                pass
+        return jsonify({"status": "ok", "deleted": name, "deleted_shots": deleted_shots})
     except FileNotFoundError:
         return jsonify({"error": "file not found"}), 404
     except Exception as e:
@@ -142,6 +296,7 @@ def recordings_delete():
 def recordings_clear():
     base = Path(__file__).parent / 'static' / 'recordings'
     deleted = 0
+    deleted_shots = 0
     try:
         for p in base.glob('*.mp4'):
             try:
@@ -149,9 +304,17 @@ def recordings_clear():
                 deleted += 1
             except Exception:
                 pass
+        # Also clear all snapshots
+        shots_dir = base / 'shots'
+        for sp in shots_dir.glob('*.jpg'):
+            try:
+                sp.unlink()
+                deleted_shots += 1
+            except Exception:
+                pass
     except Exception as e:
-        return jsonify({"error": str(e), "deleted": deleted}), 500
-    return jsonify({"status": "ok", "deleted": deleted})
+        return jsonify({"error": str(e), "deleted": deleted, "deleted_shots": deleted_shots}), 500
+    return jsonify({"status": "ok", "deleted": deleted, "deleted_shots": deleted_shots})
 
 
 @app.post('/api/pan-tilt')
@@ -298,6 +461,18 @@ def motion_config():
                                     frame_skip=frame_skip, scale=scale)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    # Persist provided fields
+    try:
+        if 'enabled' in data: store.set_setting('motion.enabled', bool(enabled))
+        if min_area is not None: store.set_setting('motion.min_area', int(min_area))
+        if alpha is not None: store.set_setting('motion.alpha', float(alpha))
+        if persist_ms is not None: store.set_setting('motion.persist_ms', int(persist_ms))
+        if bg_mode is not None: store.set_setting('motion.bg_mode', str(bg_mode))
+        if prefer_tracking is not None: store.set_setting('motion.prefer_tracking', bool(prefer_tracking))
+        if frame_skip is not None: store.set_setting('motion.frame_skip', int(frame_skip))
+        if scale is not None: store.set_setting('motion.scale', float(scale))
+    except Exception:
+        pass
     return jsonify({
         "status": "ok",
         "enabled": enabled,
@@ -324,7 +499,36 @@ def motion_center():
         'v': info.get('v'),
         'width': info.get('width'),
         'height': info.get('height'),
+        'fg_pixels': info.get('fg_pixels'),
+        'largest_area': info.get('largest_area'),
+        'peak_largest_area': info.get('peak_largest_area'),
     })
+
+
+@app.get('/api/motion/counters')
+def motion_counters():
+    try:
+        return jsonify(webcam.motion_counters())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.post('/api/motion/counters/reset')
+def motion_counters_reset():
+    try:
+        webcam.reset_motion_counters()
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.post('/api/motion/peak/reset')
+def motion_peak_reset():
+    try:
+        webcam.reset_motion_peak()
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.get('/api/motion/config')
@@ -342,6 +546,10 @@ def motion_follow_set():
     data = request.get_json(silent=True) or {}
     enabled = bool(data.get('enabled', False))
     follow_motion_enabled = enabled
+    try:
+        store.set_setting('follow_motion.enabled', bool(enabled))
+    except Exception:
+        pass
     return jsonify({"status": "ok", "enabled": enabled})
 
 

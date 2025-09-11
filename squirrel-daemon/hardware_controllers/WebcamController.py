@@ -18,12 +18,17 @@ class WebcamController:
         self._cond = threading.Condition()
         # Motion detection settings/state
         self._motion_enabled = True
-        self._motion_min_area = 800  # pixels in full-res image
+        # Increase default area to reduce sensitivity on noise
+        self._motion_min_area = 1500  # pixels in full-res image
         self._motion_alpha = 0.05    # background learning rate
         self._bg_gray = None         # type: ignore
         self._last_motion_rect = None  # type: ignore
+        self._last_fg_pixels = 0
+        self._last_largest_area = 0
+        self._peak_largest_area = 0
         # Temporal persistence and suppression
-        self._persist_ms = 0  # 0 disables persistence; report immediately
+        # Require brief persistence to avoid flicker/false positives
+        self._persist_ms = 250  # milliseconds; 0 disables persistence
         self._candidate_rect = None  # type: ignore
         self._candidate_start_ts = 0.0
         self._suppress_until_ts = 0.0
@@ -37,6 +42,10 @@ class WebcamController:
         self._motion_frame_skip = 2   # compute motion every N+1 frames (2 => ~5 Hz @ 15 fps)
         self._motion_scale = 0.5      # process motion at half resolution
 
+        # Diagnostics for motion → recording path
+        self._motion_events_published = 0
+        self._motion_triggers_received = 0
+
         # Recording state and config
         from pathlib import Path as _P
         self._recordings_dir = _P(__file__).resolve().parents[1] / 'static' / 'recordings'
@@ -44,8 +53,16 @@ class WebcamController:
             self._recordings_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
+        # Screenshots directory (per-motion snapshot)
+        self._snapshots_dir = self._recordings_dir / 'shots'
+        try:
+            self._snapshots_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
         # No internal auto-record on motion; use event bus subscription instead
         self._record_on_motion_enabled = True
+        self._record_duration_sec = 30.0
+        self._snapshot_on_motion_enabled = True
         self._recording_active = False
         self._recording_end_ts = 0.0
         self._video_writer = None  # type: ignore
@@ -123,6 +140,38 @@ class WebcamController:
             writer = None
         return writer
 
+    def save_snapshot(self, out_path: Optional[Path] = None) -> Optional[Path]:
+        """Save the latest available JPEG frame to a file.
+
+        If out_path is None, write to `static/recordings/shots/snap_YYYYmmDD_HHMMSSfff.jpg`.
+        Returns the path on success, or None if no frame available.
+        """
+        # Get latest in-memory JPEG if available
+        data: Optional[bytes] = None
+        with self._cond:
+            if self._latest:
+                data = bytes(self._latest)
+
+        ts = time.time()
+        if out_path is None:
+            fname = time.strftime('snap_%Y%m%d_%H%M%S', time.localtime(ts)) + f"{int((ts % 1) * 1000):03d}.jpg"
+            out_path = (self._snapshots_dir / fname)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if data:
+            try:
+                with open(out_path, 'wb') as f:
+                    f.write(data)
+                return out_path
+            except Exception:
+                return None
+        # Fallback: capture a fresh frame directly
+        try:
+            ok = self._capture_with_opencv(out_path)
+            return out_path if ok else None
+        except Exception:
+            return None
+
     def start_recording(self, duration_sec: float = 30.0, extend: bool = True) -> Optional[Path]:
         """Start recording for duration_sec seconds.
 
@@ -169,20 +218,76 @@ class WebcamController:
         """
         self._bus = bus
         self._record_on_motion_enabled = bool(record_on_motion)
+        try:
+            self._record_duration_sec = float(duration_sec)
+        except Exception:
+            self._record_duration_sec = 30.0
 
         def _on_motion(evt: Any) -> None:
             if not self._record_on_motion_enabled:
                 return
             try:
-                self.start_recording(duration_sec=float(duration_sec), extend=True)
+                self._motion_triggers_received += 1
+                # Start or extend recording; take a snapshot only on new start
+                started_path = self.start_recording(duration_sec=float(getattr(self, '_record_duration_sec', 30.0)), extend=True)
+                if started_path is not None and bool(getattr(self, '_snapshot_on_motion_enabled', True)):
+                    try:
+                        # Name snapshot using the same timestamp as the recording
+                        rec_name = getattr(started_path, 'name', '')
+                        if rec_name.startswith('rec_') and rec_name.endswith('.mp4') and len(rec_name) >= 4 + 15 + 4:
+                            ts = rec_name[len('rec_'):-len('.mp4')]
+                            shot_path = self._snapshots_dir / f'snap_{ts}.jpg'
+                        else:
+                            ts = time.strftime('%Y%m%d_%H%M%S')
+                            shot_path = self._snapshots_dir / f'snap_{ts}.jpg'
+                        # Prefer the exact triggering frame if present on the event
+                        data = None
+                        try:
+                            data = evt.get('jpeg') if isinstance(evt, dict) else None
+                        except Exception:
+                            data = None
+                        if data:
+                            try:
+                                shot_path.parent.mkdir(parents=True, exist_ok=True)
+                                with open(shot_path, 'wb') as f:
+                                    f.write(data)
+                            except Exception:
+                                # Fallback to grabbing latest frame if writing bytes failed
+                                self.save_snapshot(out_path=shot_path)
+                        else:
+                            # Fallback to latest available
+                            self.save_snapshot(out_path=shot_path)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
+        # Subscribe for motion events to trigger recording
         try:
             if hasattr(bus, 'subscribe'):
                 bus.subscribe('motion', _on_motion)
         except Exception:
             pass
+
+    # Recording config helpers
+    def get_recording_config(self) -> dict:
+        return {
+            'record_on_motion': bool(self._record_on_motion_enabled),
+            'duration_sec': float(self._record_duration_sec),
+            'snapshot_on_motion': bool(self._snapshot_on_motion_enabled),
+        }
+
+    def set_recording_config(self, record_on_motion: Optional[bool] = None, duration_sec: Optional[float] = None, snapshot_on_motion: Optional[bool] = None) -> None:
+        if record_on_motion is not None:
+            self._record_on_motion_enabled = bool(record_on_motion)
+        if duration_sec is not None:
+            try:
+                self._record_duration_sec = max(1.0, float(duration_sec))
+            except Exception:
+                pass
+        if snapshot_on_motion is not None:
+            self._snapshot_on_motion_enabled = bool(snapshot_on_motion)
+
 
     def start_stream(self, fps: int = 15, quality: int = 80) -> None:
         self._fps = max(1, int(fps))
@@ -255,19 +360,38 @@ class WebcamController:
                                     thresh = cv2.morphologyEx(thresh, cv2.MORPH_DILATE, kernel, iterations=1)
 
                                     cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                                    # Count foreground pixels to help tune sensitivity
+                                    try:
+                                        fg_small = int(cv2.countNonZero(thresh))
+                                    except Exception:
+                                        fg_small = 0
                                     min_area_small = int(float(self._motion_min_area) * (s * s))
                                     for c in cnts:
                                         if c is None:
                                             continue
                                         x, y, w, h = cv2.boundingRect(c)
                                         area = w * h
-                                        if area >= max(1, int(min_area_small)):
+                                        if area >= int(min_area_small):
                                             # Scale back to full-res coordinates
                                             X = int(round(x / s))
                                             Y = int(round(y / s))
                                             W = int(round(w / s))
                                             H = int(round(h / s))
                                             candidates.append((X, Y, W, H, int(round(area / (s * s)))))
+
+                                    # Store metrics (foreground count as current sample; largest area 'sticky' until next non-zero)
+                                    try:
+                                        self._last_fg_pixels = int(round(fg_small / (s * s)))
+                                    except Exception:
+                                        self._last_fg_pixels = fg_small
+                                    try:
+                                        cur_largest = int(max([r[4] for r in candidates])) if candidates else 0
+                                        if cur_largest > 0:
+                                            self._last_largest_area = cur_largest
+                                            if cur_largest > self._peak_largest_area:
+                                                self._peak_largest_area = cur_largest
+                                    except Exception:
+                                        pass
 
                                 best = None
                                 # Choose candidate: prefer overlap with previous to "follow" target
@@ -321,8 +445,18 @@ class WebcamController:
                                                 'center': (float(cx), float(cy)),
                                                 'u': u, 'v': v,
                                                 'width': int(self.width), 'height': int(self.height),
+                                                'fg_pixels': int(self._last_fg_pixels),
+                                                'largest_area': int(self._last_largest_area),
                                             }
+                                            # Attach the triggering frame as JPEG for snapshot fidelity
                                             try:
+                                                okj, enc = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), self._quality])
+                                                if okj:
+                                                    evt['jpeg'] = enc.tobytes()
+                                            except Exception:
+                                                pass
+                                            try:
+                                                self._motion_events_published += 1
                                                 self._publish('motion', evt)
                                             except Exception:
                                                 pass
@@ -351,8 +485,18 @@ class WebcamController:
                                                     'center': (float(cx), float(cy)),
                                                     'u': u, 'v': v,
                                                     'width': int(self.width), 'height': int(self.height),
+                                                    'fg_pixels': int(self._last_fg_pixels),
+                                                    'largest_area': int(self._last_largest_area),
                                                 }
+                                                # Attach the triggering frame as JPEG for snapshot fidelity
                                                 try:
+                                                    okj, enc = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), self._quality])
+                                                    if okj:
+                                                        evt['jpeg'] = enc.tobytes()
+                                                except Exception:
+                                                    pass
+                                                try:
+                                                    self._motion_events_published += 1
                                                     self._publish('motion', evt)
                                                 except Exception:
                                                     pass
@@ -473,6 +617,9 @@ class WebcamController:
             'v': None,
             'width': int(self.width) if self.width else None,
             'height': int(self.height) if self.height else None,
+            'fg_pixels': int(self._last_fg_pixels),
+            'largest_area': int(self._last_largest_area),
+            'peak_largest_area': int(self._peak_largest_area),
         }
         if rect is not None and self.width and self.height:
             x, y, w, h = rect
@@ -487,6 +634,9 @@ class WebcamController:
                 info['v'] = None
         return info
 
+    def reset_motion_peak(self) -> None:
+        self._peak_largest_area = 0
+
     def motion_config(self) -> dict:
         """Return current motion detector configuration."""
         return {
@@ -499,6 +649,17 @@ class WebcamController:
             'frame_skip': int(getattr(self, '_motion_frame_skip', 0)),
             'scale': float(getattr(self, '_motion_scale', 1.0)),
         }
+
+    # Diagnostics helpers
+    def motion_counters(self) -> dict:
+        return {
+            'events_published': int(self._motion_events_published),
+            'triggers_received': int(self._motion_triggers_received),
+        }
+
+    def reset_motion_counters(self) -> None:
+        self._motion_events_published = 0
+        self._motion_triggers_received = 0
 
     def set_motion_publisher(self, publish: Optional[Callable[[str, Any], None]]) -> None:
         """Set a callback to publish motion events with signature (topic, data)."""
@@ -516,7 +677,7 @@ class WebcamController:
         self._motion_enabled = bool(enabled)
         if min_area is not None:
             try:
-                self._motion_min_area = max(1, int(min_area))
+                self._motion_min_area = max(0, int(min_area))
             except Exception:
                 pass
         if alpha is not None:

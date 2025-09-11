@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Snapshots</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <div class="card">
+      <header>
+        <img src="{{ url_for('static', filename='logo.png') }}" alt="Sad Squirrel Logo" />
+        <div>
+          <h1>Snapshots</h1>
+          <div class="sub">Per-motion stills saved alongside recordings.</div>
+          <div style="margin-top:6px; display:flex; gap:12px;">
+            <a href="/" style="text-decoration: none;">⟵ Control</a>
+            <a href="/recordings" style="text-decoration: none;">🎥 Recordings</a>
+          </div>
+        </div>
+      </header>
+
+      <section class="panel">
+        <h2>Saved Snapshots</h2>
+        {% if files and files|length > 0 %}
+        <div class="hint">Newest first. Click to view full size or download.</div>
+        <div style="display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px;">
+          {% for f in files %}
+          <div class="panel" style="padding:8px;">
+            <div style="font-weight:600; font-size: 14px;">{{ f.name }}</div>
+            <div class="hint" style="margin:4px 0 8px 0;">
+              {{ (f.size // 1024) }} KB • {{ f.display_time }}
+            </div>
+            <a href="{{ f.url }}" target="_blank" style="display:block;">
+              <img src="{{ f.url }}" alt="{{ f.name }}" style="width:100%; border-radius:8px; background:#000; object-fit:contain;" />
+            </a>
+            <div style="margin-top:6px; display:flex; gap:8px; align-items:center;">
+              <a href="{{ f.url }}" download>Download</a>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+        {% else %}
+          <div class="hint">No snapshots yet. They are captured once at recording start.</div>
+        {% endif %}
+      </section>
+    </div>
+  </body>
+  </html>

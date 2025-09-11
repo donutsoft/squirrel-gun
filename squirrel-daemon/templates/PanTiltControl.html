@@ -14,12 +14,13 @@
           <h1>Squirrel Pan/Tilt</h1>
           <div class="sub">Control panel with pan/tilt and a sad squirrel.</div>
           <div style="margin-top:6px;">
-            <a href="/recordings" style="text-decoration: none;">🎥 View Recordings</a>
+            <a href="/recordings" style="text-decoration: none; margin-right:12px;">🎥 Recordings</a>
+            <a href="/snapshots" style="text-decoration: none;">🖼️ Snapshots</a>
           </div>
         </div>
       </header>
       <div class="grid">
-        <section class="panel">
+        <section class="panel controls-direction">
           <h2>Direction</h2>
           <div class="control-pad">
             <button class="up accent" id="btn-up" aria-label="Up">Up ⬆</button>
@@ -30,7 +31,7 @@
           <div class="hint">Buttons nudge values by 5° (Pan 0–270, Tilt 0–180).</div>
         </section>
 
-        <section class="panel">
+        <section class="panel controls-angles">
           <h2>Angles</h2>
           <div class="inputs">
             <label>
@@ -47,7 +48,7 @@
           </div>
         </section>
 
-        <section class="panel">
+        <section class="panel webcam-panel">
           <h2>Webcam</h2>
           <div>
             <label style="display:inline-flex; align-items:center; gap:6px; margin-bottom:6px;">
@@ -65,11 +66,40 @@
               </label>
               <label style="display:inline-flex; align-items:center; gap:6px;">
                 <span>Min area (px)</span>
-                <input id="motion-min-area" type="number" min="1" step="1" value="800" style="width: 100px;" />
+                <input id="motion-min-area" type="number" min="0" step="1" value="800" style="width: 100px;" />
+              </label>
+              <label style="display:inline-flex; align-items:center; gap:6px;">
+                <span>Persist (ms)</span>
+                <input id="motion-persist-ms" type="number" min="0" step="50" value="250" style="width: 100px;" />
               </label>
             </div>
+            <div style="display:flex; align-items:center; gap:16px; margin: 4px 0; flex-wrap:wrap;">
+              <div class="hint" id="motion-stats">Last motion: 0 px (largest: 0, peak: 0)</div>
+              <div id="rec-ind" style="display:inline-flex; align-items:center; gap:6px; font-weight:600;">
+                <span id="rec-dot" style="width:10px; height:10px; border-radius:50%; background:#6b7280; display:inline-block;"></span>
+                <span id="rec-text" style="color:#6b7280;">Idle</span>
+                <span id="rec-eta" class="hint" style="margin-left:6px;"></span>
+              </div>
+              <button id="btn-reset-peak" class="danger" style="padding:4px 8px;">Reset Peak</button>
+            </div>
+            <div style="display:flex; gap:12px; align-items:center; margin:6px 0; flex-wrap:wrap;">
+              <label style="display:inline-flex; align-items:center; gap:6px;">
+                <input id="record-on-motion" type="checkbox" />
+                <span>Record on motion</span>
+              </label>
+              <label style="display:inline-flex; align-items:center; gap:6px;">
+                <input id="snapshot-on-motion" type="checkbox" />
+                <span>Save snapshot on motion</span>
+              </label>
+              <label style="display:inline-flex; align-items:center; gap:6px;">
+                <span>Duration (s)</span>
+                <input id="record-duration" type="number" min="1" step="1" value="30" style="width: 100px;" />
+              </label>
+              <button id="btn-rec-start" class="accent">Start Recording</button>
+              <button id="btn-rec-stop" class="danger">Stop</button>
+            </div>
             <img id="webcam-stream" src="/webcam/stream" alt="Live Webcam Stream"
-                 style="width:200%; max-height: 720px; object-fit: contain; background:#000; border-radius:10px; border:1px solid #111827; cursor: crosshair;" />
+                 style="width:100%; max-height: 720px; object-fit: contain; background:#000; border-radius:10px; border:1px solid #111827; cursor: crosshair;" />
             <div class="hint">Live MJPEG stream. If blank, check camera connection.</div>
           </div>
         </section>
@@ -229,12 +259,12 @@
       refreshClicks();
 
       // Motion config and follow
-      async function setMotionConfig({ enabled, min_area, alpha } = {}) {
+      async function setMotionConfig({ enabled, min_area, alpha, persist_ms } = {}) {
         try {
           await fetch('/api/motion/config', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ enabled, min_area, alpha })
+            body: JSON.stringify({ enabled, min_area, alpha, persist_ms })
           });
         } catch (e) {
           console.error('Failed to set motion config', e);
@@ -258,7 +288,7 @@
       }
 
       motionEnable.addEventListener('change', () => {
-        setMotionConfig({ enabled: motionEnable.checked, min_area: Number(motionMinArea.value) || 800 });
+        setMotionConfig({ enabled: motionEnable.checked, min_area: Number(motionMinArea.value) || 800, persist_ms: Number(motionPersist.value) || 0 });
       });
       motionFollow.addEventListener('change', () => setFollowEnabled(motionFollow.checked));
 
@@ -273,10 +303,19 @@
       const sendMinArea = debounce(() => {
         const minArea = Math.max(1, Math.floor(Number(motionMinArea.value) || 800));
         motionMinArea.value = String(minArea);
-        setMotionConfig({ enabled: motionEnable.checked, min_area: minArea });
+        setMotionConfig({ enabled: motionEnable.checked, min_area: minArea, persist_ms: Number(motionPersist.value) || 0 });
       }, 250);
       motionMinArea.addEventListener('change', sendMinArea);
       motionMinArea.addEventListener('input', sendMinArea);
+
+      const motionPersist = byId('motion-persist-ms');
+      const sendPersist = debounce(() => {
+        const p = Math.max(0, Math.floor(Number(motionPersist.value) || 0));
+        motionPersist.value = String(p);
+        setMotionConfig({ enabled: motionEnable.checked, min_area: Math.max(1, Math.floor(Number(motionMinArea.value) || 800)), persist_ms: p });
+      }, 250);
+      motionPersist.addEventListener('change', sendPersist);
+      motionPersist.addEventListener('input', sendPersist);
 
       // Initialize UI from backend config
       (async function initMotionConfig() {
@@ -286,6 +325,7 @@
             const cfg = await res.json();
             if (typeof cfg.enabled === 'boolean') motionEnable.checked = cfg.enabled;
             if (typeof cfg.min_area === 'number') motionMinArea.value = String(cfg.min_area);
+            if (typeof cfg.persist_ms === 'number') motionPersist.value = String(cfg.persist_ms);
           }
         } catch (_) {}
         try {
@@ -295,7 +335,113 @@
             if (typeof f.enabled === 'boolean') motionFollow.checked = f.enabled;
           }
         } catch (_) {}
+        try {
+          const r3 = await fetch('/api/recording/config');
+          if (r3.ok) {
+            const rc = await r3.json();
+            byId('record-on-motion').checked = !!rc.record_on_motion;
+            byId('snapshot-on-motion').checked = !!rc.snapshot_on_motion;
+            if (typeof rc.duration_sec === 'number') byId('record-duration').value = String(Math.floor(rc.duration_sec));
+          }
+        } catch (_) {}
+        // Start polling motion stats
+        try {
+          if (window.__motionPoll) clearInterval(window.__motionPoll);
+        } catch (_) {}
+        window.__motionPoll = setInterval(async () => {
+          try {
+            const r = await fetch('/api/motion/center');
+            if (!r.ok) return;
+            const j = await r.json();
+            const fg = typeof j.fg_pixels === 'number' ? j.fg_pixels : 0;
+            const lg = typeof j.largest_area === 'number' ? j.largest_area : 0;
+            const pk = typeof j.peak_largest_area === 'number' ? j.peak_largest_area : 0;
+            const el = document.getElementById('motion-stats');
+            if (el) el.textContent = `Last motion: ${fg} px (largest: ${lg}, peak: ${pk})`;
+          } catch (_) {}
+        }, 1000);
+
+        // Poll recording status and update indicator
+        try { if (window.__recPoll) clearInterval(window.__recPoll); } catch (_) {}
+        window.__recPoll = setInterval(async () => {
+          try {
+            const r = await fetch('/api/recording/status');
+            if (!r.ok) return;
+            const s = await r.json();
+            const active = !!s.active;
+            const dot = document.getElementById('rec-dot');
+            const txt = document.getElementById('rec-text');
+            const eta = document.getElementById('rec-eta');
+            if (active) {
+              if (dot) dot.style.background = '#ef4444'; // red
+              if (txt) { txt.textContent = 'Recording'; txt.style.color = '#ef4444'; }
+              if (eta) eta.textContent = typeof s.seconds_left === 'number' ? `(${Math.ceil(s.seconds_left)}s left)` : '';
+            } else {
+              if (dot) dot.style.background = '#6b7280'; // gray
+              if (txt) { txt.textContent = 'Idle'; txt.style.color = '#6b7280'; }
+              if (eta) eta.textContent = '';
+            }
+          } catch (_) {}
+        }, 1000);
       })();
+
+      // Reset peak button
+      const btnResetPeak = document.getElementById('btn-reset-peak');
+      btnResetPeak?.addEventListener('click', async () => {
+        btnResetPeak.disabled = true;
+        try {
+          await fetch('/api/motion/peak/reset', { method: 'POST' });
+        } catch (_) {}
+        btnResetPeak.disabled = false;
+      });
+
+      async function setRecordingConfig({ record_on_motion, snapshot_on_motion, duration_sec } = {}) {
+        try {
+          await fetch('/api/recording/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ record_on_motion, snapshot_on_motion, duration_sec })
+          });
+        } catch (e) {
+          console.error('Failed to set recording config', e);
+        }
+      }
+
+      const recordOnMotion = byId('record-on-motion');
+      const snapshotOnMotion = byId('snapshot-on-motion');
+      const recordDuration = byId('record-duration');
+      recordOnMotion.addEventListener('change', () => setRecordingConfig({ record_on_motion: recordOnMotion.checked }));
+      snapshotOnMotion.addEventListener('change', () => setRecordingConfig({ snapshot_on_motion: snapshotOnMotion.checked }));
+      const sendDuration = debounce(() => {
+        const d = Math.max(1, Math.floor(Number(recordDuration.value) || 30));
+        recordDuration.value = String(d);
+        setRecordingConfig({ duration_sec: d });
+      }, 250);
+      recordDuration.addEventListener('change', sendDuration);
+      recordDuration.addEventListener('input', sendDuration);
+
+      // Manual recording controls
+      const btnRecStart = byId('btn-rec-start');
+      const btnRecStop = byId('btn-rec-stop');
+      btnRecStart?.addEventListener('click', async () => {
+        btnRecStart.disabled = true;
+        try {
+          const d = Math.max(1, Math.floor(Number(recordDuration.value) || 30));
+          await fetch('/api/recording/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ duration: d })
+          });
+        } catch (_) {}
+        setTimeout(() => { btnRecStart.disabled = false; }, 500);
+      });
+      btnRecStop?.addEventListener('click', async () => {
+        btnRecStop.disabled = true;
+        try {
+          await fetch('/api/recording/stop', { method: 'POST' });
+        } catch (_) {}
+        setTimeout(() => { btnRecStop.disabled = false; }, 500);
+      });
 
       // Clear clicks handler
       const clearBtn = document.getElementById('clear-clicks');
