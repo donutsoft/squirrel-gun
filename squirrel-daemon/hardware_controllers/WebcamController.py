@@ -34,7 +34,7 @@ class WebcamController:
         self._suppress_until_ts = 0.0
         self._publish: Optional[Callable[[str, Any], None]] = None
         # Background subtraction / selection strategy
-        self._bg_mode = 'mog2'  # one of: 'avg', 'mog2', 'knn'
+        self._bg_mode = 'knn'  # one of: 'avg', 'mog2', 'knn'
         self._bg_subtractor = None  # type: ignore
         # Prefer to follow previous target over raw largest blob
         self._prefer_tracking = True
