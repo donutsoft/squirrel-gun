@@ -37,6 +37,22 @@ class WebcamController:
         self._motion_frame_skip = 2   # compute motion every N+1 frames (2 => ~5 Hz @ 15 fps)
         self._motion_scale = 0.5      # process motion at half resolution
 
+        # Recording state and config
+        from pathlib import Path as _P
+        self._recordings_dir = _P(__file__).resolve().parents[1] / 'static' / 'recordings'
+        try:
+            self._recordings_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        # No internal auto-record on motion; use event bus subscription instead
+        self._record_on_motion_enabled = True
+        self._recording_active = False
+        self._recording_end_ts = 0.0
+        self._video_writer = None  # type: ignore
+        self._recording_path: Optional[_P] = None  # type: ignore
+        self._recording_lock = threading.Lock()
+        self._bus = None  # type: ignore
+
     def _device_index(self) -> int:
         index = 0
         if isinstance(self.device, str) and self.device.startswith("/dev/video"):
@@ -98,6 +114,75 @@ class WebcamController:
             return outfile
         self._capture_with_opencv(outfile)
         return outfile
+
+    def _open_video_writer(self, path: Path, fps: int, frame_size: tuple[int, int]):
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        try:
+            writer = cv2.VideoWriter(str(path), fourcc, float(max(1, fps)), frame_size)
+        except Exception:
+            writer = None
+        return writer
+
+    def start_recording(self, duration_sec: float = 30.0, extend: bool = True) -> Optional[Path]:
+        """Start recording for duration_sec seconds.
+
+        If a recording is already active and extend is True, extend the end time.
+        Returns the output file path for a new recording, else None.
+        """
+        out_path: Optional[Path] = None
+        with self._recording_lock:
+            now = time.time()
+            if self._recording_active:
+                if extend:
+                    self._recording_end_ts = max(self._recording_end_ts, now + max(0.1, float(duration_sec)))
+                return None
+            ts = time.strftime('%Y%m%d_%H%M%S')
+            out_path = self._recordings_dir / f'rec_{ts}.mp4'
+            self._recording_path = out_path
+            self._recording_active = True
+            self._recording_end_ts = now + max(0.1, float(duration_sec))
+            # Lazily open writer on first frame when we know size
+            self._video_writer = None
+        return out_path
+
+    def stop_recording(self) -> None:
+        with self._recording_lock:
+            self._recording_active = False
+            self._recording_end_ts = 0.0
+            try:
+                if self._video_writer is not None:
+                    self._video_writer.release()
+            except Exception:
+                pass
+            self._video_writer = None
+            self._recording_path = None
+
+    def is_recording(self) -> bool:
+        with self._recording_lock:
+            return bool(self._recording_active and time.time() < self._recording_end_ts)
+
+    # External integration: listen to event bus for motion events
+    def set_event_bus(self, bus: Any, record_on_motion: bool = True, duration_sec: float = 30.0) -> None:
+        """Subscribe to motion events on the provided bus to trigger recording.
+
+        The bus must support subscribe(topic, handler) and will receive 'motion' events.
+        """
+        self._bus = bus
+        self._record_on_motion_enabled = bool(record_on_motion)
+
+        def _on_motion(evt: Any) -> None:
+            if not self._record_on_motion_enabled:
+                return
+            try:
+                self.start_recording(duration_sec=float(duration_sec), extend=True)
+            except Exception:
+                pass
+
+        try:
+            if hasattr(bus, 'subscribe'):
+                bus.subscribe('motion', _on_motion)
+        except Exception:
+            pass
 
     def start_stream(self, fps: int = 15, quality: int = 80) -> None:
         self._fps = max(1, int(fps))
@@ -279,6 +364,34 @@ class WebcamController:
                                 # If OpenCV processing fails for any reason, continue without overlay
                                 pass
                         last_frame = frame
+                        # Handle recording lifecycle and write frames
+                        try:
+                            with self._recording_lock:
+                                nowt = time.time()
+                                if self._recording_active and nowt >= self._recording_end_ts:
+                                    # stop
+                                    try:
+                                        if self._video_writer is not None:
+                                            self._video_writer.release()
+                                    except Exception:
+                                        pass
+                                    self._video_writer = None
+                                    self._recording_active = False
+                                    self._recording_path = None
+                                if self._recording_active:
+                                    if self._video_writer is None:
+                                        h, w = frame.shape[:2]
+                                        fps_w = max(1, int(self._fps))
+                                        path = self._recording_path or (self._recordings_dir / f'rec_{time.strftime("%Y%m%d_%H%M%S")}.mp4')
+                                        self._recording_path = path
+                                        self._video_writer = self._open_video_writer(path, fps_w, (w, h))
+                                    if self._video_writer is not None:
+                                        try:
+                                            self._video_writer.write(frame)
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            pass
                         failures = 0
                     else:
                         failures += 1

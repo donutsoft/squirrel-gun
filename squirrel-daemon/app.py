@@ -7,6 +7,7 @@ from db import ClickStore
 from aim_model import LinearAimer
 from event_bus import EventBus
 import time
+import re
 
 # Serve static files from root (e.g., "/logo.svg").
 app = Flask(__name__, static_url_path='')
@@ -19,6 +20,12 @@ bus = EventBus()
 # Wire WebcamController to publish motion events to the bus
 try:
     webcam.set_motion_publisher(bus.publish)
+except Exception:
+    pass
+
+# Subscribe webcam controller to the bus to start/extend recording on motion
+try:
+    webcam.set_event_bus(bus, record_on_motion=True, duration_sec=30.0)
 except Exception:
     pass
 
@@ -58,6 +65,93 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 @app.route('/')
 def index():
     return render_template('PanTiltControl.html')
+
+
+@app.get('/recordings')
+def recordings_page():
+    base = Path(__file__).parent / 'static' / 'recordings'
+    files = []
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        for p in base.glob('*.mp4'):
+            try:
+                stat = p.stat()
+                files.append({
+                    'name': p.name,
+                    'url': f"/recordings/{p.name}",
+                    'size': stat.st_size,
+                    'mtime': stat.st_mtime,
+                    'display_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime)),
+                })
+            except Exception:
+                pass
+        files.sort(key=lambda x: x['mtime'], reverse=True)
+    except Exception:
+        pass
+    return render_template('Recordings.html', files=files)
+
+
+@app.get('/api/recordings')
+def recordings_api():
+    base = Path(__file__).parent / 'static' / 'recordings'
+    files = []
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        for p in base.glob('*.mp4'):
+            try:
+                stat = p.stat()
+                files.append({
+                    'name': p.name,
+                    'url': f"/recordings/{p.name}",
+                    'size': stat.st_size,
+                    'mtime': stat.st_mtime,
+                    'display_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime)),
+                })
+            except Exception:
+                pass
+        files.sort(key=lambda x: x['mtime'], reverse=True)
+    except Exception:
+        pass
+    return jsonify({'files': files})
+
+
+_REC_NAME_RE = re.compile(r'^rec_\d{8}_\d{6}\.mp4$')
+
+
+@app.post('/api/recordings/delete')
+def recordings_delete():
+    data = request.get_json(silent=True) or {}
+    name = str(data.get('name', '')).strip()
+    if not _REC_NAME_RE.match(name):
+        return jsonify({"error": "invalid filename"}), 400
+    base = Path(__file__).parent / 'static' / 'recordings'
+    path = base / name
+    try:
+        # Ensure path stays within the recordings dir
+        if not path.resolve().is_file() or base.resolve() not in path.resolve().parents:
+            return jsonify({"error": "file not found"}), 404
+        path.unlink()
+        return jsonify({"status": "ok", "deleted": name})
+    except FileNotFoundError:
+        return jsonify({"error": "file not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post('/api/recordings/clear')
+def recordings_clear():
+    base = Path(__file__).parent / 'static' / 'recordings'
+    deleted = 0
+    try:
+        for p in base.glob('*.mp4'):
+            try:
+                p.unlink()
+                deleted += 1
+            except Exception:
+                pass
+    except Exception as e:
+        return jsonify({"error": str(e), "deleted": deleted}), 500
+    return jsonify({"status": "ok", "deleted": deleted})
 
 
 @app.post('/api/pan-tilt')
