@@ -39,8 +39,10 @@ class WebcamController:
         # Prefer to follow previous target over raw largest blob
         self._prefer_tracking = True
         # Performance controls
-        self._motion_frame_skip = 2   # compute motion every N+1 frames (2 => ~5 Hz @ 15 fps)
+        self._motion_frame_skip = 0   # compute motion every N+1 frames (2 => ~5 Hz @ 15 fps)
         self._motion_scale = 0.5      # process motion at half resolution
+        # Optional motion zone (normalized x,y,w,h in [0,1])
+        self._motion_zone = None  # type: ignore
 
         # Diagnostics for motion → recording path
         self._motion_events_published = 0
@@ -379,6 +381,37 @@ class WebcamController:
                                             H = int(round(h / s))
                                             candidates.append((X, Y, W, H, int(round(area / (s * s)))))
 
+                                    # If a motion zone is set, filter candidates to those whose center lies inside the zone
+                                    zone = None
+                                    try:
+                                        zone = getattr(self, '_motion_zone')
+                                    except Exception:
+                                        zone = None
+                                    if zone and isinstance(zone, (tuple, list)) and len(zone) == 4:
+                                        try:
+                                            # Use actual frame size to compute pixel zone
+                                            fh, fw = frame.shape[:2]
+                                            zx = int(max(0, min(fw, round(float(zone[0]) * fw))))
+                                            zy = int(max(0, min(fh, round(float(zone[1]) * fh))))
+                                            zw = int(max(0, min(fw - zx, round(float(zone[2]) * fw))))
+                                            zh = int(max(0, min(fh - zy, round(float(zone[3]) * fh))))
+                                            def inside(px: int, py: int) -> bool:
+                                                return (zx <= px <= (zx + zw)) and (zy <= py <= (zy + zh))
+                                            filtered = []
+                                            for X, Y, W, H, A in candidates:
+                                                cx = X + W // 2
+                                                cy = Y + H // 2
+                                                if inside(cx, cy):
+                                                    filtered.append((X, Y, W, H, A))
+                                            candidates = filtered
+                                            # Draw zone overlay on the frame for visualization
+                                            try:
+                                                cv2.rectangle(frame, (zx, zy), (zx + zw, zy + zh), (255, 0, 0), 2)
+                                            except Exception:
+                                                pass
+                                        except Exception:
+                                            pass
+
                                     # Store metrics (foreground count as current sample; largest area 'sticky' until next non-zero)
                                     try:
                                         self._last_fg_pixels = int(round(fg_small / (s * s)))
@@ -648,6 +681,7 @@ class WebcamController:
             'prefer_tracking': bool(self._prefer_tracking),
             'frame_skip': int(getattr(self, '_motion_frame_skip', 0)),
             'scale': float(getattr(self, '_motion_scale', 1.0)),
+            'zone': tuple(self._motion_zone) if isinstance(getattr(self, '_motion_zone', None), (tuple, list)) else None,
         }
 
     # Diagnostics helpers
@@ -723,3 +757,33 @@ class WebcamController:
             self._last_motion_rect = None
             self._candidate_rect = None
             self._candidate_start_ts = 0.0
+
+    # Motion zone controls (normalized rect x,y,w,h)
+    def set_motion_zone(self, zone: Optional[tuple[float, float, float, float] | list[float] | dict]) -> None:
+        if zone is None:
+            self._motion_zone = None
+            return
+        # Accept dict with x,y,w,h or tuple/list
+        try:
+            if isinstance(zone, dict):
+                x = float(zone.get('x', 0.0))
+                y = float(zone.get('y', 0.0))
+                w = float(zone.get('w', 0.0))
+                h = float(zone.get('h', 0.0))
+            else:
+                x, y, w, h = [float(v) for v in zone]  # type: ignore
+            # Clamp to [0,1] and ensure non-negative width/height within bounds
+            x = max(0.0, min(1.0, x))
+            y = max(0.0, min(1.0, y))
+            w = max(0.0, min(1.0 - x, w))
+            h = max(0.0, min(1.0 - y, h))
+            self._motion_zone = (x, y, w, h)
+        except Exception:
+            # On invalid input, ignore and keep previous
+            pass
+
+    def motion_zone(self) -> Optional[tuple[float, float, float, float]]:
+        z = getattr(self, '_motion_zone', None)
+        if isinstance(z, (tuple, list)) and len(z) == 4:
+            return (float(z[0]), float(z[1]), float(z[2]), float(z[3]))
+        return None

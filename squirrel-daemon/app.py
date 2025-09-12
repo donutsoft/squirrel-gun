@@ -37,6 +37,7 @@ try:
         'motion.prefer_tracking', 'motion.frame_skip', 'motion.scale',
         'record.record_on_motion', 'record.duration_sec', 'record.snapshot_on_motion',
         'follow_motion.enabled',
+        'motion.zone',
     ])
     # Apply motion settings (use current config as defaults)
     cur_motion = webcam.motion_config()
@@ -60,6 +61,12 @@ try:
     # Apply follow motion flag
     if 'follow_motion.enabled' in persisted:
         follow_motion_enabled = bool(persisted['follow_motion.enabled'])
+    # Apply motion zone if present (normalized x,y,w,h)
+    if 'motion.zone' in persisted:
+        try:
+            webcam.set_motion_zone(persisted.get('motion.zone'))
+        except Exception:
+            pass
 except Exception:
     pass
 
@@ -124,6 +131,11 @@ def recordings_page():
     except Exception:
         pass
     return render_template('Recordings.html', files=files)
+
+
+@app.get('/motion-zone')
+def motion_zone_page():
+    return render_template('MotionZone.html')
 
 
 @app.get('/api/recordings')
@@ -484,6 +496,63 @@ def motion_config():
         "frame_skip": frame_skip,
         "scale": scale,
     })
+
+
+@app.get('/api/motion/zone')
+def motion_zone_get():
+    try:
+        z = webcam.motion_zone()
+        return jsonify({ 'zone': z })
+    except Exception as e:
+        return jsonify({ 'error': str(e) }), 500
+
+
+@app.post('/api/motion/zone')
+def motion_zone_set():
+    data = request.get_json(silent=True) or {}
+    # Accept normalized x,y,w,h in [0,1], or pixel coords if width/height provided
+    x = data.get('x'); y = data.get('y'); w = data.get('w'); h = data.get('h')
+    # If values look > 1, assume pixels and normalize using camera resolution
+    try:
+        fx = float(x) if x is not None else None
+        fy = float(y) if y is not None else None
+        fw = float(w) if w is not None else None
+        fh = float(h) if h is not None else None
+    except Exception:
+        return jsonify({ 'error': 'invalid x/y/w/h' }), 400
+    # Normalize if necessary
+    if any(v is None for v in (fx, fy, fw, fh)):
+        return jsonify({ 'error': 'x,y,w,h required' }), 400
+    if (fx > 1.0 or fy > 1.0 or fw > 1.0 or fh > 1.0):
+        # Use webcam reported resolution for normalization
+        cam_w = float(getattr(webcam, 'width', 0) or 0)
+        cam_h = float(getattr(webcam, 'height', 0) or 0)
+        if cam_w <= 0 or cam_h <= 0:
+            return jsonify({ 'error': 'camera resolution unknown; provide normalized values 0..1' }), 400
+        fx /= cam_w; fw /= cam_w
+        fy /= cam_h; fh /= cam_h
+    # Clamp and apply
+    fx = max(0.0, min(1.0, float(fx)))
+    fy = max(0.0, min(1.0, float(fy)))
+    fw = max(0.0, min(1.0 - fx, float(fw)))
+    fh = max(0.0, min(1.0 - fy, float(fh)))
+    zone = { 'x': fx, 'y': fy, 'w': fw, 'h': fh }
+    try:
+        webcam.set_motion_zone(zone)
+        store.set_setting('motion.zone', zone)
+        return jsonify({ 'status': 'ok', 'zone': zone })
+    except Exception as e:
+        return jsonify({ 'error': str(e) }), 500
+
+
+@app.post('/api/motion/zone/clear')
+def motion_zone_clear():
+    try:
+        webcam.set_motion_zone(None)
+        store.set_setting('motion.zone', None)
+        return jsonify({ 'status': 'ok' })
+    except Exception as e:
+        return jsonify({ 'error': str(e) }), 500
 
 
 @app.get('/api/motion/center')

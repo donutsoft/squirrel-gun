@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Motion Zone</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <style>
+      .zone-wrap { position: relative; width: 100%; max-width: 960px; margin: 0 auto; }
+      .zone-img { width: 100%; display: block; background: #000; border-radius: 10px; border: 1px solid #111827; }
+      .zone-canvas { position: absolute; left: 0; top: 0; pointer-events: none; }
+      .zone-overlay { position: absolute; left: 0; top: 0; cursor: crosshair; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <header>
+        <img src="{{ url_for('static', filename='logo.png') }}" alt="Sad Squirrel Logo" />
+        <div>
+          <h1>Motion Zone</h1>
+          <div class="sub">Limit motion detection to a specific region.</div>
+          <div style="margin-top:6px;">
+            <a href="/" style="text-decoration: none; margin-right:12px;">⬅ Back</a>
+            <a href="/recordings" style="text-decoration: none; margin-right:12px;">🎥 Recordings</a>
+            <a href="/snapshots" style="text-decoration: none;">🖼️ Snapshots</a>
+          </div>
+        </div>
+      </header>
+
+      <section class="panel">
+        <h2>Define Zone</h2>
+        <div class="actions" style="display:flex; gap:8px; align-items:center; flex-wrap: wrap;">
+          <button id="btn-save" class="accent">Save Zone</button>
+          <button id="btn-clear" class="danger">Clear Zone</button>
+          <div class="hint">Draw or resize the rectangle; Save to apply.</div>
+        </div>
+        <div class="zone-wrap" id="zone-wrap">
+          <img id="zone-img" class="zone-img" src="/webcam/stream?fps=10&quality=70" alt="Live Webcam Stream" />
+          <canvas id="zone-canvas" class="zone-canvas"></canvas>
+          <div id="zone-overlay" class="zone-overlay"></div>
+        </div>
+      </section>
+    </div>
+
+    <script>
+      const wrap = document.getElementById('zone-wrap');
+      const img = document.getElementById('zone-img');
+      const canvas = document.getElementById('zone-canvas');
+      const overlay = document.getElementById('zone-overlay');
+      const ctx = canvas.getContext('2d');
+
+      let norm = null; // {x,y,w,h} in 0..1
+      let dragging = false;
+      let dragMode = null; // 'move' or 'resize' or 'new'
+      let startPt = null;
+
+      function layout() {
+        const r = img.getBoundingClientRect();
+        canvas.width = Math.round(r.width);
+        canvas.height = Math.round(r.height);
+        overlay.style.width = r.width + 'px';
+        overlay.style.height = r.height + 'px';
+        overlay.style.left = '0px';
+        overlay.style.top = '0px';
+        draw();
+      }
+
+      function draw() {
+        const w = canvas.width, h = canvas.height;
+        ctx.clearRect(0,0,w,h);
+        // Dim outside the zone slightly
+        if (norm) {
+          const zx = Math.round(norm.x * w);
+          const zy = Math.round(norm.y * h);
+          const zw = Math.round(norm.w * w);
+          const zh = Math.round(norm.h * h);
+          ctx.save();
+          ctx.fillStyle = 'rgba(0,0,0,0.25)';
+          ctx.fillRect(0,0,w,h);
+          ctx.clearRect(zx, zy, zw, zh);
+          ctx.strokeStyle = '#2563eb'; // blue
+          ctx.lineWidth = 2;
+          ctx.strokeRect(zx, zy, zw, zh);
+          // Handles
+          const hs = 8;
+          const handles = [
+            [zx, zy], [zx+zw, zy], [zx, zy+zh], [zx+zw, zy+zh],
+            [zx+zw/2, zy], [zx+zw/2, zy+zh], [zx, zy+zh/2], [zx+zw, zy+zh/2]
+          ];
+          ctx.fillStyle = '#2563eb';
+          for (const [hx, hy] of handles) ctx.fillRect(hx - hs/2, hy - hs/2, hs, hs);
+          ctx.restore();
+        }
+      }
+
+      function pointToNorm(e) {
+        const r = overlay.getBoundingClientRect();
+        const x = (e.clientX - r.left) / r.width;
+        const y = (e.clientY - r.top) / r.height;
+        return { x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)) };
+      }
+
+      function hitTest(e) {
+        if (!norm) return { where: 'outside' };
+        const { x, y } = pointToNorm(e);
+        const pad = 0.02; // 2% tolerance for edges/handles
+        const inside = x >= norm.x && x <= norm.x + norm.w && y >= norm.y && y <= norm.y + norm.h;
+        const near = (a,b) => Math.abs(a-b) < pad;
+        if (inside) {
+          if (near(x, norm.x) && near(y, norm.y)) return { where: 'tl' };
+          if (near(x, norm.x + norm.w) && near(y, norm.y)) return { where: 'tr' };
+          if (near(x, norm.x) && near(y, norm.y + norm.h)) return { where: 'bl' };
+          if (near(x, norm.x + norm.w) && near(y, norm.y + norm.h)) return { where: 'br' };
+          if (near(y, norm.y)) return { where: 'top' };
+          if (near(y, norm.y + norm.h)) return { where: 'bottom' };
+          if (near(x, norm.x)) return { where: 'left' };
+          if (near(x, norm.x + norm.w)) return { where: 'right' };
+          return { where: 'inside' };
+        }
+        return { where: 'outside' };
+      }
+
+      overlay.addEventListener('mousedown', (e) => {
+        const hit = hitTest(e);
+        dragging = true;
+        startPt = pointToNorm(e);
+        if (!norm || hit.where === 'outside') {
+          norm = { x: startPt.x, y: startPt.y, w: 0, h: 0 };
+          dragMode = 'new';
+        } else if (hit.where === 'inside') {
+          dragMode = 'move';
+        } else {
+          dragMode = hit.where; // resize by edge/corner
+        }
+        e.preventDefault();
+      });
+
+      window.addEventListener('mousemove', (e) => {
+        if (!dragging) return;
+        const pt = pointToNorm(e);
+        if (!norm) return;
+        const dx = pt.x - startPt.x;
+        const dy = pt.y - startPt.y;
+        const clamp01 = (v) => Math.min(1, Math.max(0, v));
+        const applyBounds = () => {
+          norm.x = clamp01(norm.x);
+          norm.y = clamp01(norm.y);
+          norm.w = Math.max(0, Math.min(1 - norm.x, norm.w));
+          norm.h = Math.max(0, Math.min(1 - norm.y, norm.h));
+        };
+        switch (dragMode) {
+          case 'new':
+            norm.w = Math.abs(dx);
+            norm.h = Math.abs(dy);
+            norm.x = Math.min(startPt.x, pt.x);
+            norm.y = Math.min(startPt.y, pt.y);
+            break;
+          case 'move':
+            norm.x += dx; norm.y += dy;
+            startPt = pt;
+            break;
+          case 'left':
+            norm.w += (norm.x - pt.x);
+            norm.x = pt.x;
+            break;
+          case 'right':
+            norm.w = (pt.x - norm.x);
+            break;
+          case 'top':
+            norm.h += (norm.y - pt.y);
+            norm.y = pt.y;
+            break;
+          case 'bottom':
+            norm.h = (pt.y - norm.y);
+            break;
+          case 'tl':
+            norm.w += (norm.x - pt.x);
+            norm.h += (norm.y - pt.y);
+            norm.x = pt.x; norm.y = pt.y;
+            break;
+          case 'tr':
+            norm.w = (pt.x - norm.x);
+            norm.h += (norm.y - pt.y);
+            norm.y = pt.y;
+            break;
+          case 'bl':
+            norm.w += (norm.x - pt.x);
+            norm.x = pt.x;
+            norm.h = (pt.y - norm.y);
+            break;
+          case 'br':
+            norm.w = (pt.x - norm.x);
+            norm.h = (pt.y - norm.y);
+            break;
+        }
+        applyBounds();
+        draw();
+        e.preventDefault();
+      });
+
+      window.addEventListener('mouseup', () => { dragging = false; dragMode = null; });
+      window.addEventListener('resize', layout);
+      img.addEventListener('load', layout);
+
+      async function fetchZone() {
+        try {
+          const res = await fetch('/api/motion/zone');
+          if (!res.ok) return null;
+          const data = await res.json();
+          return data.zone || null;
+        } catch { return null; }
+      }
+
+      async function init() {
+        norm = await fetchZone();
+        layout();
+      }
+      init();
+
+      document.getElementById('btn-save').addEventListener('click', async () => {
+        if (!norm || norm.w <= 0 || norm.h <= 0) {
+          alert('Draw a non-empty zone first.');
+          return;
+        }
+        const body = { x: norm.x, y: norm.y, w: norm.w, h: norm.h };
+        try {
+          const res = await fetch('/api/motion/zone', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+          });
+          if (!res.ok) { alert('Failed to save zone'); return; }
+          await res.json();
+          alert('Zone saved');
+        } catch { alert('Failed to save zone'); }
+      });
+
+      document.getElementById('btn-clear').addEventListener('click', async () => {
+        try {
+          const res = await fetch('/api/motion/zone/clear', { method: 'POST' });
+          if (!res.ok) { alert('Failed to clear'); return; }
+          norm = null;
+          draw();
+        } catch { alert('Failed to clear'); }
+      });
+    </script>
+  </body>
+  </html>
+
