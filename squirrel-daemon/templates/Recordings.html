@@ -34,10 +34,14 @@
             <div class="hint" style="margin:4px 0 8px 0;">
               {{ (f.size // 1024) }} KB • {{ f.display_time }}
             </div>
-            <video controls preload="metadata" style="width:100%; border-radius:8px; background:#000;">
-              <source src="{{ f.url }}" type="video/mp4">
-              Your browser does not support the video tag.
-            </video>
+            <a href="{{ f.url }}" title="Open video" target="_blank" style="display:block;">
+              <img
+                src="/recordings/shots/snap_{{ f.name[4:-4] }}.jpg"
+                alt="Snapshot for {{ f.name }}"
+                style="width:100%; border-radius:8px; background:#000; object-fit:cover; aspect-ratio:16/9;"
+                onerror="this.onerror=null; this.src='{{ url_for('static', filename='logo.png') }}';"
+              />
+            </a>
             <div style="margin-top:6px; display:flex; gap:8px; align-items:center;">
               <a href="{{ f.url }}" download>Download</a>
               <button class="danger btn-delete" data-name="{{ f.name }}">Delete</button>
