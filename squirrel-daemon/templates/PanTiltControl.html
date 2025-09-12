@@ -66,6 +66,10 @@
                 <span>Follow motion with laser</span>
               </label>
               <label style="display:inline-flex; align-items:center; gap:6px;">
+                <input id="water-on-motion" type="checkbox" />
+                <span>Fire water on motion</span>
+              </label>
+              <label style="display:inline-flex; align-items:center; gap:6px;">
                 <span>Min area (px)</span>
                 <input id="motion-min-area" type="number" min="0" step="1" value="800" style="width: 100px;" />
               </label>
@@ -288,10 +292,28 @@
         }
       }
 
+      async function setWaterOnMotionEnabled(enabled) {
+        try {
+          if (enabled && !motionEnable.checked) {
+            motionEnable.checked = true;
+            await setMotionConfig({ enabled: true, min_area: Number(motionMinArea.value) || 800 });
+          }
+          await fetch('/api/motion/water', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: !!enabled })
+          });
+        } catch (e) {
+          console.error('Failed to set water-on-motion', e);
+        }
+      }
+
       motionEnable.addEventListener('change', () => {
         setMotionConfig({ enabled: motionEnable.checked, min_area: Number(motionMinArea.value) || 800, persist_ms: Number(motionPersist.value) || 0 });
       });
       motionFollow.addEventListener('change', () => setFollowEnabled(motionFollow.checked));
+      const waterOnMotion = byId('water-on-motion');
+      waterOnMotion.addEventListener('change', () => setWaterOnMotionEnabled(waterOnMotion.checked));
 
       function debounce(fn, ms) {
         let t = null;
@@ -334,6 +356,13 @@
           if (r2.ok) {
             const f = await r2.json();
             if (typeof f.enabled === 'boolean') motionFollow.checked = f.enabled;
+          }
+        } catch (_) {}
+        try {
+          const rw = await fetch('/api/motion/water');
+          if (rw.ok) {
+            const wcfg = await rw.json();
+            if (typeof wcfg.enabled === 'boolean') waterOnMotion.checked = wcfg.enabled;
           }
         } catch (_) {}
         try {

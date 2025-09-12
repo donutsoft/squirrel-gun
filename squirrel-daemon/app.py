@@ -38,6 +38,7 @@ try:
         'record.record_on_motion', 'record.duration_sec', 'record.snapshot_on_motion',
         'follow_motion.enabled',
         'motion.zone',
+        'water_on_motion.enabled',
     ])
     # Apply motion settings (use current config as defaults)
     cur_motion = webcam.motion_config()
@@ -67,6 +68,9 @@ try:
             webcam.set_motion_zone(persisted.get('motion.zone'))
         except Exception:
             pass
+    # Apply water-on-motion flag
+    if 'water_on_motion.enabled' in persisted:
+        water_on_motion_enabled = bool(persisted['water_on_motion.enabled'])
 except Exception:
     pass
 
@@ -77,6 +81,11 @@ current = (135.0, 90.0)
 # Default: don't aim the laser on motion (can be overridden by persisted setting)
 follow_motion_enabled = False
 _last_follow_ts = 0.0
+
+# Water-on-motion control (disabled by default) with cooldown
+water_on_motion_enabled = False
+_last_water_fire_ts = 0.0
+_WATER_COOLDOWN_SEC = 60.0
 
 # Attempt to center hardware on startup; ignore failures if hardware not present
 try:
@@ -627,6 +636,33 @@ def motion_follow_get():
     return jsonify({"enabled": bool(globals().get('follow_motion_enabled', False))})
 
 
+@app.post('/api/motion/water')
+def motion_water_set():
+    """Enable/disable firing water on motion events (with cooldown)."""
+    global water_on_motion_enabled
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get('enabled', False))
+    water_on_motion_enabled = enabled
+    try:
+        store.set_setting('water_on_motion.enabled', bool(enabled))
+    except Exception:
+        pass
+    return jsonify({"status": "ok", "enabled": enabled})
+
+
+@app.get('/api/motion/water')
+def motion_water_get():
+    now = time.time()
+    last = float(globals().get('_last_water_fire_ts', 0.0) or 0.0)
+    cd = float(globals().get('_WATER_COOLDOWN_SEC', 60.0) or 60.0)
+    remaining = max(0.0, (last + cd) - now)
+    return jsonify({
+        "enabled": bool(globals().get('water_on_motion_enabled', False)),
+        "cooldown_remaining_sec": remaining,
+        "cooldown_sec": cd,
+    })
+
+
 @app.post('/api/click')
 def record_click():
     data = request.get_json(silent=True) or {}
@@ -735,6 +771,34 @@ def _on_motion(evt: dict) -> None:
 
 bus.subscribe('motion', _on_motion)
 
+
+# Subscribe to motion events and optionally fire water (with cooldown)
+def _on_motion_water(evt: dict) -> None:
+    global water_on_motion_enabled, _last_water_fire_ts
+    try:
+        if not water_on_motion_enabled:
+            return
+        now = time.time()
+        # Enforce cooldown between water firings
+        if (now - _last_water_fire_ts) < float(_WATER_COOLDOWN_SEC):
+            return
+        _last_water_fire_ts = now
+
+        # Fire asynchronously to avoid blocking the event bus thread
+        def _do_fire():
+            try:
+                water.startWatering(2.0)
+            except Exception:
+                pass
+
+        import threading as _th
+        _th.Thread(target=_do_fire, name='WaterOnMotion', daemon=True).start()
+    except Exception:
+        # Avoid crashing the bus on handler errors
+        pass
+
+
+bus.subscribe('motion', _on_motion_water)
 
 @app.get('/api/clicks')
 def list_clicks():
