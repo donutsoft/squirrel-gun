@@ -124,7 +124,7 @@ def is_annotated(
         from PIL import ImageOps
         # Save binary mask as visible image
         m = (mask.astype(np.uint8) * 255)
-        Image.fromarray(m, mode="L").save(save_mask_dir / f"{img_path.stem}_mask.png")
+        Image.fromarray(m).save(save_mask_dir / f"{img_path.stem}_mask.png")
 
     if ratio < min_ratio:
         return False
@@ -142,7 +142,7 @@ def is_annotated(
     # Use Canny edges on mask and Hough lines to see if there are long straight edges
     mask_u8 = (mask.astype(np.uint8) * 255)
     edges = cv2.Canny(mask_u8, 50, 150)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50, minLineLength=40, maxLineGap=5)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=40, minLineLength=12, maxLineGap=6)
     if lines is None or len(lines) < 2:
         return False
     return True
@@ -152,8 +152,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dir", default="stills", help="Directory to scan recursively")
     parser.add_argument("--glob", default="**/*.jpg", help="Glob of files to check")
-    parser.add_argument("--min-ratio", type=float, default=0.0005, help="Minimum green ratio to flag")
-    parser.add_argument("--min-pixels", type=int, default=150, help="Minimum green pixels to flag")
+    parser.add_argument("--min-ratio", type=float, default=0.0002, help="Minimum green ratio to flag")
+    parser.add_argument("--min-pixels", type=int, default=200, help="Minimum green pixels to flag")
     # RGB gates (looser by default to handle overlays of various brightness)
     parser.add_argument("--g-min", type=int, default=140, help="Minimum G value")
     parser.add_argument("--r-max", type=int, default=140, help="Maximum R value")
@@ -166,7 +166,7 @@ def main(argv=None) -> int:
     parser.add_argument("--val-min", type=int, default=60, help="Minimum value/brightness (0-255)")
     parser.add_argument("--delete", action="store_true", help="Delete matched files")
     parser.add_argument("--move-to", help="Move matched files to this directory")
-    parser.add_argument("--require-rect", action="store_true", help="Require rectangle-like edges (needs OpenCV if available)")
+    parser.add_argument("--require-rect", action="store_true", default=True, help="Require rectangle-like edges (needs OpenCV if available)")
     parser.add_argument("--save-mask", help="Directory to save binary masks for debugging")
     parser.add_argument("--print-stats", action="store_true", help="Print per-image pixel counts/ratios")
 
