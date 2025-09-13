@@ -10,7 +10,8 @@ class WebcamController:
         self.width = 1280
         self.height = 720
         self._fps = 15
-        self._quality = 80
+        # Slightly lower default JPEG quality to reduce encode latency
+        self._quality = 70
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._latest: bytes = b""
@@ -18,6 +19,8 @@ class WebcamController:
         self._cond = threading.Condition()
         # Motion detection settings/state
         self._motion_enabled = True
+        # Low-latency streaming mode flag
+        self._low_latency = False
         # Increase default area to reduce sensitivity on noise
         self._motion_min_area = 1500  # pixels in full-res image
         self._motion_alpha = 0.05    # background learning rate
@@ -43,6 +46,8 @@ class WebcamController:
         self._motion_scale = 0.5      # process motion at half resolution
         # Optional motion zone (normalized x,y,w,h in [0,1])
         self._motion_zone = None  # type: ignore
+        # Pre-allocated morphology kernel for motion cleanup
+        self._morph_kernel = None  # type: ignore
 
         # Diagnostics for motion → recording path
         self._motion_events_published = 0
@@ -100,6 +105,11 @@ class WebcamController:
         # Hint the backend to keep a tiny buffer (best-effort; some backends ignore it)
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        # Hint desired FPS to reduce internal buffering when possible
+        try:
+            cap.set(cv2.CAP_PROP_FPS, float(self._fps))
         except Exception:
             pass
         # Prefer MJPG if the camera supports it; this often drops latency on UVC devices
@@ -292,6 +302,10 @@ class WebcamController:
 
 
     def start_stream(self, fps: int = 15, quality: int = 80) -> None:
+        # In low-latency mode with motion off, bias for lower encode cost
+        if bool(getattr(self, '_low_latency', False)) and not bool(getattr(self, '_motion_enabled', True)):
+            fps = min(int(fps), 12)
+            quality = min(int(quality), 70)
         self._fps = max(1, int(fps))
         self._quality = max(1, min(100, int(quality)))
         if self._running and self._thread and self._thread.is_alive():
@@ -313,9 +327,7 @@ class WebcamController:
                         # Optional: motion detection and overlay
                         if self._motion_enabled:
                             try:
-                                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                                gray = cv2.GaussianBlur(gray, (5, 5), 0)
-                                # Only run motion detection every Nth frame and on downscaled image
+                                # Only run motion detection every Nth frame
                                 try:
                                     counter = getattr(self, '_motion_counter')
                                 except Exception:
@@ -327,37 +339,49 @@ class WebcamController:
                                     pass
                                 candidates = []
                                 if do_motion:
+                                    # Downscale first, then convert to gray/blur at smaller size
                                     try:
                                         s = float(self._motion_scale)
                                     except Exception:
                                         s = 0.5
                                     s = 0.5 if not (0.1 <= s <= 1.0) else s
-                                    small = cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
+                                    small = cv2.resize(frame, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
+                                    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                                    gray = cv2.GaussianBlur(gray, (5, 5), 0)
                                     # Compute foreground mask based on configured background model
                                     thresh = None
                                     if self._bg_mode == 'mog2':
                                         if self._bg_subtractor is None:
                                             # Detect shadows; treat 255 as foreground later
                                             self._bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=True)
-                                        fg = self._bg_subtractor.apply(small, learningRate=float(self._motion_alpha))
+                                        fg = self._bg_subtractor.apply(gray, learningRate=float(self._motion_alpha))
                                         # Remove shadows (value 127) by thresholding to 255 only
                                         _, thresh = cv2.threshold(fg, 254, 255, cv2.THRESH_BINARY)
                                     elif self._bg_mode == 'knn':
                                         if self._bg_subtractor is None:
                                             self._bg_subtractor = cv2.createBackgroundSubtractorKNN(history=400, dist2Threshold=400.0, detectShadows=True)
-                                        fg = self._bg_subtractor.apply(small, learningRate=float(self._motion_alpha))
+                                        fg = self._bg_subtractor.apply(gray, learningRate=float(self._motion_alpha))
                                         _, thresh = cv2.threshold(fg, 254, 255, cv2.THRESH_BINARY)
                                     else:
                                         # Running average background (simple, low-cost)
-                                        if self._bg_gray is None or getattr(self._bg_gray, 'shape', None) != small.shape:
-                                            self._bg_gray = small.copy().astype('float')
-                                        cv2.accumulateWeighted(small, self._bg_gray, float(self._motion_alpha))
+                                        if self._bg_gray is None or getattr(self._bg_gray, 'shape', None) != gray.shape:
+                                            self._bg_gray = gray.copy().astype('float')
+                                        cv2.accumulateWeighted(gray, self._bg_gray, float(self._motion_alpha))
                                         bg_uint8 = cv2.convertScaleAbs(self._bg_gray)
-                                        delta = cv2.absdiff(bg_uint8, small)
+                                        delta = cv2.absdiff(bg_uint8, gray)
                                         _, thresh = cv2.threshold(delta, 25, 255, cv2.THRESH_BINARY)
 
                                     # Morphological cleanup: remove speckles and fill small gaps
-                                    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+                                    try:
+                                        kernel = self._morph_kernel
+                                    except Exception:
+                                        kernel = None
+                                    if kernel is None:
+                                        try:
+                                            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+                                            self._morph_kernel = kernel
+                                        except Exception:
+                                            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
                                     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
                                     thresh = cv2.morphologyEx(thresh, cv2.MORPH_DILATE, kernel, iterations=1)
 
@@ -597,8 +621,12 @@ class WebcamController:
                         if now - next_emit > 2 * target_dt:
                             next_emit = now + target_dt
 
-                    # Light backoff to avoid pegging CPU while still keeping latency low
-                    time.sleep(0.001)
+                    # Light backoff: scale sleep by how far we are from next emit
+                    slack = max(0.0, next_emit - now)
+                    if slack > (0.5 * target_dt):
+                        time.sleep(min(0.003, slack * 0.25))
+                    else:
+                        time.sleep(0.001)
             finally:
                 cap.release()
 
@@ -706,6 +734,12 @@ class WebcamController:
             d = 0.5
         self._suppress_until_ts = time.time() + max(0.0, d)
 
+    # Low-latency streaming control
+    def set_low_latency_mode(self, enabled: bool) -> None:
+        self._low_latency = bool(enabled)
+    def get_low_latency_mode(self) -> bool:
+        return bool(getattr(self, '_low_latency', False))
+
     # Public controls for motion detection
     def set_motion_detection(self, enabled: bool, min_area: Optional[int] = None, alpha: Optional[float] = None, persist_ms: Optional[int] = None, bg_mode: Optional[str] = None, prefer_tracking: Optional[bool] = None, frame_skip: Optional[int] = None, scale: Optional[float] = None) -> None:
         self._motion_enabled = bool(enabled)
@@ -757,6 +791,15 @@ class WebcamController:
             self._last_motion_rect = None
             self._candidate_rect = None
             self._candidate_start_ts = 0.0
+        # Automatically enable low-latency streaming when motion detection is disabled
+        try:
+            if not self._motion_enabled:
+                self._low_latency = True
+            else:
+                # When motion is enabled again, drop back to normal latency unless explicitly set elsewhere
+                self._low_latency = bool(getattr(self, '_low_latency', False) and False)
+        except Exception:
+            pass
 
     # Motion zone controls (normalized rect x,y,w,h)
     def set_motion_zone(self, zone: Optional[tuple[float, float, float, float] | list[float] | dict]) -> None:

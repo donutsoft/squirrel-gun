@@ -102,7 +102,25 @@ def _build_aimer(min_rows: int = 10) -> tuple[LinearAimer, int, bool]:
     rows = store.list(limit=5000)
     if len(rows) >= max(1, int(min_rows)):
         m = LinearAimer.default()
-        m.fit_from_clicks(rows)
+        # If a motion zone is set, use its center as focus for higher local accuracy
+        focus = None
+        try:
+            z = store.get_setting('motion.zone', None)
+            if isinstance(z, dict):
+                x = float(z.get('x', 0.5))
+                y = float(z.get('y', 0.5))
+                w = float(z.get('w', 0.0))
+                h = float(z.get('h', 0.0))
+                # Use center of zone; values are expected normalized 0..1
+                focus = (x + max(0.0, w) * 0.5, y + max(0.0, h) * 0.5)
+                # Clamp focus to bounds
+                fx = 0.0 if focus[0] < 0.0 else 1.0 if focus[0] > 1.0 else focus[0]
+                fy = 0.0 if focus[1] < 0.0 else 1.0 if focus[1] > 1.0 else focus[1]
+                focus = (fx, fy)
+        except Exception:
+            focus = None
+        # Use a modest sigma so points near the focus dominate (higher accuracy in small area)
+        m.fit_from_clicks(rows, focus=focus, sigma=0.2)
         return m, len(rows), True
     return LinearAimer.default(), len(rows), False
 
@@ -450,6 +468,18 @@ def webcam_stream():
             webcam.set_motion_detection(enabled=enabled, min_area=min_area, alpha=alpha,
                                         bg_mode=bg_mode, prefer_tracking=prefer_tracking,
                                         frame_skip=frame_skip, scale=scale)
+        except Exception:
+            pass
+
+    # Optional low-latency streaming hint
+    low_lat_q = request.args.get('low_latency')
+    if low_lat_q is not None:
+        try:
+            ll = not (str(low_lat_q).strip() in ('0', 'false', 'False'))
+            try:
+                webcam.set_low_latency_mode(ll)
+            except Exception:
+                pass
         except Exception:
             pass
 
