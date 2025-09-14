@@ -3,12 +3,19 @@ name = "squirrel-daemon"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.9"
 dependencies = [
     "flask>=3.1.2",
-    "opencv-python>=4.12.0.88",
+    "opencv-python==4.7.0.72",
     "paho-mqtt>=2.1.0",
     "pigpio>=1.78",
     "rpi-gpio>=0.7.1",
-    "scikit-learn>=1.7.1",
+    "scikit-learn>=1.5.1",
+    "numpy<2",
+    "pycoral==2.0.0",
 ]
+python = "3.9"
+[tool.uv]
+extra-index-url = ["https://google-coral.github.io/py-repo/"]
+
+#coral = { url = "https://google-coral.github.io/py-repo/" }
