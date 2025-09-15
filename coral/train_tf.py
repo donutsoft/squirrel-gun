@@ -51,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+
 def enable_mixed_precision():
     try:
         from tensorflow.keras import mixed_precision as mp
