@@ -70,6 +70,10 @@
                 <span>Fire water on motion</span>
               </label>
               <label style="display:inline-flex; align-items:center; gap:6px;">
+                <input id="laser-enabled" type="checkbox" checked />
+                <span>Laser enabled</span>
+              </label>
+              <label style="display:inline-flex; align-items:center; gap:6px;">
                 <span>Min area (px)</span>
                 <input id="motion-min-area" type="number" min="0" step="1" value="800" style="width: 100px;" />
               </label>
@@ -181,6 +185,7 @@
       const motionEnable = byId('motion-enable');
       const motionFollow = byId('motion-follow');
       const motionMinArea = byId('motion-min-area');
+      const laserEnabled = byId('laser-enabled');
       img.addEventListener('click', async (e) => {
         const rect = img.getBoundingClientRect();
         const x = e.clientX - rect.left;
@@ -315,6 +320,19 @@
       const waterOnMotion = byId('water-on-motion');
       waterOnMotion.addEventListener('change', () => setWaterOnMotionEnabled(waterOnMotion.checked));
 
+      // Laser power toggle
+      laserEnabled.addEventListener('change', async () => {
+        try {
+          await fetch('/api/laser', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: !!laserEnabled.checked })
+          });
+        } catch (e) {
+          console.error('Failed to toggle laser', e);
+        }
+      });
+
       function debounce(fn, ms) {
         let t = null;
         return (...args) => {
@@ -413,6 +431,15 @@
             }
           } catch (_) {}
         }, 1000);
+
+        // Initialize laser toggle from backend
+        try {
+          const lr = await fetch('/api/laser');
+          if (lr.ok) {
+            const s = await lr.json();
+            laserEnabled.checked = !!s.enabled;
+          }
+        } catch (_) {}
       })();
 
       // Reset peak button

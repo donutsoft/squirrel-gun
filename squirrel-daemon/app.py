@@ -1,5 +1,6 @@
 from flask import Flask, render_template, request, jsonify, send_file, Response
 from hardware_controllers.PanTiltController import PanTiltController
+from hardware_controllers.LaserController import LaserController
 from hardware_controllers.WebcamController import WebcamController
 from hardware_controllers.WaterController import WaterController
 from pathlib import Path
@@ -15,7 +16,15 @@ pantilt = PanTiltController()
 webcam = WebcamController()
 store = ClickStore()
 water = WaterController()
+try:
+    laser = LaserController()
+except Exception as _e:
+    # Fallback: controller may not be available in dev
+    laser = None  # type: ignore
 bus = EventBus()
+
+# Track laser enabled state (default ON; overridden by persisted if present)
+laser_enabled = True
 
 # Wire WebcamController to publish motion events to the bus
 try:
@@ -39,6 +48,7 @@ try:
         'follow_motion.enabled',
         'motion.zone',
         'water_on_motion.enabled',
+        'laser.enabled',
     ])
     # Apply motion settings (use current config as defaults)
     cur_motion = webcam.motion_config()
@@ -71,6 +81,9 @@ try:
     # Apply water-on-motion flag
     if 'water_on_motion.enabled' in persisted:
         water_on_motion_enabled = bool(persisted['water_on_motion.enabled'])
+    # Apply laser enabled flag (default True)
+    if 'laser.enabled' in persisted:
+        laser_enabled = bool(persisted['laser.enabled'])
 except Exception:
     pass
 
@@ -92,6 +105,16 @@ try:
     pantilt.setPanTilt(current[0], current[1])
 except Exception as e:
     print(f"Warning: Failed to center pan/tilt on startup: {e}")
+
+# Attempt to set laser state on startup
+try:
+    if laser is not None:
+        if laser_enabled:
+            laser.turn_on()
+        else:
+            laser.turn_off()
+except Exception as e:
+    print(f"Warning: Failed to initialize laser state: {e}")
 
 def _build_aimer(min_rows: int = 10) -> tuple[LinearAimer, int, bool]:
     """Create a fresh LinearAimer from click data in the DB.
@@ -839,6 +862,34 @@ def list_clicks():
         return jsonify({"error": "invalid limit/offset"}), 400
     rows = store.list(limit=limit, offset=offset)
     return jsonify({"rows": rows})
+
+
+@app.get('/api/laser')
+def get_laser():
+    return jsonify({"enabled": bool(laser_enabled)})
+
+
+@app.post('/api/laser')
+def set_laser():
+    global laser_enabled
+    data = request.get_json(silent=True) or {}
+    enabled = data.get('enabled')
+    if not isinstance(enabled, bool):
+        return jsonify({"error": "enabled must be boolean"}), 400
+    try:
+        if laser is not None:
+            if enabled:
+                laser.turn_on()
+            else:
+                laser.turn_off()
+    except Exception as e:
+        return jsonify({"error": f"failed to set laser: {e}"}), 500
+    laser_enabled = enabled
+    try:
+        store.set_setting('laser.enabled', bool(laser_enabled))
+    except Exception:
+        pass
+    return jsonify({"status": "ok", "enabled": bool(laser_enabled)})
 
 
 @app.post('/api/clicks/clear')

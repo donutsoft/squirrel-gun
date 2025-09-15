@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Optional, Iterator, Callable, Any
+from typing import Optional, Iterator, Callable, Any, Union, Tuple, List, Dict
 import time
 import threading
 import cv2  # type: ignore
@@ -802,7 +802,7 @@ class WebcamController:
             pass
 
     # Motion zone controls (normalized rect x,y,w,h)
-    def set_motion_zone(self, zone: Optional[tuple[float, float, float, float] | list[float] | dict]) -> None:
+    def set_motion_zone(self, zone: Optional[Union[Tuple[float, float, float, float], List[float], Dict]]) -> None:
         if zone is None:
             self._motion_zone = None
             return
