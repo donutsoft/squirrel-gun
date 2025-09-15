@@ -451,6 +451,7 @@ def webcam_stream():
     prefer_tracking_q = request.args.get('prefer_tracking')
     frame_skip_q = request.args.get('frame_skip')
     scale_q = request.args.get('scale')
+    preview_scale_q = request.args.get('preview_scale')
     if (motion_q is not None or min_area_q is not None or alpha_q is not None or
         bg_mode_q is not None or prefer_tracking_q is not None or frame_skip_q is not None or scale_q is not None):
         try:
@@ -491,6 +492,12 @@ def webcam_stream():
             webcam.set_motion_detection(enabled=enabled, min_area=min_area, alpha=alpha,
                                         bg_mode=bg_mode, prefer_tracking=prefer_tracking,
                                         frame_skip=frame_skip, scale=scale)
+        except Exception:
+            pass
+    # Optional preview downscale hint (only affects JPEG stream, not recording)
+    if preview_scale_q is not None:
+        try:
+            webcam.set_preview_scale(float(preview_scale_q))
         except Exception:
             pass
 

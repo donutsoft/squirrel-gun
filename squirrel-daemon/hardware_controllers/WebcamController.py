@@ -3,6 +3,7 @@ from typing import Optional, Iterator, Callable, Any, Union, Tuple, List, Dict
 import time
 import threading
 import cv2  # type: ignore
+from turbojpeg import TurboJPEG, TJPF_BGR, TJSAMP_420  # type: ignore
 
 class WebcamController:
     def __init__(self, device: str = "/dev/video0", width: Optional[int] = None, height: Optional[int] = None):
@@ -17,10 +18,16 @@ class WebcamController:
         self._latest: bytes = b""
         self._seq = 0
         self._cond = threading.Condition()
+        # TurboJPEG encoder instance (required)
+        self._tj = TurboJPEG()
+        # Number of active MJPEG consumers
+        self._subscribers = 0
         # Motion detection settings/state
         self._motion_enabled = True
-        # Low-latency streaming mode flag
-        self._low_latency = False
+        # Low-latency streaming mode flag (default ON)
+        self._low_latency = True
+        # Preview downscale factor for low-latency mode (encode fewer pixels)
+        self._preview_scale = 0.5  # 0.1..1.0
         # Increase default area to reduce sensitivity on noise
         self._motion_min_area = 1500  # pixels in full-res image
         self._motion_alpha = 0.05    # background learning rate
@@ -128,9 +135,14 @@ class WebcamController:
         if not ok or frame is None:
             return False
 
-        # Write as JPEG
-        ok = cv2.imwrite(str(outfile), frame)
-        return bool(ok)
+        # Encode using TurboJPEG and write to file
+        try:
+            jpg = self._tj.encode(frame, quality=int(self._quality), pixel_format=TJPF_BGR, jpeg_subsample=TJSAMP_420)
+            with open(outfile, 'wb') as f:
+                f.write(jpg)
+            return True
+        except Exception:
+            return False
 
     def capture(self, outfile: Path) -> Path:
         outfile = outfile.resolve()
@@ -507,9 +519,7 @@ class WebcamController:
                                             }
                                             # Attach the triggering frame as JPEG for snapshot fidelity
                                             try:
-                                                okj, enc = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), self._quality])
-                                                if okj:
-                                                    evt['jpeg'] = enc.tobytes()
+                                                evt['jpeg'] = self._tj.encode(frame, quality=int(self._quality), pixel_format=TJPF_BGR, jpeg_subsample=TJSAMP_420)
                                             except Exception:
                                                 pass
                                             try:
@@ -547,9 +557,7 @@ class WebcamController:
                                                 }
                                                 # Attach the triggering frame as JPEG for snapshot fidelity
                                                 try:
-                                                    okj, enc = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), self._quality])
-                                                    if okj:
-                                                        evt['jpeg'] = enc.tobytes()
+                                                    evt['jpeg'] = self._tj.encode(frame, quality=int(self._quality), pixel_format=TJPF_BGR, jpeg_subsample=TJSAMP_420)
                                                 except Exception:
                                                     pass
                                                 try:
@@ -605,21 +613,30 @@ class WebcamController:
 
                     now = time.monotonic()
                     if now >= next_emit:
-                        if last_frame is not None:
-                            ok2, encoded = cv2.imencode(
-                                '.jpg', last_frame, [int(cv2.IMWRITE_JPEG_QUALITY), self._quality]
-                            )
-                            if ok2:
-                                jpg = encoded.tobytes()
+                        if last_frame is not None and int(getattr(self, '_subscribers', 0)) > 0:
+                            # Prepare frame for encoding (downscale in low-latency + motion-off mode)
+                            frame_to_encode = last_frame
+                            try:
+                                if bool(getattr(self, '_low_latency', False)) and not bool(getattr(self, '_motion_enabled', True)):
+                                    s = float(getattr(self, '_preview_scale', 1.0))
+                                    if 0.1 <= s < 1.0:
+                                        frame_to_encode = cv2.resize(last_frame, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
+                            except Exception:
+                                frame_to_encode = last_frame
+
+                            # Encode with TurboJPEG (required)
+                            try:
+                                jpg = self._tj.encode(frame_to_encode, quality=int(self._quality), pixel_format=TJPF_BGR, jpeg_subsample=TJSAMP_420)
+                            except Exception:
+                                jpg = None
+
+                            if jpg is not None:
                                 with self._cond:
                                     self._latest = jpg
                                     self._seq += 1
                                     self._cond.notify_all()
-                        # Schedule next emit; if we're behind, skip ahead without sleeping
-                        next_emit += target_dt
-                        # Avoid runaway if system time drifted or we were paused
-                        if now - next_emit > 2 * target_dt:
-                            next_emit = now + target_dt
+                        # Schedule next emit based on current time to prevent burst catch-up
+                        next_emit = now + target_dt
 
                     # Light backoff: scale sleep by how far we are from next emit
                     slack = max(0.0, next_emit - now)
@@ -645,18 +662,29 @@ class WebcamController:
         self.start_stream(fps=fps, quality=quality)
         delay = 1.0 / self._fps
         last_seq = -1
-        while True:
-            with self._cond:
-                if self._seq == last_seq:
-                    self._cond.wait(timeout=delay)
-                data = self._latest
-                last_seq = self._seq
-            if not data:
-                time.sleep(delay)
-                continue
-            yield (b"--" + boundary.encode() + b"\r\n"
-                   b"Content-Type: image/jpeg\r\n"
-                   b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data + b"\r\n")
+        # Track subscriber lifecycle
+        try:
+            try:
+                self._subscribers += 1
+            except Exception:
+                pass
+            while True:
+                with self._cond:
+                    if self._seq == last_seq:
+                        self._cond.wait(timeout=delay)
+                    data = self._latest
+                    last_seq = self._seq
+                if not data:
+                    time.sleep(delay)
+                    continue
+                yield (b"--" + boundary.encode() + b"\r\n"
+                       b"Content-Type: image/jpeg\r\n"
+                       b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data + b"\r\n")
+        finally:
+            try:
+                self._subscribers = max(0, int(getattr(self, '_subscribers', 0)) - 1)
+            except Exception:
+                pass
 
     
 
@@ -740,6 +768,20 @@ class WebcamController:
     def get_low_latency_mode(self) -> bool:
         return bool(getattr(self, '_low_latency', False))
 
+    # Preview downscale control (for encoding only; recording stays full-res)
+    def set_preview_scale(self, scale: float) -> None:
+        try:
+            s = float(scale)
+            if 0.1 <= s <= 1.0:
+                self._preview_scale = s
+        except Exception:
+            pass
+    def get_preview_scale(self) -> float:
+        try:
+            return float(getattr(self, '_preview_scale', 1.0))
+        except Exception:
+            return 1.0
+
     # Public controls for motion detection
     def set_motion_detection(self, enabled: bool, min_area: Optional[int] = None, alpha: Optional[float] = None, persist_ms: Optional[int] = None, bg_mode: Optional[str] = None, prefer_tracking: Optional[bool] = None, frame_skip: Optional[int] = None, scale: Optional[float] = None) -> None:
         self._motion_enabled = bool(enabled)
@@ -795,9 +837,12 @@ class WebcamController:
         try:
             if not self._motion_enabled:
                 self._low_latency = True
+                # Default to half-size preview when motion is off to save CPU
+                self._preview_scale = 0.5
             else:
                 # When motion is enabled again, drop back to normal latency unless explicitly set elsewhere
                 self._low_latency = bool(getattr(self, '_low_latency', False) and False)
+                self._preview_scale = 1.0
         except Exception:
             pass
 
