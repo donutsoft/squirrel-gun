@@ -6,6 +6,7 @@ from typing import Optional, Iterable
 import tensorflow as tf
 
 
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train an image classification model with TensorFlow/Keras.")
 
