@@ -2,6 +2,7 @@
 """
 Extract every frame from all MP4 files in `recordings/` and write JPGs
 into `stills/` (one subfolder per video) under the `image_extractor/` directory.
+All extracted frames are letterboxed to 320x320 (aspect preserved, padded).
 
 Usage:
   python3 extract_frames.py
@@ -58,6 +59,9 @@ def extract_with_ffmpeg(video: Path, out_dir: Path, prefix: str, overwrite: bool
         "-sn",  # no subtitles
         "-vsync",
         "0",    # keep all frames; avoid dup/drop
+        "-vf",
+        # aspect-preserving scale then pad to 320x320 with neutral gray
+        "scale=320:320:force_original_aspect_ratio=decrease,pad=320:320:(ow-iw)/2:(oh-ih)/2:color=0x727272",
         "-q:v",
         "2",     # high quality JPEG
         out_pattern,
@@ -74,6 +78,7 @@ def extract_with_ffmpeg(video: Path, out_dir: Path, prefix: str, overwrite: bool
 def extract_with_opencv(video: Path, out_dir: Path, prefix: str, overwrite: bool, seconds: float) -> int:
     try:
         import cv2  # type: ignore
+        import numpy as np  # type: ignore
     except Exception as e:  # pragma: no cover
         print(
             "OpenCV (opencv-python) not available and ffmpeg not usable; install it to proceed.",
@@ -107,7 +112,32 @@ def extract_with_opencv(video: Path, out_dir: Path, prefix: str, overwrite: bool
             idx += 1
             count += 1
             continue
-        ok = cv2.imwrite(str(out_path), frame)
+        # Letterbox to 320x320 (keep aspect, pad with gray 114)
+        h, w = frame.shape[:2]
+        if h == 0 or w == 0:
+            print(f"Invalid frame size {w}x{h} for {video}", file=sys.stderr)
+            break
+        scale = min(320 / w, 320 / h)
+        new_w = int(round(w * scale))
+        new_h = int(round(h * scale))
+        if new_w < 1: new_w = 1
+        if new_h < 1: new_h = 1
+        try:
+            resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        except Exception:
+            resized = cv2.resize(frame, (new_w, new_h))
+
+        # Create padded canvas
+        canvas = None
+        if len(frame.shape) == 2 or frame.shape[2] == 1:
+            canvas = (114 * np.ones((320, 320), dtype=resized.dtype))
+        else:
+            canvas = (114 * np.ones((320, 320, 3), dtype=resized.dtype))
+        top = (320 - new_h) // 2
+        left = (320 - new_w) // 2
+        canvas[top:top+new_h, left:left+new_w] = resized
+
+        ok = cv2.imwrite(str(out_path), canvas)
         if not ok:
             print(f"Failed to write frame {idx} for {video}", file=sys.stderr)
             break

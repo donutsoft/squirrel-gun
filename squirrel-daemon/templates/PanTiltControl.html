@@ -107,7 +107,7 @@
               <button id="btn-rec-start" class="accent">Start Recording</button>
               <button id="btn-rec-stop" class="danger">Stop</button>
             </div>
-            <img id="webcam-stream" src="" data-mjpeg-port="8090" data-src-path="/stream.mjpg" alt="Live Webcam Stream"
+            <img id="webcam-stream" src="/webcam/stream?low_latency=1&preview_scale=0.5&quality=60&fps=8" alt="Live Webcam Stream"
                  style="width:100%; max-height: 720px; object-fit: contain; background:#000; border-radius:10px; border:1px solid #111827; cursor: crosshair;" />
             <div class="hint">Live MJPEG stream. If blank, check camera connection.</div>
           </div>
@@ -181,20 +181,7 @@
 
       // Record clicks on the webcam image with coordinates and current angles
       const img = byId('webcam-stream');
-      // Point preview to the ffmpeg MJPEG pass-through server (no re-encode)
-      try {
-        const port = img?.getAttribute('data-mjpeg-port') || '8090';
-        const path = img?.getAttribute('data-src-path') || '/stream.mjpg';
-        const url = `${location.protocol}//${location.hostname}:${port}${path}`;
-        img.src = url;
-        // Fallback to Flask MJPEG if ffmpeg server is unavailable
-        img.addEventListener('error', () => {
-          if (!img?.dataset?.__flaskFallback) {
-            img.dataset.__flaskFallback = '1';
-            img.src = '/webcam/stream?low_latency=1&preview_scale=0.5&quality=60&fps=8';
-          }
-        }, { once: true });
-      } catch (_) {}
+      // Stream is served by Flask MJPEG endpoint with low-latency defaults
       const recordToggle = byId('record-clicks');
       const motionEnable = byId('motion-enable');
       const motionFollow = byId('motion-follow');

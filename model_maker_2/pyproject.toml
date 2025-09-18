@@ -1,0 +1,10 @@
+[project]
+name = "model-maker-2"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "tensorflow>=2.20.0",
+    "ultralytics>=8.3.201",
+]

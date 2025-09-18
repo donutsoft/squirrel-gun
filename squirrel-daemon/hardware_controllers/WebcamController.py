@@ -157,12 +157,32 @@ class WebcamController:
         return outfile
 
     def _open_video_writer(self, path: Path, fps: int, frame_size: tuple[int, int]):
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        try:
-            writer = cv2.VideoWriter(str(path), fourcc, float(max(1, fps)), frame_size)
-        except Exception:
-            writer = None
-        return writer
+        """Open a VideoWriter preferring H.264 for QuickTime compatibility.
+
+        Tries 'avc1' then 'H264', then falls back to 'mp4v'. Returns an opened
+        writer or None on failure.
+        """
+        fpsf = float(max(1, fps))
+        w, h = int(frame_size[0]), int(frame_size[1])
+        # Ensure even dimensions for YUV420 encoders (avoid green artifacts)
+        if (w % 2) != 0 or (h % 2) != 0:
+            w -= (w % 2)
+            h -= (h % 2)
+            frame_size = (w, h)
+        # Try AV1/H264 (QuickTime-friendly) then fallback to mp4v
+        for fourcc_tag in ('avc1', 'H264', 'mp4v'):
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*fourcc_tag)
+                writer = cv2.VideoWriter(str(path), fourcc, fpsf, frame_size)
+                if writer is not None and getattr(writer, 'isOpened', lambda: True)():
+                    return writer
+                try:
+                    writer.release()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        return None
 
     def save_snapshot(self, out_path: Optional[Path] = None) -> Optional[Path]:
         """Save the latest available JPEG frame to a file.
@@ -214,8 +234,14 @@ class WebcamController:
             self._recording_path = out_path
             self._recording_active = True
             self._recording_end_ts = now + max(0.1, float(duration_sec))
-            # Lazily open writer on first frame when we know size
+            # Close any previous writer defensively
+            try:
+                if self._video_writer is not None:
+                    self._video_writer.release()
+            except Exception:
+                pass
             self._video_writer = None
+            # OpenCV writer will be initialized lazily on first frame
         return out_path
 
     def stop_recording(self) -> None:
@@ -336,9 +362,11 @@ class WebcamController:
                 while self._running:
                     ok, frame = cap.read()
                     if ok and frame is not None:
-                        # Optional: motion detection and overlay
+                        raw_frame = frame
+                        # Optional: motion detection and overlay (draw on a copy)
                         if self._motion_enabled:
                             try:
+                                frame = raw_frame.copy()
                                 # Only run motion detection every Nth frame
                                 try:
                                     counter = getattr(self, '_motion_counter')
@@ -572,6 +600,9 @@ class WebcamController:
                             except Exception:
                                 # If OpenCV processing fails for any reason, continue without overlay
                                 pass
+                        else:
+                            # No overlay: use raw frame for preview
+                            frame = raw_frame
                         last_frame = frame
                         # Handle recording lifecycle and write frames
                         try:
@@ -589,14 +620,23 @@ class WebcamController:
                                     self._recording_path = None
                                 if self._recording_active:
                                     if self._video_writer is None:
-                                        h, w = frame.shape[:2]
+                                        h, w = raw_frame.shape[:2]
                                         fps_w = max(1, int(self._fps))
                                         path = self._recording_path or (self._recordings_dir / f'rec_{time.strftime("%Y%m%d_%H%M%S")}.mp4')
                                         self._recording_path = path
                                         self._video_writer = self._open_video_writer(path, fps_w, (w, h))
                                     if self._video_writer is not None:
                                         try:
-                                            self._video_writer.write(frame)
+                                            # Resize to writer size if necessary to satisfy encoder requirements
+                                            try:
+                                                ws = int(getattr(self._video_writer, 'get', lambda *_: 0)(cv2.CAP_PROP_FRAME_WIDTH))
+                                                hs = int(getattr(self._video_writer, 'get', lambda *_: 0)(cv2.CAP_PROP_FRAME_HEIGHT))
+                                            except Exception:
+                                                ws, hs = raw_frame.shape[1], raw_frame.shape[0]
+                                            fr = raw_frame
+                                            if ws and hs and (raw_frame.shape[1] != ws or raw_frame.shape[0] != hs):
+                                                fr = cv2.resize(raw_frame, (ws, hs), interpolation=cv2.INTER_LINEAR)
+                                            self._video_writer.write(fr)
                                         except Exception:
                                             pass
                         except Exception:
