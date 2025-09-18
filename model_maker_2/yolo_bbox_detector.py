@@ -75,6 +75,8 @@ class YOLOBBoxDetector:
         val_split: float = 0.1,
         device: Optional[Union[int, str]] = None,
         verbose: bool = True,
+        workers: Optional[int] = None,
+        amp: Optional[bool] = None,
     ):
         """Prepare YOLO dataset and train using ultralytics.
 
@@ -97,6 +99,13 @@ class YOLOBBoxDetector:
         if device is None:
             device = self._default_device
 
+        # Default dataloader workers: use 0 on macOS/MPS to avoid hangs
+        if workers is None:
+            workers = 0 if (device in ("mps", None) and self._default_device == "mps") else 8
+        # Mixed precision sometimes unstable on MPS; default to False there
+        if amp is None:
+            amp = False if (device in ("mps", None) and self._default_device == "mps") else True
+
         self._model.train(
             data=str(data_yaml),
             epochs=epochs,
@@ -105,6 +114,8 @@ class YOLOBBoxDetector:
             device=device,
             verbose=verbose,
             plots=False,
+            workers=workers,
+            amp=amp,
         )
         return self._model
 
@@ -252,13 +263,31 @@ class YOLOBBoxDetector:
 
             lines: List[str] = []
             for cls, (xmin, ymin, xmax, ymax) in items:
+                # Normalize coordinates to ensure positive width/height
+                xa, xb = (xmin, xmax) if xmin <= xmax else (xmax, xmin)
+                ya, yb = (ymin, ymax) if ymin <= ymax else (ymax, ymin)
+                # Skip degenerate boxes (and warn)
+                if xb <= xa or yb <= ya:
+                    try:
+                        print(f"[WARN] Skipping invalid box (non-positive size) for {img_path.name}: "
+                              f"({xmin},{ymin},{xmax},{ymax}) -> ({xa},{ya},{xb},{yb})")
+                    except Exception:
+                        pass
+                    continue
                 idx = self._label_to_id[cls]
-                x, y, bw, bh = self._xyxy_to_yolo(xmin, ymin, xmax, ymax, w, h)
-                # Clamp to [0,1] just in case
+                x, y, bw, bh = self._xyxy_to_yolo(xa, ya, xb, yb, w, h)
+                # Clamp to [0,1] and drop zero-area after normalization
                 x = min(max(x, 0.0), 1.0)
                 y = min(max(y, 0.0), 1.0)
                 bw = min(max(bw, 0.0), 1.0)
                 bh = min(max(bh, 0.0), 1.0)
+                if bw <= 0.0 or bh <= 0.0:
+                    try:
+                        print(f"[WARN] Skipping invalid box (zero area after clamp) for {img_path.name}: "
+                              f"({xa},{ya},{xb},{yb}) -> (bw={bw:.6f}, bh={bh:.6f})")
+                    except Exception:
+                        pass
+                    continue
                 lines.append(f"{idx} {x:.6f} {y:.6f} {bw:.6f} {bh:.6f}")
 
             lbl_path = self.yolo_root / "labels" / split / (img_path.with_suffix(".txt").name)
@@ -286,6 +315,8 @@ if __name__ == "__main__":
     p_train.add_argument("--val_split", type=float, default=0.2)
     p_train.add_argument("--device", type=str, default=_MAC_DEFAULT_DEVICE, help="Device id/name, e.g. '0', 'cpu', or 'mps'")
     p_train.add_argument("--seed", type=int, default=0)
+    p_train.add_argument("--workers", type=int, default=None, help="Dataloader workers (default: 0 on mps, else 8)")
+    p_train.add_argument("--amp", type=lambda v: v.lower() in ("1","true","yes"), default=None, help="Use AMP mixed precision (default: False on mps, else True)")
 
     p_pred = sub.add_parser("predict", help="Run inference using trained weights")
     p_pred.add_argument("--weights", type=Path, required=True, help="Path to .pt weights")
@@ -329,6 +360,12 @@ if __name__ == "__main__":
                 set_if("val_split", "val_split", float)
                 set_if("device", "device", str)
                 set_if("seed", "seed", int)
+                if "workers" in c and not _cli_supplied("--workers"):
+                    w = c["workers"].strip()
+                    setattr(args, "workers", int(w) if w else None)
+                if "amp" in c and not _cli_supplied("--amp"):
+                    a = c["amp"].strip().lower()
+                    setattr(args, "amp", a in ("1","true","yes"))
             elif args.cmd == "predict":
                 set_if("weights", "weights", Path)
                 set_if("source", "source", Path)
@@ -364,6 +401,8 @@ if __name__ == "__main__":
             val_split=args.val_split,
             device=args.device,
             verbose=True,
+            workers=args.workers,
+            amp=args.amp,
         )
         print("[DONE] Training complete. Best weights saved under ultralytics runs directory.")
 
