@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 Extract every frame from all MP4 files in `recordings/` and write JPGs
-into `stills/` (one subfolder per video) under the `image_extractor/` directory.
+into a single `stills/` directory under the `image_extractor/` directory
+(no per-video subfolders). Filenames are prefixed with the video basename
+to avoid collisions, e.g. `video1_000001.jpg`.
 All extracted frames are letterboxed to 320x320 (aspect preserved, padded).
 
 Usage:
@@ -192,8 +194,10 @@ def main(argv=None) -> int:
     total_frames = 0
     for vid in videos:
         base = vid.stem
-        out_dir = dst / base
-        print(f"Extracting frames: {vid.name} -> {out_dir}")
+        # Write all frames into a single destination directory. Use the
+        # video basename as filename prefix to keep frames distinct.
+        out_dir = dst
+        print(f"Extracting frames: {vid.name} -> {out_dir} (prefix: {base}_)")
         if method == "ffmpeg":
             extracted = extract_with_ffmpeg(vid, out_dir, base, args.overwrite, args.seconds)
         else:
