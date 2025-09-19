@@ -216,6 +216,7 @@ class YOLOBBoxDetector:
             f"path: {self.yolo_root}",
             "train: images/train",
             "val: images/val",
+            f"nc: {len(self._labels)}",
             f"names: {self._labels}",
             "",
         ]

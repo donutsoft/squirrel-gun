@@ -49,7 +49,14 @@ try:
         'motion.zone',
         'water_on_motion.enabled',
         'laser.enabled',
+        'detector.type',
     ])
+    # Apply detector type
+    if 'detector.type' in persisted:
+        try:
+            webcam.set_detector_type(persisted['detector.type'])
+        except Exception as e:
+            print(f"Warning: failed to set detector type: {e}")
     # Apply motion settings (use current config as defaults)
     cur_motion = webcam.motion_config()
     webcam.set_motion_detection(
@@ -676,6 +683,32 @@ def motion_config_get():
         return jsonify(cfg)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# Detector type endpoints
+@app.get('/api/detector/type')
+def detector_type_get():
+    try:
+        return jsonify({ 'type': webcam.get_detector_type() })
+    except Exception as e:
+        return jsonify({ 'error': str(e) }), 500
+
+
+@app.post('/api/detector/type')
+def detector_type_set():
+    data = request.get_json(silent=True) or {}
+    kind = str(data.get('type', 'motion')).lower().strip()
+    if kind not in ('motion', 'yolo'):
+        return jsonify({ 'error': 'invalid type' }), 400
+    try:
+        t = webcam.set_detector_type(kind)
+        try:
+            store.set_setting('detector.type', t)
+        except Exception:
+            pass
+        return jsonify({ 'status': 'ok', 'type': t })
+    except Exception as e:
+        return jsonify({ 'error': str(e) }), 500
 
 
 @app.post('/api/motion/follow')

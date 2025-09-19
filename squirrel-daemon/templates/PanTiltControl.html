@@ -58,6 +58,13 @@
             </label>
             <div style="display:flex; gap:12px; align-items:center; margin:6px 0; flex-wrap:wrap;">
               <label style="display:inline-flex; align-items:center; gap:6px;">
+                <span>Detector</span>
+                <select id="detector-type">
+                  <option value="motion">Motion</option>
+                  <option value="yolo">YOLO</option>
+                </select>
+              </label>
+              <label style="display:inline-flex; align-items:center; gap:6px;">
                 <input id="motion-enable" type="checkbox" />
                 <span>Enable motion overlay</span>
               </label>
@@ -185,6 +192,7 @@
       const recordToggle = byId('record-clicks');
       const motionEnable = byId('motion-enable');
       const motionFollow = byId('motion-follow');
+      const detectorType = byId('detector-type');
       const motionMinArea = byId('motion-min-area');
       const laserEnabled = byId('laser-enabled');
       img.addEventListener('click', async (e) => {
@@ -317,6 +325,22 @@
       motionEnable.addEventListener('change', () => {
         setMotionConfig({ enabled: motionEnable.checked, min_area: Number(motionMinArea.value) || 800, persist_ms: Number(motionPersist.value) || 0 });
       });
+      detectorType.addEventListener('change', async () => {
+        const v = detectorType.value;
+        try {
+          const res = await fetch('/api/detector/type', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ type: v })
+          });
+          if (!res.ok) {
+            const e = await res.json().catch(() => ({}));
+            alert('Failed to set detector: ' + (e.error || res.statusText));
+          }
+        } catch (e) {
+          alert('Error setting detector: ' + e);
+        }
+      });
       motionFollow.addEventListener('change', () => setFollowEnabled(motionFollow.checked));
       const waterOnMotion = byId('water-on-motion');
       waterOnMotion.addEventListener('change', () => setWaterOnMotionEnabled(waterOnMotion.checked));
@@ -391,6 +415,14 @@
             byId('record-on-motion').checked = !!rc.record_on_motion;
             byId('snapshot-on-motion').checked = !!rc.snapshot_on_motion;
             if (typeof rc.duration_sec === 'number') byId('record-duration').value = String(Math.floor(rc.duration_sec));
+          }
+        } catch (_) {}
+        // Initialize detector type from backend
+        try {
+          const r = await fetch('/api/detector/type');
+          if (r.ok) {
+            const j = await r.json();
+            if (j.type === 'yolo' || j.type === 'motion') detectorType.value = j.type;
           }
         } catch (_) {}
         // Start polling motion stats

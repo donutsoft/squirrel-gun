@@ -5,6 +5,7 @@ import threading
 import cv2  # type: ignore
 from turbojpeg import TurboJPEG, TJPF_BGR, TJSAMP_420  # type: ignore
 from event_detection.motion import MotionDetector
+from event_detection.yolo import YOLOEventDetector
 
 class WebcamController:
     def __init__(self, device: str = "/dev/video0", width: Optional[int] = None, height: Optional[int] = None):
@@ -23,8 +24,11 @@ class WebcamController:
         self._tj = TurboJPEG()
         # Number of active MJPEG consumers
         self._subscribers = 0
-        # Event detector: motion
-        self._motion_detector = MotionDetector()
+        # Active event detector
+        self._detector_type = 'motion'
+        self._detector = MotionDetector()
+        # Store motion zone centrally; applied only to motion detector
+        self._zone: Optional[Tuple[float, float, float, float]] = None
         # Low-latency streaming mode flag (default ON)
         self._low_latency = True
         # Preview downscale factor for low-latency mode (encode fewer pixels)
@@ -132,10 +136,11 @@ class WebcamController:
         return outfile
 
     def _open_video_writer(self, path: Path, fps: int, frame_size: tuple[int, int]):
-        """Open a VideoWriter preferring H.264 for QuickTime compatibility.
+        """Open a VideoWriter with sane cross-platform defaults.
 
-        Tries 'avc1' then 'H264', then falls back to 'mp4v'. Returns an opened
-        writer or None on failure.
+        Default priority is 'mp4v' (widely available) then 'avc1'/'H264'.
+        Override order via env var 'SQ_VIDEO_FOURCCS' (comma-separated tags).
+        Returns an opened writer or None on failure.
         """
         fpsf = float(max(1, fps))
         w, h = int(frame_size[0]), int(frame_size[1])
@@ -144,8 +149,16 @@ class WebcamController:
             w -= (w % 2)
             h -= (h % 2)
             frame_size = (w, h)
-        # Try AV1/H264 (QuickTime-friendly) then fallback to mp4v
-        for fourcc_tag in ('avc1', 'H264', 'mp4v'):
+        # Codec preference (env override supported)
+        import os
+        env_order = os.getenv('SQ_VIDEO_FOURCCS', '').strip()
+        if env_order:
+            order = [t.strip() for t in env_order.split(',') if t.strip()]
+        else:
+            # Prefer mp4v first to avoid hardware H.264 encoder errors on systems
+            # without h264 encoders (e.g., missing v4l2m2m device in containers)
+            order = ['mp4v', 'avc1', 'H264']
+        for fourcc_tag in order:
             try:
                 fourcc = cv2.VideoWriter_fourcc(*fourcc_tag)
                 writer = cv2.VideoWriter(str(path), fourcc, fpsf, frame_size)
@@ -316,7 +329,7 @@ class WebcamController:
 
     def start_stream(self, fps: int = 15, quality: int = 80) -> None:
         # In low-latency mode with motion off, bias for lower encode cost
-        if bool(getattr(self, '_low_latency', False)) and not bool(self._motion_detector.enabled()):
+        if bool(getattr(self, '_low_latency', False)) and not bool(self._detector.enabled()):
             fps = min(int(fps), 12)
             quality = min(int(quality), 70)
         self._fps = max(1, int(fps))
@@ -339,9 +352,9 @@ class WebcamController:
                     if ok and frame is not None:
                         raw_frame = frame
                         # Run motion detector (draw overlays within detector)
-                        if self._motion_detector.enabled():
+                        if self._detector.enabled():
                             try:
-                                res = self._motion_detector.process(raw_frame, now_ts=time.time())
+                                res = self._detector.process(raw_frame, now_ts=time.time())
                                 frame = res.frame
                                 if self._publish is not None and res.events:
                                     for e in res.events:
@@ -433,7 +446,7 @@ class WebcamController:
                             # Prepare frame for encoding (downscale in low-latency + motion-off mode)
                             frame_to_encode = last_frame
                             try:
-                                if bool(getattr(self, '_low_latency', False)) and not bool(self._motion_detector.enabled()):
+                                if bool(getattr(self, '_low_latency', False)) and not bool(self._detector.enabled()):
                                     s = float(getattr(self, '_preview_scale', 1.0))
                                     if 0.1 <= s < 1.0:
                                         frame_to_encode = cv2.resize(last_frame, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
@@ -505,36 +518,16 @@ class WebcamController:
     
 
     def motion_info(self) -> dict:
-        """Return motion detector info and latest state/metrics."""
-        try:
-            return self._motion_detector.info((int(self.width) if self.width else 0,
-                                               int(self.height) if self.height else 0))
-        except Exception:
-            return {
-                'enabled': False,
-                'rect': None,
-                'center': None,
-                'u': None,
-                'v': None,
-                'width': int(self.width) if self.width else None,
-                'height': int(self.height) if self.height else None,
-                'fg_pixels': 0,
-                'largest_area': 0,
-                'peak_largest_area': 0,
-            }
+        """Return active detector info and latest state/metrics."""
+        return self._detector.info((int(self.width) if self.width else 0,
+                                    int(self.height) if self.height else 0))
 
     def reset_motion_peak(self) -> None:
-        try:
-            self._motion_detector.reset_metrics()
-        except Exception:
-            pass
+        self._detector.reset_metrics()
 
     def motion_config(self) -> dict:
-        """Return current motion detector configuration."""
-        try:
-            return self._motion_detector.config()
-        except Exception:
-            return {}
+        """Return current detector configuration."""
+        return self._detector.config()
 
     # Diagnostics helpers
     def motion_counters(self) -> dict:
@@ -552,10 +545,7 @@ class WebcamController:
         self._publish = publish
 
     def suppress_motion(self, duration_sec: float = 0.5) -> None:
-        try:
-            self._motion_detector.suppress(float(duration_sec))
-        except Exception:
-            pass
+        self._detector.suppress(float(duration_sec))
 
     # Low-latency streaming control
     def set_low_latency_mode(self, enabled: bool) -> None:
@@ -580,7 +570,7 @@ class WebcamController:
     # Public controls for motion detection
     def set_motion_detection(self, enabled: bool, min_area: Optional[int] = None, alpha: Optional[float] = None, persist_ms: Optional[int] = None, bg_mode: Optional[str] = None, prefer_tracking: Optional[bool] = None, frame_skip: Optional[int] = None, scale: Optional[float] = None) -> None:
         # Configure detector
-        self._motion_detector.configure(
+        self._detector.configure(
             enabled=bool(enabled),
             min_area=min_area,
             alpha=alpha,
@@ -604,29 +594,50 @@ class WebcamController:
     # Motion zone controls (normalized rect x,y,w,h)
     def set_motion_zone(self, zone: Optional[Union[Tuple[float, float, float, float], List[float], Dict]]) -> None:
         if zone is None:
-            self._motion_detector.set_zone(None)
+            self._zone = None
+            # Apply to motion detector only
+            if self._detector_type == 'motion':
+                self._detector.set_zone(None)
             return
-        try:
-            if isinstance(zone, dict):
-                x = float(zone.get('x', 0.0))
-                y = float(zone.get('y', 0.0))
-                w = float(zone.get('w', 0.0))
-                h = float(zone.get('h', 0.0))
-            else:
-                x, y, w, h = [float(v) for v in zone]  # type: ignore
-            x = max(0.0, min(1.0, x))
-            y = max(0.0, min(1.0, y))
-            w = max(0.0, min(1.0 - x, w))
-            h = max(0.0, min(1.0 - y, h))
-            self._motion_detector.set_zone((x, y, w, h))
-        except Exception:
-            pass
+        # Normalize and persist
+        if isinstance(zone, dict):
+            x = float(zone.get('x', 0.0))
+            y = float(zone.get('y', 0.0))
+            w = float(zone.get('w', 0.0))
+            h = float(zone.get('h', 0.0))
+        else:
+            x, y, w, h = [float(v) for v in zone]  # type: ignore
+        x = max(0.0, min(1.0, x))
+        y = max(0.0, min(1.0, y))
+        w = max(0.0, min(1.0 - x, w))
+        h = max(0.0, min(1.0 - y, h))
+        self._zone = (x, y, w, h)
+        if self._detector_type == 'motion':
+            self._detector.set_zone(self._zone)
 
     def motion_zone(self) -> Optional[tuple[float, float, float, float]]:
-        try:
-            z = self._motion_detector.get_zone()
-            if z is None:
-                return None
-            return (float(z[0]), float(z[1]), float(z[2]), float(z[3]))
-        except Exception:
+        z = self._zone
+        if z is None:
             return None
+        return (float(z[0]), float(z[1]), float(z[2]), float(z[3]))
+
+    # Detector switching
+    def set_detector_type(self, kind: str) -> str:
+        kind = str(kind).lower().strip()
+        if kind not in ('motion', 'yolo'):
+            raise ValueError('invalid detector type')
+        if kind == getattr(self, '_detector_type', 'motion'):
+            return self._detector_type
+        if kind == 'motion':
+            det = MotionDetector()
+            # Apply stored zone when enabling motion
+            if self._zone is not None:
+                det.set_zone(self._zone)
+        else:
+            det = YOLOEventDetector()
+        self._detector = det
+        self._detector_type = kind
+        return self._detector_type
+
+    def get_detector_type(self) -> str:
+        return getattr(self, '_detector_type', 'motion')
