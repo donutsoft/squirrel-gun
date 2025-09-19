@@ -72,6 +72,11 @@ This document captures the working knowledge added while extending the project: 
 - Performance: Motion is computed on downscaled frames and every Nth frame to keep CPU low. JPEG encoding runs at the configured FPS; ensure device bandwidth is sufficient.
 - Safety: Recording deletion validates names and restricts paths to `static/recordings` to avoid traversal.
 
+## Local Development Policy
+- No fallback logic: Do not implement silent fallbacks or auto-degradation for any feature or dependency. This project runs on a single, controlled machine.
+- Fail fast: If something is missing, unsupported, or version-mismatched, raise a clear error instead of attempting alternatives.
+- Visibility over resiliency: Prefer explicit errors and actionable messages so issues surface immediately during development.
+
 ## Quick How-Tos
 - Start the server: `bash squirrel-daemon/run.sh` (ensure dependencies in `pyproject.toml` are installed via `uv` or equivalent).
 - Open the live view: visit `/` and `/webcam/stream` loads automatically in the page.
@@ -93,4 +98,3 @@ This document captures the working knowledge added while extending the project: 
 - `squirrel-daemon/app.py` — routes for recordings; event bus wiring for recording; existing motion/aim logic.
 - `squirrel-daemon/templates/Recordings.html` — new gallery page with delete actions.
 - `squirrel-daemon/templates/PanTiltControl.html` — link to recordings page.
-

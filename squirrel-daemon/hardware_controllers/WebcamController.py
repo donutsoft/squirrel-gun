@@ -4,6 +4,7 @@ import time
 import threading
 import cv2  # type: ignore
 from turbojpeg import TurboJPEG, TJPF_BGR, TJSAMP_420  # type: ignore
+from event_detection.motion import MotionDetector
 
 class WebcamController:
     def __init__(self, device: str = "/dev/video0", width: Optional[int] = None, height: Optional[int] = None):
@@ -22,39 +23,13 @@ class WebcamController:
         self._tj = TurboJPEG()
         # Number of active MJPEG consumers
         self._subscribers = 0
-        # Motion detection settings/state
-        self._motion_enabled = True
+        # Event detector: motion
+        self._motion_detector = MotionDetector()
         # Low-latency streaming mode flag (default ON)
         self._low_latency = True
         # Preview downscale factor for low-latency mode (encode fewer pixels)
         self._preview_scale = 0.5  # 0.1..1.0
-        # Increase default area to reduce sensitivity on noise
-        self._motion_min_area = 1500  # pixels in full-res image
-        self._motion_alpha = 0.05    # background learning rate
-        self._bg_gray = None         # type: ignore
-        self._last_motion_rect = None  # type: ignore
-        self._last_fg_pixels = 0
-        self._last_largest_area = 0
-        self._peak_largest_area = 0
-        # Temporal persistence and suppression
-        # Require brief persistence to avoid flicker/false positives
-        self._persist_ms = 250  # milliseconds; 0 disables persistence
-        self._candidate_rect = None  # type: ignore
-        self._candidate_start_ts = 0.0
-        self._suppress_until_ts = 0.0
         self._publish: Optional[Callable[[str, Any], None]] = None
-        # Background subtraction / selection strategy
-        self._bg_mode = 'knn'  # one of: 'avg', 'mog2', 'knn'
-        self._bg_subtractor = None  # type: ignore
-        # Prefer to follow previous target over raw largest blob
-        self._prefer_tracking = True
-        # Performance controls
-        self._motion_frame_skip = 0   # compute motion every N+1 frames (2 => ~5 Hz @ 15 fps)
-        self._motion_scale = 0.5      # process motion at half resolution
-        # Optional motion zone (normalized x,y,w,h in [0,1])
-        self._motion_zone = None  # type: ignore
-        # Pre-allocated morphology kernel for motion cleanup
-        self._morph_kernel = None  # type: ignore
 
         # Diagnostics for motion → recording path
         self._motion_events_published = 0
@@ -341,7 +316,7 @@ class WebcamController:
 
     def start_stream(self, fps: int = 15, quality: int = 80) -> None:
         # In low-latency mode with motion off, bias for lower encode cost
-        if bool(getattr(self, '_low_latency', False)) and not bool(getattr(self, '_motion_enabled', True)):
+        if bool(getattr(self, '_low_latency', False)) and not bool(self._motion_detector.enabled()):
             fps = min(int(fps), 12)
             quality = min(int(quality), 70)
         self._fps = max(1, int(fps))
@@ -363,245 +338,46 @@ class WebcamController:
                     ok, frame = cap.read()
                     if ok and frame is not None:
                         raw_frame = frame
-                        # Optional: motion detection and overlay (draw on a copy)
-                        if self._motion_enabled:
+                        # Run motion detector (draw overlays within detector)
+                        if self._motion_detector.enabled():
                             try:
-                                frame = raw_frame.copy()
-                                # Only run motion detection every Nth frame
-                                try:
-                                    counter = getattr(self, '_motion_counter')
-                                except Exception:
-                                    counter = 0
-                                do_motion = (counter % max(1, int(self._motion_frame_skip) + 1)) == 0
-                                try:
-                                    setattr(self, '_motion_counter', counter + 1)
-                                except Exception:
-                                    pass
-                                candidates = []
-                                if do_motion:
-                                    # Downscale first, then convert to gray/blur at smaller size
-                                    try:
-                                        s = float(self._motion_scale)
-                                    except Exception:
-                                        s = 0.5
-                                    s = 0.5 if not (0.1 <= s <= 1.0) else s
-                                    small = cv2.resize(frame, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
-                                    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-                                    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-                                    # Compute foreground mask based on configured background model
-                                    thresh = None
-                                    if self._bg_mode == 'mog2':
-                                        if self._bg_subtractor is None:
-                                            # Detect shadows; treat 255 as foreground later
-                                            self._bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=True)
-                                        fg = self._bg_subtractor.apply(gray, learningRate=float(self._motion_alpha))
-                                        # Remove shadows (value 127) by thresholding to 255 only
-                                        _, thresh = cv2.threshold(fg, 254, 255, cv2.THRESH_BINARY)
-                                    elif self._bg_mode == 'knn':
-                                        if self._bg_subtractor is None:
-                                            self._bg_subtractor = cv2.createBackgroundSubtractorKNN(history=400, dist2Threshold=400.0, detectShadows=True)
-                                        fg = self._bg_subtractor.apply(gray, learningRate=float(self._motion_alpha))
-                                        _, thresh = cv2.threshold(fg, 254, 255, cv2.THRESH_BINARY)
-                                    else:
-                                        # Running average background (simple, low-cost)
-                                        if self._bg_gray is None or getattr(self._bg_gray, 'shape', None) != gray.shape:
-                                            self._bg_gray = gray.copy().astype('float')
-                                        cv2.accumulateWeighted(gray, self._bg_gray, float(self._motion_alpha))
-                                        bg_uint8 = cv2.convertScaleAbs(self._bg_gray)
-                                        delta = cv2.absdiff(bg_uint8, gray)
-                                        _, thresh = cv2.threshold(delta, 25, 255, cv2.THRESH_BINARY)
-
-                                    # Morphological cleanup: remove speckles and fill small gaps
-                                    try:
-                                        kernel = self._morph_kernel
-                                    except Exception:
-                                        kernel = None
-                                    if kernel is None:
-                                        try:
-                                            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-                                            self._morph_kernel = kernel
-                                        except Exception:
-                                            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-                                    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-                                    thresh = cv2.morphologyEx(thresh, cv2.MORPH_DILATE, kernel, iterations=1)
-
-                                    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                                    # Count foreground pixels to help tune sensitivity
-                                    try:
-                                        fg_small = int(cv2.countNonZero(thresh))
-                                    except Exception:
-                                        fg_small = 0
-                                    min_area_small = int(float(self._motion_min_area) * (s * s))
-                                    for c in cnts:
-                                        if c is None:
-                                            continue
-                                        x, y, w, h = cv2.boundingRect(c)
-                                        area = w * h
-                                        if area >= int(min_area_small):
-                                            # Scale back to full-res coordinates
-                                            X = int(round(x / s))
-                                            Y = int(round(y / s))
-                                            W = int(round(w / s))
-                                            H = int(round(h / s))
-                                            candidates.append((X, Y, W, H, int(round(area / (s * s)))))
-
-                                    # If a motion zone is set, filter candidates to those whose center lies inside the zone
-                                    zone = None
-                                    try:
-                                        zone = getattr(self, '_motion_zone')
-                                    except Exception:
-                                        zone = None
-                                    if zone and isinstance(zone, (tuple, list)) and len(zone) == 4:
-                                        try:
-                                            # Use actual frame size to compute pixel zone
-                                            fh, fw = frame.shape[:2]
-                                            zx = int(max(0, min(fw, round(float(zone[0]) * fw))))
-                                            zy = int(max(0, min(fh, round(float(zone[1]) * fh))))
-                                            zw = int(max(0, min(fw - zx, round(float(zone[2]) * fw))))
-                                            zh = int(max(0, min(fh - zy, round(float(zone[3]) * fh))))
-                                            def inside(px: int, py: int) -> bool:
-                                                return (zx <= px <= (zx + zw)) and (zy <= py <= (zy + zh))
-                                            filtered = []
-                                            for X, Y, W, H, A in candidates:
-                                                cx = X + W // 2
-                                                cy = Y + H // 2
-                                                if inside(cx, cy):
-                                                    filtered.append((X, Y, W, H, A))
-                                            candidates = filtered
-                                            # Draw zone overlay on the frame for visualization
+                                res = self._motion_detector.process(raw_frame, now_ts=time.time())
+                                frame = res.frame
+                                if self._publish is not None and res.events:
+                                    for e in res.events:
+                                        # Compute normalized coords
+                                        if self.width and self.height and e.center is not None:
                                             try:
-                                                cv2.rectangle(frame, (zx, zy), (zx + zw, zy + zh), (255, 0, 0), 2)
-                                            except Exception:
-                                                pass
-                                        except Exception:
-                                            pass
-
-                                    # Store metrics (foreground count as current sample; largest area 'sticky' until next non-zero)
-                                    try:
-                                        self._last_fg_pixels = int(round(fg_small / (s * s)))
-                                    except Exception:
-                                        self._last_fg_pixels = fg_small
-                                    try:
-                                        cur_largest = int(max([r[4] for r in candidates])) if candidates else 0
-                                        if cur_largest > 0:
-                                            self._last_largest_area = cur_largest
-                                            if cur_largest > self._peak_largest_area:
-                                                self._peak_largest_area = cur_largest
-                                    except Exception:
-                                        pass
-
-                                best = None
-                                # Choose candidate: prefer overlap with previous to "follow" target
-                                def _iou(a, b) -> float:
-                                    ax, ay, aw, ah = a; bx, by, bw, bh = b
-                                    ax2, ay2 = ax + aw, ay + ah
-                                    bx2, by2 = bx + bw, by + bh
-                                    inter_w = max(0, min(ax2, bx2) - max(ax, bx))
-                                    inter_h = max(0, min(ay2, by2) - max(ay, by))
-                                    inter = inter_w * inter_h
-                                    union = aw * ah + bw * bh - inter
-                                    return (inter / union) if union > 0 else 0.0
-
-                                prev = self._last_motion_rect or self._candidate_rect
-                                if candidates:
-                                    if self._prefer_tracking and prev is not None:
-                                        # Pick with maximum IoU to previous; fallback to largest area if overlap tiny
-                                        best_by_iou = max(candidates, key=lambda r: _iou((r[0], r[1], r[2], r[3]), prev))
-                                        if _iou((best_by_iou[0], best_by_iou[1], best_by_iou[2], best_by_iou[3]), prev) >= 0.05:
-                                            best = (best_by_iou[0], best_by_iou[1], best_by_iou[2], best_by_iou[3])
-                                        else:
-                                            best_largest = max(candidates, key=lambda r: r[4])
-                                            best = (best_largest[0], best_largest[1], best_largest[2], best_largest[3])
-                                    else:
-                                        best_largest = max(candidates, key=lambda r: r[4])
-                                        best = (best_largest[0], best_largest[1], best_largest[2], best_largest[3])
-                                # Temporal persistence: optionally require stable presence before reporting
-                                now_ts = time.time()
-
-                                if best is None:
-                                    self._candidate_rect = None
-                                    self._candidate_start_ts = 0.0
-                                    self._last_motion_rect = None
-                                else:
-                                    # If persistence disabled, emit immediately (subject to suppression)
-                                    if int(self._persist_ms) <= 0 and now_ts >= self._suppress_until_ts:
-                                        self._last_motion_rect = best
-                                        x, y, w, h = best
-                                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                                        if self._publish is not None and self.width and self.height:
-                                            cx = x + w / 2.0
-                                            cy = y + h / 2.0
-                                            try:
+                                                cx, cy = e.center
                                                 u = float(cx) / float(self.width)
                                                 v = float(cy) / float(self.height)
                                             except Exception:
                                                 u, v = None, None
-                                            evt = {
-                                                'ts': now_ts,
-                                                'rect': (int(x), int(y), int(w), int(h)),
-                                                'center': (float(cx), float(cy)),
-                                                'u': u, 'v': v,
-                                                'width': int(self.width), 'height': int(self.height),
-                                                'fg_pixels': int(self._last_fg_pixels),
-                                                'largest_area': int(self._last_largest_area),
-                                            }
-                                            # Attach the triggering frame as JPEG for snapshot fidelity
-                                            try:
-                                                evt['jpeg'] = self._tj.encode(frame, quality=int(self._quality), pixel_format=TJPF_BGR, jpeg_subsample=TJSAMP_420)
-                                            except Exception:
-                                                pass
-                                            try:
-                                                self._motion_events_published += 1
-                                                self._publish('motion', evt)
-                                            except Exception:
-                                                pass
-                                    else:
-                                        if self._candidate_rect is None or _iou(best, self._candidate_rect) < 0.3:
-                                            self._candidate_rect = best
-                                            self._candidate_start_ts = now_ts
-                                        # Only accept as motion if persisted long enough and not suppressed
-                                        persisted = (now_ts - self._candidate_start_ts) * 1000.0
-                                        if persisted >= float(self._persist_ms) and now_ts >= self._suppress_until_ts:
-                                            self._last_motion_rect = best
-                                            x, y, w, h = best
-                                            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                                            # Publish motion event (non-blocking) if a bus is set
-                                            if self._publish is not None and self.width and self.height:
-                                                cx = x + w / 2.0
-                                                cy = y + h / 2.0
-                                                try:
-                                                    u = float(cx) / float(self.width)
-                                                    v = float(cy) / float(self.height)
-                                                except Exception:
-                                                    u, v = None, None
-                                                evt = {
-                                                    'ts': now_ts,
-                                                    'rect': (int(x), int(y), int(w), int(h)),
-                                                    'center': (float(cx), float(cy)),
-                                                    'u': u, 'v': v,
-                                                    'width': int(self.width), 'height': int(self.height),
-                                                    'fg_pixels': int(self._last_fg_pixels),
-                                                    'largest_area': int(self._last_largest_area),
-                                                }
-                                                # Attach the triggering frame as JPEG for snapshot fidelity
-                                                try:
-                                                    evt['jpeg'] = self._tj.encode(frame, quality=int(self._quality), pixel_format=TJPF_BGR, jpeg_subsample=TJSAMP_420)
-                                                except Exception:
-                                                    pass
-                                                try:
-                                                    self._motion_events_published += 1
-                                                    self._publish('motion', evt)
-                                                except Exception:
-                                                    pass
                                         else:
-                                            # Show a yellow box while accumulating persistence (optional visual feedback)
-                                            x, y, w, h = best
-                                            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 1)
+                                            u = v = None
+                                        evt = {
+                                            'ts': e.ts,
+                                            'rect': e.rect,
+                                            'center': e.center,
+                                            'u': u, 'v': v,
+                                            'width': int(self.width), 'height': int(self.height),
+                                        }
+                                        # Include metrics if present
+                                        if e.extra:
+                                            evt.update(e.extra)
+                                        # Attach JPEG of the overlay frame for fidelity
+                                        try:
+                                            evt['jpeg'] = self._tj.encode(frame, quality=int(self._quality), pixel_format=TJPF_BGR, jpeg_subsample=TJSAMP_420)
+                                        except Exception:
+                                            pass
+                                        try:
+                                            self._motion_events_published += 1
+                                            self._publish('motion', evt)
+                                        except Exception:
+                                            pass
                             except Exception:
-                                # If OpenCV processing fails for any reason, continue without overlay
-                                pass
+                                frame = raw_frame
                         else:
-                            # No overlay: use raw frame for preview
                             frame = raw_frame
                         last_frame = frame
                         # Handle recording lifecycle and write frames
@@ -657,7 +433,7 @@ class WebcamController:
                             # Prepare frame for encoding (downscale in low-latency + motion-off mode)
                             frame_to_encode = last_frame
                             try:
-                                if bool(getattr(self, '_low_latency', False)) and not bool(getattr(self, '_motion_enabled', True)):
+                                if bool(getattr(self, '_low_latency', False)) and not bool(self._motion_detector.enabled()):
                                     s = float(getattr(self, '_preview_scale', 1.0))
                                     if 0.1 <= s < 1.0:
                                         frame_to_encode = cv2.resize(last_frame, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
@@ -729,56 +505,36 @@ class WebcamController:
     
 
     def motion_info(self) -> dict:
-        """Return the latest motion rectangle and normalized center.
-
-        Returns a dict with keys: enabled, rect, center, u, v, width, height.
-        If no motion is detected or not enabled, rect/center/u/v are None.
-        """
-        rect = None
-        with self._cond:
-            if self._last_motion_rect is not None:
-                rect = tuple(int(v) for v in self._last_motion_rect)
-        info = {
-            'enabled': bool(self._motion_enabled),
-            'rect': rect,
-            'center': None,
-            'u': None,
-            'v': None,
-            'width': int(self.width) if self.width else None,
-            'height': int(self.height) if self.height else None,
-            'fg_pixels': int(self._last_fg_pixels),
-            'largest_area': int(self._last_largest_area),
-            'peak_largest_area': int(self._peak_largest_area),
-        }
-        if rect is not None and self.width and self.height:
-            x, y, w, h = rect
-            cx = x + w / 2.0
-            cy = y + h / 2.0
-            info['center'] = (cx, cy)
-            try:
-                info['u'] = float(cx) / float(self.width)
-                info['v'] = float(cy) / float(self.height)
-            except Exception:
-                info['u'] = None
-                info['v'] = None
-        return info
+        """Return motion detector info and latest state/metrics."""
+        try:
+            return self._motion_detector.info((int(self.width) if self.width else 0,
+                                               int(self.height) if self.height else 0))
+        except Exception:
+            return {
+                'enabled': False,
+                'rect': None,
+                'center': None,
+                'u': None,
+                'v': None,
+                'width': int(self.width) if self.width else None,
+                'height': int(self.height) if self.height else None,
+                'fg_pixels': 0,
+                'largest_area': 0,
+                'peak_largest_area': 0,
+            }
 
     def reset_motion_peak(self) -> None:
-        self._peak_largest_area = 0
+        try:
+            self._motion_detector.reset_metrics()
+        except Exception:
+            pass
 
     def motion_config(self) -> dict:
         """Return current motion detector configuration."""
-        return {
-            'enabled': bool(self._motion_enabled),
-            'min_area': int(self._motion_min_area),
-            'alpha': float(self._motion_alpha),
-            'persist_ms': int(self._persist_ms),
-            'bg_mode': str(self._bg_mode),
-            'prefer_tracking': bool(self._prefer_tracking),
-            'frame_skip': int(getattr(self, '_motion_frame_skip', 0)),
-            'scale': float(getattr(self, '_motion_scale', 1.0)),
-            'zone': tuple(self._motion_zone) if isinstance(getattr(self, '_motion_zone', None), (tuple, list)) else None,
-        }
+        try:
+            return self._motion_detector.config()
+        except Exception:
+            return {}
 
     # Diagnostics helpers
     def motion_counters(self) -> dict:
@@ -797,10 +553,9 @@ class WebcamController:
 
     def suppress_motion(self, duration_sec: float = 0.5) -> None:
         try:
-            d = float(duration_sec)
+            self._motion_detector.suppress(float(duration_sec))
         except Exception:
-            d = 0.5
-        self._suppress_until_ts = time.time() + max(0.0, d)
+            pass
 
     # Low-latency streaming control
     def set_low_latency_mode(self, enabled: bool) -> None:
@@ -824,63 +579,23 @@ class WebcamController:
 
     # Public controls for motion detection
     def set_motion_detection(self, enabled: bool, min_area: Optional[int] = None, alpha: Optional[float] = None, persist_ms: Optional[int] = None, bg_mode: Optional[str] = None, prefer_tracking: Optional[bool] = None, frame_skip: Optional[int] = None, scale: Optional[float] = None) -> None:
-        self._motion_enabled = bool(enabled)
-        if min_area is not None:
-            try:
-                self._motion_min_area = max(0, int(min_area))
-            except Exception:
-                pass
-        if alpha is not None:
-            try:
-                a = float(alpha)
-                # keep sane bounds for learning rate
-                if 0.0 < a <= 0.5:
-                    self._motion_alpha = a
-            except Exception:
-                pass
-        if persist_ms is not None:
-            try:
-                self._persist_ms = max(0, int(persist_ms))
-            except Exception:
-                pass
-        if bg_mode is not None:
-            m = str(bg_mode).lower().strip()
-            if m in ('avg', 'mog2', 'knn'):
-                self._bg_mode = m
-            # Reset background subtractor instance when mode changes
-            self._bg_subtractor = None
-        if prefer_tracking is not None:
-            try:
-                self._prefer_tracking = bool(prefer_tracking)
-            except Exception:
-                pass
-        if frame_skip is not None:
-            try:
-                self._motion_frame_skip = max(0, int(frame_skip))
-            except Exception:
-                pass
-        if scale is not None:
-            try:
-                s = float(scale)
-                if 0.1 <= s <= 1.0:
-                    self._motion_scale = s
-            except Exception:
-                pass
-        # Reset background model when toggling on to avoid stale state
-        if self._motion_enabled:
-            self._bg_gray = None
-            self._bg_subtractor = None
-            self._last_motion_rect = None
-            self._candidate_rect = None
-            self._candidate_start_ts = 0.0
-        # Automatically enable low-latency streaming when motion detection is disabled
+        # Configure detector
+        self._motion_detector.configure(
+            enabled=bool(enabled),
+            min_area=min_area,
+            alpha=alpha,
+            persist_ms=persist_ms,
+            bg_mode=bg_mode,
+            prefer_tracking=prefer_tracking,
+            frame_skip=frame_skip,
+            scale=scale,
+        )
+        # Adjust streaming hints based on enabled flag
         try:
-            if not self._motion_enabled:
+            if not bool(enabled):
                 self._low_latency = True
-                # Default to half-size preview when motion is off to save CPU
                 self._preview_scale = 0.5
             else:
-                # When motion is enabled again, drop back to normal latency unless explicitly set elsewhere
                 self._low_latency = bool(getattr(self, '_low_latency', False) and False)
                 self._preview_scale = 1.0
         except Exception:
@@ -889,9 +604,8 @@ class WebcamController:
     # Motion zone controls (normalized rect x,y,w,h)
     def set_motion_zone(self, zone: Optional[Union[Tuple[float, float, float, float], List[float], Dict]]) -> None:
         if zone is None:
-            self._motion_zone = None
+            self._motion_detector.set_zone(None)
             return
-        # Accept dict with x,y,w,h or tuple/list
         try:
             if isinstance(zone, dict):
                 x = float(zone.get('x', 0.0))
@@ -900,18 +614,19 @@ class WebcamController:
                 h = float(zone.get('h', 0.0))
             else:
                 x, y, w, h = [float(v) for v in zone]  # type: ignore
-            # Clamp to [0,1] and ensure non-negative width/height within bounds
             x = max(0.0, min(1.0, x))
             y = max(0.0, min(1.0, y))
             w = max(0.0, min(1.0 - x, w))
             h = max(0.0, min(1.0 - y, h))
-            self._motion_zone = (x, y, w, h)
+            self._motion_detector.set_zone((x, y, w, h))
         except Exception:
-            # On invalid input, ignore and keep previous
             pass
 
     def motion_zone(self) -> Optional[tuple[float, float, float, float]]:
-        z = getattr(self, '_motion_zone', None)
-        if isinstance(z, (tuple, list)) and len(z) == 4:
+        try:
+            z = self._motion_detector.get_zone()
+            if z is None:
+                return None
             return (float(z[0]), float(z[1]), float(z[2]), float(z[3]))
-        return None
+        except Exception:
+            return None
