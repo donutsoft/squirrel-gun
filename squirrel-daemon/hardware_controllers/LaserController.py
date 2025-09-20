@@ -13,6 +13,10 @@ except Exception:
             print(f"[LaserController] GPIO.setmode({mode}) [noop]")
 
         @staticmethod
+        def setwarnings(flag):
+            print(f"[LaserController] GPIO.setwarnings({flag}) [noop]")
+
+        @staticmethod
         def setup(pin, mode):
             print(f"[LaserController] GPIO.setup(pin={pin}, mode={mode}) [noop]")
 
@@ -27,10 +31,24 @@ except Exception:
     GPIO = _DummyGPIO()  # type: ignore
 
 class LaserController:
+    _configured_pins = set()  # class-level to avoid duplicate setup warnings
     def __init__(self, pin: int = 23):
         self._pin = int(pin)
         GPIO.setmode(GPIO.BCM)
-        GPIO.setup(self._pin, GPIO.OUT)
+        # Suppress benign "channel already in use" warnings due to repeated init
+        try:
+            GPIO.setwarnings(False)
+        except Exception:
+            pass
+        # Idempotent setup: only configure the pin once per process
+        if self._pin not in LaserController._configured_pins:
+            GPIO.setup(self._pin, GPIO.OUT)
+            # Default to OFF on startup
+            try:
+                GPIO.output(self._pin, GPIO.LOW)
+            except Exception:
+                pass
+            LaserController._configured_pins.add(self._pin)
 
     def turn_on(self):
         print("Turning on the laser.")

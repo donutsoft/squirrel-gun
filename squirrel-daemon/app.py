@@ -7,6 +7,8 @@ from pathlib import Path
 from db import ClickStore
 from aim_model import LinearAimer
 from event_bus import EventBus
+
+from aiming import CameraIntrinsics
 import time
 import re
 
@@ -782,6 +784,7 @@ def aim_to_click():
     normalized coordinates (u,v). If values are > 1, treat as pixel
     coordinates and normalize using the webcam's configured resolution.
     """
+
     global current
     data = request.get_json(silent=True) or {}
     try:
@@ -791,7 +794,7 @@ def aim_to_click():
         return jsonify({"error": "x and y required"}), 400
     if x is None or y is None:
         return jsonify({"error": "x and y required"}), 400
-
+    """
     # Determine normalization
     cam_w = float(getattr(webcam, 'width', 0) or 0)
     cam_h = float(getattr(webcam, 'height', 0) or 0)
@@ -816,17 +819,28 @@ def aim_to_click():
     new_pan = _clamp(pred_pan, 0.0, float(getattr(pantilt, 'PAN_MAX_DEG', 180)))
     new_tilt = _clamp(pred_tilt, 0.0, float(getattr(pantilt, 'TILT_MAX_DEG', 180)))
 
+    """
+
+    intrinsics = CameraIntrinsics(1280,720, 98.0, 98.0)
+    result = intrinsics.get_pitch_yaw_from_tuple(x, y)
+    # yaw result[0], tilt result[1]
+    pred_pan = result[0]
+    pred_tilt = result[1]
+
+    new_pan = _clamp(pred_pan, 0.0, float(getattr(pantilt, 'PAN_MAX_DEG', 180)))
+    new_tilt = _clamp(pred_tilt, 0.0, float(getattr(pantilt, 'TILT_MAX_DEG', 180)))
+
     pantilt.setPanTilt(new_pan, new_tilt)
     current = (new_pan, new_tilt)
 
     return jsonify({
         "status": "ok",
-        "x": x, "y": y, "mode": mode,
-        "u": u, "v": v,
-        "x_px": x_px, "y_px": y_px,
+        #"x": x, "y": y, "mode": mode,
+        #"u": u, "v": v,
+        #"x_px": x_px, "y_px": y_px,
         "pan": new_pan, "tilt": new_tilt,
-        "model": aimer.to_dict(),
-        "n_rows": n_rows, "trained": trained,
+        #"model": aimer.to_dict(),
+        #"n_rows": n_rows, "trained": trained,
     })
 
 
