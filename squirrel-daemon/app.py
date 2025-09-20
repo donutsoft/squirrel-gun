@@ -7,8 +7,7 @@ from pathlib import Path
 from db import ClickStore
 from aim_model import LinearAimer
 from event_bus import EventBus
-
-from aiming import CameraIntrinsics
+from .aiming import Calculate_Hose_Angles
 import time
 import re
 
@@ -820,18 +819,19 @@ def aim_to_click():
     new_tilt = _clamp(pred_tilt, 0.0, float(getattr(pantilt, 'TILT_MAX_DEG', 180)))
 
     """
+    print(f"Received aim request for {x},{y}", flush=True)
+    results  = Calculate_Hose_Angles.get_yaw_pitch(x,y)
+    print(f"Calculated angles")
 
-    intrinsics = CameraIntrinsics(1280,720, 98.0, 98.0)
-    result = intrinsics.get_pitch_yaw_from_tuple(x, y)
-    # yaw result[0], tilt result[1]
-    pred_pan = result[0]
-    pred_tilt = result[1]
+    pred_pan = results[0]
+    pred_tilt = results[1]
 
     new_pan = _clamp(pred_pan, 0.0, float(getattr(pantilt, 'PAN_MAX_DEG', 180)))
     new_tilt = _clamp(pred_tilt, 0.0, float(getattr(pantilt, 'TILT_MAX_DEG', 180)))
 
     pantilt.setPanTilt(new_pan, new_tilt)
     current = (new_pan, new_tilt)
+    print(f"Result {new_pan},{new_tilt}", flush=True)
 
     return jsonify({
         "status": "ok",
