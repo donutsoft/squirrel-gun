@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EdgeTPU TFLite Converter</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 2rem; }
+    .box { border: 1px solid #ddd; padding: 1rem; border-radius: 8px; max-width: 800px; }
+    .logs { white-space: pre-wrap; background: #111; color: #eee; padding: 1rem; border-radius: 6px; overflow-x: auto; }
+    .flash { color: #b00; font-weight: 600; }
+  </style>
+  </head>
+<body>
+  <h1>EdgeTPU Export Service</h1>
+  <div class="box">
+    <form method="post" action="/upload" enctype="multipart/form-data">
+      <label>Upload model checkpoint (.pt):</label><br/>
+      <input type="file" name="file" required><br/><br/>
+      <button type="submit">Convert to EdgeTPU TFLite</button>
+    </form>
+  </div>
+
+  {% with messages = get_flashed_messages() %}
+    {% if messages %}
+      <p class="flash">{{ messages[0] }}</p>
+    {% endif %}
+  {% endwith %}
+
+  {% if job_id %}
+    <h2>Logs</h2>
+    <div id="logs" class="logs"></div>
+    <div id="download"></div>
+    <script>
+      (function(){
+        const logEl = document.getElementById('logs');
+        const dlEl = document.getElementById('download');
+        const es = new EventSource('/stream/{{ job_id }}');
+        es.onmessage = (evt) => {
+          try {
+            const msg = JSON.parse(evt.data);
+            if (msg.type === 'log') {
+              logEl.textContent += msg.message;
+              logEl.scrollTop = logEl.scrollHeight;
+            } else if (msg.type === 'done') {
+              es.close();
+              if (msg.download) {
+                dlEl.innerHTML = '<h2>Download</h2><p><a href="' + msg.download + '">Download edge_tpu.tflite</a></p>';
+              } else {
+                dlEl.innerHTML = '<p class="flash">Export did not produce an edge_tpu.tflite file. Check logs.</p>';
+              }
+            }
+          } catch (e) {
+            // ignore parse errors
+          }
+        };
+      })();
+    </script>
+  {% endif %}
+</body>
+</html>

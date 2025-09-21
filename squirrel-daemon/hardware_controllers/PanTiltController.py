@@ -28,12 +28,14 @@ class PanTiltController:
     def setPan(self, angle: float) -> None:
         # Add offset in UI domain, then invert for physical direction
         servo_angle = float(self.PAN_MAX_DEG) - (float(angle) + self._pan_offset)
-        self._setAngle(self.pan_pin, servo_angle, self.PAN_MAX_DEG)
+        if angle >= 70 and angle <= 200:
+            self._setAngle(self.pan_pin, servo_angle, self.PAN_MAX_DEG)
 
     def setTilt(self, angle: float) -> None:
         # Add offset in UI domain, then invert for physical direction
         servo_angle = float(self.TILT_MAX_DEG) - (float(angle) + self._tilt_offset)
-        self._setAngle(self.tilt_pin, servo_angle, self.TILT_MAX_DEG)
+        if angle >=20 and angle <= 170:
+            self._setAngle(self.tilt_pin, servo_angle, self.TILT_MAX_DEG)
 
     def setPanTilt(self, pan: float, tilt: float) -> None:
         self.setPan(pan)
