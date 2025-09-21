@@ -5,12 +5,18 @@ from contextlib import redirect_stdout, redirect_stderr
 import threading
 import queue
 import json
+import logging
 
-from flask import Flask, request, render_template, redirect, url_for, send_from_directory, flash, Response
+from flask import Flask, request, render_template, redirect, url_for, send_from_directory, flash, Response, stream_with_context
 from uuid import uuid4
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret")
+# Allow large uploads (MB). Default 1024MB. Override with MAX_UPLOAD_MB env var.
+try:
+    app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('MAX_UPLOAD_MB', '1024')) * 1024 * 1024
+except Exception:
+    app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024 * 1024
 
 BASE_DIR = Path(__file__).parent.resolve()
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -38,29 +44,71 @@ class QueueWriter:
 JOBS = {}
 
 
+class QueueLogHandler(logging.Handler):
+    """Logging handler that writes formatted records into a Queue for SSE streaming."""
+    def __init__(self, q: queue.Queue):
+        super().__init__()
+        self.q = q
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            msg = self.format(record)
+        except Exception:
+            msg = record.getMessage()
+        # Ensure each log record ends with a newline for readability
+        if not msg.endswith("\n"):
+            msg += "\n"
+        self.q.put(msg)
+
+
 def run_export(job_id: str, upload_path: Path):
     """Export to EdgeTPU using Ultralytics YOLO export only.
     Streams logs to JOBS[job_id]['queue'] and records output.
+    Uses the original uploaded filename and removes it after export.
     """
-    from ultralytics import YOLO
 
     q: queue.Queue = JOBS[job_id]["queue"]
     writer = QueueWriter(q)
 
-    # As requested, use fixed name "uploadedfile.tp" regardless of input name
-    fixed_input = UPLOAD_DIR / "uploadedfile.tp"
-    fixed_input.write_bytes(upload_path.read_bytes())
-
     exported_path = None
+    # Attach logging handler to stream Ultralytics logs as they occur
+    root_logger = logging.getLogger()
+    ul_logger = logging.getLogger("ultralytics")
+    handler = QueueLogHandler(q)
+    formatter = logging.Formatter("[%(levelname)s] %(message)s")
+    handler.setFormatter(formatter)
+    root_logger.addHandler(handler)
+    ul_logger.addHandler(handler)
+    # Ensure INFO level so typical logs are emitted
+    root_prev_level = root_logger.level
+    ul_prev_level = ul_logger.level
+    root_logger.setLevel(logging.INFO)
+    ul_logger.setLevel(logging.INFO)
+
     with redirect_stdout(writer), redirect_stderr(writer):
         try:
-            print(f"Loading model from: {fixed_input}")
-            model = YOLO(str(fixed_input))
+            print("Starting job...\n")
+            print(f"Loading model from: {upload_path}")
+            # Import inside the redirected/logging context to capture import-time logs
+            from ultralytics import YOLO
+            model = YOLO(str(upload_path))
             print("Starting export to EdgeTPU via Ultralytics...")
             result = model.export(format='edgetpu', imgsz=320, nms=False, batch=1, dynamic=False)
             print(f"Export result: {result}")
         except Exception as e:
             print("Export failed:", repr(e))
+        finally:
+            # Detach handlers and restore levels to avoid duplicate logs in subsequent jobs
+            try:
+                root_logger.removeHandler(handler)
+            except Exception:
+                pass
+            try:
+                ul_logger.removeHandler(handler)
+            except Exception:
+                pass
+            root_logger.setLevel(root_prev_level)
+            ul_logger.setLevel(ul_prev_level)
 
     # Try to locate the produced *edgetpu.tflite file
     candidates = list(BASE_DIR.rglob("*edgetpu.tflite"))
@@ -71,6 +119,13 @@ def run_export(job_id: str, upload_path: Path):
         target = OUTPUT_DIR / f"{job_id}_edge_tpu.tflite"
         target.write_bytes(src.read_bytes())
         exported_path = target
+
+    # Remove the original uploaded file after export completes (success or fail)
+    try:
+        if upload_path.exists():
+            upload_path.unlink()
+    except Exception:
+        pass
 
     JOBS[job_id]["download"] = exported_path.name if exported_path else None
     JOBS[job_id]["done"] = True
@@ -85,12 +140,12 @@ def index():
 def upload():
     if 'file' not in request.files:
         flash('No file part provided')
-        return redirect(url_for('index'))
+        return render_template('upload.html')
 
     file = request.files['file']
     if file.filename == '':
         flash('No file selected')
-        return redirect(url_for('index'))
+        return render_template('upload.html')
 
     # Save uploaded file
     saved_path = UPLOAD_DIR / file.filename
@@ -113,26 +168,35 @@ def stream(job_id):
 
     def event_stream():
         q: queue.Queue = JOBS[job_id]["queue"]
+        # Send an initial message so the client sees activity promptly
+        init = {"type": "status", "message": "connected"}
+        yield f"data: {json.dumps(init)}\n\n"
+        # Periodic heartbeats to keep proxies/browsers flushing
+        import time
+        last_ping = time.time()
         while True:
             try:
                 chunk = q.get(timeout=0.5)
             except queue.Empty:
                 if JOBS[job_id]["done"]:
-                    data = {
-                        "type": "done",
-                        "download": (
-                            url_for('download_file', filename=JOBS[job_id]["download"]) if JOBS[job_id]["download"] else None
-                        ),
-                    }
+                    download = JOBS[job_id]["download"]
+                    download_url = f"/download/{download}" if download else None
+                    data = {"type": "done", "download": download_url}
                     yield f"data: {json.dumps(data)}\n\n"
                     break
+                # Heartbeat every 2s
+                if time.time() - last_ping > 2:
+                    yield ": ping\n\n"
+                    last_ping = time.time()
                 continue
             else:
                 data = {"type": "log", "message": chunk}
                 yield f"data: {json.dumps(data)}\n\n"
 
-    resp = Response(event_stream(), mimetype='text/event-stream')
-    resp.headers["Cache-Control"] = "no-cache"
+    resp = Response(stream_with_context(event_stream()), mimetype='text/event-stream')
+    resp.headers["Cache-Control"] = "no-cache, no-transform"
+    resp.headers["X-Accel-Buffering"] = "no"  # Disable nginx buffering if present
+    resp.headers["Connection"] = "keep-alive"
     return resp
 
 
