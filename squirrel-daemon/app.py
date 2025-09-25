@@ -793,7 +793,7 @@ def aim_to_click():
         return jsonify({"error": "x and y required"}), 400
     if x is None or y is None:
         return jsonify({"error": "x and y required"}), 400
-    """
+
     # Determine normalization
     cam_w = float(getattr(webcam, 'width', 0) or 0)
     cam_h = float(getattr(webcam, 'height', 0) or 0)
@@ -832,15 +832,19 @@ def aim_to_click():
     pantilt.setPanTilt(new_pan, new_tilt)
     current = (new_pan, new_tilt)
     print(f"Result {new_pan},{new_tilt}", flush=True)
+    """
+    
+    pantilt.setPanTilt(new_pan, new_tilt)
+    current = (new_pan, new_tilt)
 
     return jsonify({
         "status": "ok",
-        #"x": x, "y": y, "mode": mode,
-        #"u": u, "v": v,
-        #"x_px": x_px, "y_px": y_px,
+        "x": x, "y": y, "mode": mode,
+        "u": u, "v": v,
+        "x_px": x_px, "y_px": y_px,
         "pan": new_pan, "tilt": new_tilt,
-        #"model": aimer.to_dict(),
-        #"n_rows": n_rows, "trained": trained,
+        "model": aimer.to_dict(),
+        "n_rows": n_rows, "trained": trained,
     })
 
 
