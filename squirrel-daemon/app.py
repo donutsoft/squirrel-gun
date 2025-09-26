@@ -45,7 +45,7 @@ try:
     persisted = store.get_settings([
         'motion.enabled', 'motion.min_area', 'motion.alpha', 'motion.persist_ms', 'motion.bg_mode',
         'motion.prefer_tracking', 'motion.frame_skip', 'motion.scale',
-        'record.record_on_motion', 'record.duration_sec', 'record.snapshot_on_motion',
+        'record.record_on_motion', 'record.duration_sec', 'record.snapshot_on_motion', 'record.preroll_sec',
         'follow_motion.enabled',
         'motion.zone',
         'water_on_motion.enabled',
@@ -76,6 +76,7 @@ try:
         record_on_motion=persisted.get('record.record_on_motion', cur_rec.get('record_on_motion')),
         duration_sec=persisted.get('record.duration_sec', cur_rec.get('duration_sec')),
         snapshot_on_motion=persisted.get('record.snapshot_on_motion', cur_rec.get('snapshot_on_motion')),
+        preroll_sec=persisted.get('record.preroll_sec', cur_rec.get('preroll_sec')),
     )
     # Apply follow motion flag
     if 'follow_motion.enabled' in persisted:
@@ -259,12 +260,14 @@ def recording_config_set():
     record_on_motion = data.get('record_on_motion')
     duration_sec = data.get('duration_sec')
     snapshot_on_motion = data.get('snapshot_on_motion')
+    preroll_sec = data.get('preroll_sec')
     try:
-        webcam.set_recording_config(record_on_motion=record_on_motion, duration_sec=duration_sec, snapshot_on_motion=snapshot_on_motion)
+        webcam.set_recording_config(record_on_motion=record_on_motion, duration_sec=duration_sec, snapshot_on_motion=snapshot_on_motion, preroll_sec=preroll_sec)
         try:
             if record_on_motion is not None: store.set_setting('record.record_on_motion', bool(record_on_motion))
             if duration_sec is not None: store.set_setting('record.duration_sec', float(duration_sec))
             if snapshot_on_motion is not None: store.set_setting('record.snapshot_on_motion', bool(snapshot_on_motion))
+            if preroll_sec is not None: store.set_setting('record.preroll_sec', float(preroll_sec))
         except Exception:
             pass
         return jsonify({"status": "ok", **webcam.get_recording_config()})

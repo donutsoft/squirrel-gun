@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Optional, Iterator, Callable, Any, Union, Tuple, List, Dict
+from collections import deque
 import time
 import threading
 import cv2  # type: ignore
@@ -62,6 +63,17 @@ class WebcamController:
         self._recording_path: Optional[_P] = None  # type: ignore
         self._recording_lock = threading.Lock()
         self._bus = None  # type: ignore
+        # Preferred recording FPS (writer). Decoupled from streaming FPS.
+        self._record_fps = 15
+
+        # Pre-roll buffer for recording N seconds before trigger
+        self._preroll_sec: float = 5.0
+        self._preroll_enabled: bool = True
+        # Store tuples of (ts, frame_bgr). Using uncompressed frames for speed.
+        # Note: 1280x720x3 @ 15fps for 5s ≈ ~200MB peak usage.
+        self._preroll: deque[Tuple[float, Any]] = deque()
+        self._preroll_lock = threading.Lock()
+        self._preroll_flush_done = False
 
     def _device_index(self) -> int:
         index = 0
@@ -222,6 +234,8 @@ class WebcamController:
             self._recording_path = out_path
             self._recording_active = True
             self._recording_end_ts = now + max(0.1, float(duration_sec))
+            # Ensure preroll will be flushed at start of this new recording
+            self._preroll_flush_done = False
             # Close any previous writer defensively
             try:
                 if self._video_writer is not None:
@@ -243,6 +257,8 @@ class WebcamController:
                 pass
             self._video_writer = None
             self._recording_path = None
+            # Reset flush flag so next recording can include pre-roll
+            self._preroll_flush_done = False
 
     def is_recording(self) -> bool:
         with self._recording_lock:
@@ -313,9 +329,10 @@ class WebcamController:
             'record_on_motion': bool(self._record_on_motion_enabled),
             'duration_sec': float(self._record_duration_sec),
             'snapshot_on_motion': bool(self._snapshot_on_motion_enabled),
+            'preroll_sec': float(getattr(self, '_preroll_sec', 0.0)),
         }
 
-    def set_recording_config(self, record_on_motion: Optional[bool] = None, duration_sec: Optional[float] = None, snapshot_on_motion: Optional[bool] = None) -> None:
+    def set_recording_config(self, record_on_motion: Optional[bool] = None, duration_sec: Optional[float] = None, snapshot_on_motion: Optional[bool] = None, preroll_sec: Optional[float] = None) -> None:
         if record_on_motion is not None:
             self._record_on_motion_enabled = bool(record_on_motion)
         if duration_sec is not None:
@@ -325,6 +342,17 @@ class WebcamController:
                 pass
         if snapshot_on_motion is not None:
             self._snapshot_on_motion_enabled = bool(snapshot_on_motion)
+        if preroll_sec is not None:
+            try:
+                p = float(preroll_sec)
+                if p <= 0:
+                    self._preroll_sec = 0.0
+                    self._preroll_enabled = False
+                else:
+                    self._preroll_sec = min(30.0, p)  # cap to 30s for safety
+                    self._preroll_enabled = True
+            except Exception:
+                pass
 
 
     def start_stream(self, fps: int = 15, quality: int = 80) -> None:
@@ -351,6 +379,23 @@ class WebcamController:
                     ok, frame = cap.read()
                     if ok and frame is not None:
                         raw_frame = frame
+                        # Append to pre-roll buffer as raw BGR frame (uncompressed)
+                        try:
+                            if bool(getattr(self, '_preroll_enabled', False)) and float(getattr(self, '_preroll_sec', 0.0)) > 0.0:
+                                ts_now = time.time()
+                                with self._preroll_lock:
+                                    # Store a copy to decouple from OpenCV's reused buffers
+                                    self._preroll.append((ts_now, raw_frame.copy()))
+                                    # Drop frames older than preroll window
+                                    cutoff = ts_now - float(getattr(self, '_preroll_sec', 0.0))
+                                    while self._preroll and self._preroll[0][0] < cutoff:
+                                        self._preroll.popleft()
+                                    # Hard cap to avoid unbounded memory in case of FPS spikes
+                                    max_frames = int(max(1, self._fps) * max(1.0, float(getattr(self, '_preroll_sec', 0.0)) * 2.0))
+                                    while len(self._preroll) > max_frames:
+                                        self._preroll.popleft()
+                        except Exception:
+                            pass
                         # Run motion detector (draw overlays within detector)
                         if self._detector.enabled():
                             try:
@@ -407,13 +452,42 @@ class WebcamController:
                                     self._video_writer = None
                                     self._recording_active = False
                                     self._recording_path = None
+                                    self._preroll_flush_done = False
                                 if self._recording_active:
                                     if self._video_writer is None:
                                         h, w = raw_frame.shape[:2]
-                                        fps_w = max(1, int(self._fps))
+                                        # Use camera-reported FPS when available; fall back to configured record FPS
+                                        try:
+                                            cam_fps = cap.get(cv2.CAP_PROP_FPS)
+                                            fps_w = max(1, int(round(cam_fps))) if cam_fps and cam_fps > 0 else max(1, int(getattr(self, '_record_fps', 15)))
+                                        except Exception:
+                                            fps_w = max(1, int(getattr(self, '_record_fps', 15)))
                                         path = self._recording_path or (self._recordings_dir / f'rec_{time.strftime("%Y%m%d_%H%M%S")}.mp4')
                                         self._recording_path = path
                                         self._video_writer = self._open_video_writer(path, fps_w, (w, h))
+                                        # On first open, flush pre-roll frames at start of clip
+                                        if self._video_writer is not None and not bool(getattr(self, '_preroll_flush_done', False)):
+                                            try:
+                                                # Copy current buffer snapshot to avoid holding lock while decoding
+                                                with self._preroll_lock:
+                                                    preroll_items = list(self._preroll)
+                                                if preroll_items:
+                                                    # Determine writer size
+                                                    try:
+                                                        ws = int(getattr(self._video_writer, 'get', lambda *_: 0)(cv2.CAP_PROP_FRAME_WIDTH))
+                                                        hs = int(getattr(self._video_writer, 'get', lambda *_: 0)(cv2.CAP_PROP_FRAME_HEIGHT))
+                                                    except Exception:
+                                                        ws, hs = w, h
+                                                    for _, fr0 in preroll_items:
+                                                        try:
+                                                            fr = fr0
+                                                            if ws and hs and (fr0.shape[1] != ws or fr0.shape[0] != hs):
+                                                                fr = cv2.resize(fr0, (ws, hs), interpolation=cv2.INTER_LINEAR)
+                                                            self._video_writer.write(fr)
+                                                        except Exception:
+                                                            continue
+                                            finally:
+                                                self._preroll_flush_done = True
                                     if self._video_writer is not None:
                                         try:
                                             # Resize to writer size if necessary to satisfy encoder requirements
