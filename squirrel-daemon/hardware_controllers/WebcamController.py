@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Optional, Iterator, Callable, Any, Union, Tuple, List, Dict
+from collections import deque
 import time
 import threading
 import cv2  # type: ignore
@@ -17,7 +18,7 @@ class WebcamController:
         self._quality = 70
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._latest: bytes = b""
+        self._latest: Optional[Any] = None
         self._seq = 0
         self._cond = threading.Condition()
         # TurboJPEG encoder instance (required)
@@ -61,6 +62,14 @@ class WebcamController:
         self._video_writer = None  # type: ignore
         self._recording_path: Optional[_P] = None  # type: ignore
         self._recording_lock = threading.Lock()
+        self._buffer_duration_sec = 30.0
+        self._motion_persist_delay_sec = 25.0
+        self._frame_buffer: deque[tuple[float, Any]] = deque()
+        self._frame_buffer_lock = threading.Lock()
+        self._pending_persist_timer: Optional[threading.Timer] = None
+        self._persist_timer_lock = threading.Lock()
+        self._last_motion_event_ts = 0.0
+        self._pending_persist_meta: Optional[dict[str, float]] = None
         self._bus = None  # type: ignore
 
     def _device_index(self) -> int:
@@ -96,6 +105,19 @@ class WebcamController:
         cap.set(cv2.CAP_PROP_FOURCC, fourcc)
         return cap
 
+    def _encode_frame(self, frame: Any, quality: Optional[int] = None) -> Optional[bytes]:
+        if frame is None:
+            return None
+        try:
+            q = int(quality if quality is not None else self._quality)
+        except Exception:
+            q = int(self._quality)
+        q = max(1, min(100, q))
+        try:
+            return self._tj.encode(frame, quality=q, pixel_format=TJPF_BGR, jpeg_subsample=TJSAMP_420)
+        except Exception:
+            return None
+
     def _capture_with_opencv(self, outfile: Path) -> bool:
         cap = self._open_capture()
 
@@ -105,8 +127,10 @@ class WebcamController:
             return False
 
         # Encode using TurboJPEG and write to file
+        jpg = self._encode_frame(frame)
+        if not jpg:
+            return False
         try:
-            jpg = self._tj.encode(frame, quality=int(self._quality), pixel_format=TJPF_BGR, jpeg_subsample=TJSAMP_420)
             with open(outfile, 'wb') as f:
                 f.write(jpg)
             return True
@@ -116,14 +140,124 @@ class WebcamController:
     def capture(self, outfile: Path) -> Path:
         outfile = outfile.resolve()
         outfile.parent.mkdir(parents=True, exist_ok=True)
-        # Fast path: if we already have a recent frame, use it without locking
-        data: Optional[bytes] = self._latest if self._latest else None
-        if data:
-            with open(outfile, 'wb') as f:
-                f.write(data)
-            return outfile
+        # Fast path: if we already have a recent frame, encode it and write to disk
+        frame: Optional[Any] = None
+        with self._cond:
+            frame = self._latest if self._latest is not None else None
+        if frame is not None:
+            jpg = self._encode_frame(frame)
+            if jpg:
+                with open(outfile, 'wb') as f:
+                    f.write(jpg)
+                return outfile
         self._capture_with_opencv(outfile)
         return outfile
+
+    def _append_frame_to_buffer(self, frame: Any, ts: Optional[float] = None) -> None:
+        if frame is None:
+            return
+        if ts is None:
+            ts = time.time()
+        with self._frame_buffer_lock:
+            self._frame_buffer.append((float(ts), frame.copy()))
+            cutoff = float(ts) - float(self._buffer_duration_sec)
+            while self._frame_buffer and self._frame_buffer[0][0] < cutoff:
+                self._frame_buffer.popleft()
+
+    def _snapshot_buffer(self) -> list[tuple[float, Any]]:
+        with self._frame_buffer_lock:
+            return list(self._frame_buffer)
+
+    def _persist_buffer_to_file(self, event_ts: Optional[float] = None) -> Optional[Path]:
+        frames = self._snapshot_buffer()
+        if not frames:
+            return None
+        # Use the dimensions from the most recent frame to configure the encoder
+        _, last_frame = frames[-1]
+        if last_frame is None or not hasattr(last_frame, 'shape'):
+            return None
+        h, w = last_frame.shape[:2]
+        if w <= 0 or h <= 0:
+            return None
+        base_ts = event_ts if event_ts is not None else frames[-1][0]
+        fname = time.strftime('rec_%Y%m%d_%H%M%S', time.localtime(base_ts)) + f"_{int((base_ts % 1) * 1000):03d}.mp4"
+        out_path = self._recordings_dir / fname
+        writer = self._open_video_writer(out_path, max(1, int(self._fps)), (w, h))
+        if writer is None:
+            return None
+        written = 0
+        try:
+            for _, frame in frames:
+                if frame is None or not hasattr(frame, 'shape'):
+                    continue
+                fh, fw = frame.shape[:2]
+                out_frame = frame
+                if fw != w or fh != h:
+                    out_frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
+                if not out_frame.flags.c_contiguous:
+                    out_frame = out_frame.copy()
+                writer.write(out_frame)
+                written += 1
+        finally:
+            try:
+                writer.release()
+            except Exception:
+                pass
+        if written == 0:
+            try:
+                out_path.unlink()
+            except Exception:
+                pass
+            return None
+        return out_path
+
+    def _persist_buffer_later(self) -> None:
+        meta: Optional[dict[str, float]]
+        with self._persist_timer_lock:
+            meta = self._pending_persist_meta.copy() if self._pending_persist_meta else None
+            self._pending_persist_timer = None
+            self._pending_persist_meta = None
+        event_ts = None
+        if meta is not None:
+            event_ts = meta.get('first_ts')
+        path = self._persist_buffer_to_file(event_ts=event_ts)
+        if path is None:
+            return
+
+    def _schedule_motion_persist(self, event_ts: float) -> bool:
+        created = False
+        delay = float(getattr(self, '_motion_persist_delay_sec', 25.0))
+        with self._persist_timer_lock:
+            timer = self._pending_persist_timer
+            if timer is not None:
+                try:
+                    timer.cancel()
+                except Exception:
+                    pass
+            else:
+                created = True
+            if self._pending_persist_meta is None:
+                self._pending_persist_meta = {
+                    'first_ts': float(event_ts),
+                    'last_ts': float(event_ts),
+                    'scheduled_at': time.time(),
+                }
+            else:
+                if created:
+                    self._pending_persist_meta.update({
+                        'first_ts': float(event_ts),
+                        'last_ts': float(event_ts),
+                        'scheduled_at': time.time(),
+                    })
+                else:
+                    self._pending_persist_meta['last_ts'] = float(event_ts)
+                    self._pending_persist_meta['scheduled_at'] = time.time()
+            timer = threading.Timer(delay, self._persist_buffer_later)
+            timer.daemon = True
+            self._pending_persist_timer = timer
+            timer.start()
+        self._last_motion_event_ts = float(event_ts)
+        return created
 
     def _open_video_writer(self, path: Path, fps: int, frame_size: tuple[int, int]):
         """Open a VideoWriter with sane cross-platform defaults.
@@ -169,10 +303,10 @@ class WebcamController:
         Returns the path on success, or None if no frame available.
         """
         # Get latest in-memory JPEG if available
-        data: Optional[bytes] = None
+        frame: Optional[Any] = None
         with self._cond:
-            if self._latest:
-                data = bytes(self._latest)
+            if self._latest is not None:
+                frame = self._latest
 
         ts = time.time()
         if out_path is None:
@@ -180,13 +314,15 @@ class WebcamController:
             out_path = (self._snapshots_dir / fname)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if data:
-            try:
-                with open(out_path, 'wb') as f:
-                    f.write(data)
-                return out_path
-            except Exception:
-                return None
+        if frame is not None:
+            jpg = self._encode_frame(frame)
+            if jpg:
+                try:
+                    with open(out_path, 'wb') as f:
+                        f.write(jpg)
+                    return out_path
+                except Exception:
+                    return None
         # Fallback: capture a fresh frame directly
         try:
             ok = self._capture_with_opencv(out_path)
@@ -247,27 +383,31 @@ class WebcamController:
         self._bus = bus
         self._record_on_motion_enabled = bool(record_on_motion)
         try:
-            self._record_duration_sec = float(duration_sec)
+            dur = max(1.0, float(duration_sec))
+            self._record_duration_sec = dur
+            self._buffer_duration_sec = dur
         except Exception:
             self._record_duration_sec = 30.0
+            self._buffer_duration_sec = 30.0
 
         def _on_motion(evt: Any) -> None:
             if not self._record_on_motion_enabled:
                 return
             try:
                 self._motion_triggers_received += 1
-                # Start or extend recording; take a snapshot only on new start
-                started_path = self.start_recording(duration_sec=float(getattr(self, '_record_duration_sec', 30.0)), extend=True)
-                if started_path is not None and bool(getattr(self, '_snapshot_on_motion_enabled', True)):
+                evt_ts = None
+                try:
+                    if isinstance(evt, dict) and 'ts' in evt:
+                        evt_ts = float(evt['ts'])
+                except Exception:
+                    evt_ts = None
+                if evt_ts is None:
+                    evt_ts = time.time()
+                new_session = self._schedule_motion_persist(evt_ts)
+                if new_session and bool(getattr(self, '_snapshot_on_motion_enabled', True)):
                     try:
-                        # Name snapshot using the same timestamp as the recording
-                        rec_name = getattr(started_path, 'name', '')
-                        if rec_name.startswith('rec_') and rec_name.endswith('.mp4') and len(rec_name) >= 4 + 15 + 4:
-                            ts = rec_name[len('rec_'):-len('.mp4')]
-                            shot_path = self._snapshots_dir / f'snap_{ts}.jpg'
-                        else:
-                            ts = time.strftime('%Y%m%d_%H%M%S')
-                            shot_path = self._snapshots_dir / f'snap_{ts}.jpg'
+                        ts_name = time.strftime('%Y%m%d_%H%M%S', time.localtime(evt_ts)) + f"_{int((evt_ts % 1) * 1000):03d}"
+                        shot_path = self._snapshots_dir / f'snap_{ts_name}.jpg'
                         # Prefer the exact triggering frame if present on the event
                         data = None
                         try:
@@ -310,7 +450,9 @@ class WebcamController:
             self._record_on_motion_enabled = bool(record_on_motion)
         if duration_sec is not None:
             try:
-                self._record_duration_sec = max(1.0, float(duration_sec))
+                dur = max(1.0, float(duration_sec))
+                self._record_duration_sec = dur
+                self._buffer_duration_sec = dur
             except Exception:
                 pass
         if snapshot_on_motion is not None:
@@ -340,11 +482,16 @@ class WebcamController:
                 while self._running:
                     ok, frame = cap.read()
                     if ok and frame is not None:
+                        frame_ts = time.time()
+                        try:
+                            self._append_frame_to_buffer(frame, ts=frame_ts)
+                        except Exception:
+                            pass
                         raw_frame = frame
                         # Run motion detector (draw overlays within detector)
                         if self._detector.enabled():
                             try:
-                                res = self._detector.process(raw_frame, now_ts=time.time())
+                                res = self._detector.process(raw_frame, now_ts=frame_ts)
                                 frame = res.frame
                                 if self._publish is not None and res.events:
                                     for e in res.events:
@@ -443,26 +590,20 @@ class WebcamController:
                             except Exception:
                                 frame_to_encode = last_frame
 
-                            # Encode with TurboJPEG (required)
-                            try:
-                                jpg = self._tj.encode(frame_to_encode, quality=int(self._quality), pixel_format=TJPF_BGR, jpeg_subsample=TJSAMP_420)
-                            except Exception:
-                                jpg = None
-
-                            if jpg is not None:
-                                with self._cond:
-                                    self._latest = jpg
-                                    self._seq += 1
-                                    self._cond.notify_all()
+                            # Publish raw frame; downstream consumers handle JPEG encoding
+                            with self._cond:
+                                self._latest = frame_to_encode
+                                self._seq += 1
+                                self._cond.notify_all()
                         # Schedule next emit based on current time to prevent burst catch-up
                         next_emit = now + target_dt
 
                     # Light backoff: scale sleep by how far we are from next emit
-                    slack = max(0.0, next_emit - now)
-                    if slack > (0.5 * target_dt):
-                        time.sleep(min(0.003, slack * 0.25))
-                    else:
-                        time.sleep(0.001)
+                    #slack = max(0.0, next_emit - now)
+                    #if slack > (0.5 * target_dt):
+                    #    time.sleep(min(0.003, slack * 0.25))
+                    #else:
+                    #    time.sleep(0.001)
             finally:
                 cap.release()
 
@@ -491,14 +632,18 @@ class WebcamController:
                 with self._cond:
                     if self._seq == last_seq:
                         self._cond.wait(timeout=delay)
-                    data = self._latest
+                    frame = self._latest
                     last_seq = self._seq
-                if not data:
+                if frame is None:
+                    time.sleep(delay)
+                    continue
+                jpg = self._encode_frame(frame)
+                if not jpg:
                     time.sleep(delay)
                     continue
                 yield (b"--" + boundary.encode() + b"\r\n"
                        b"Content-Type: image/jpeg\r\n"
-                       b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data + b"\r\n")
+                       b"Content-Length: " + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
         finally:
             try:
                 self._subscribers = max(0, int(getattr(self, '_subscribers', 0)) - 1)

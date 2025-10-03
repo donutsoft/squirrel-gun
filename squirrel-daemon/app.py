@@ -10,6 +10,7 @@ from event_bus import EventBus
 from .aiming import Calculate_Hose_Angles
 import time
 import re
+import math
 
 # Serve static files from root (e.g., "/logo.svg").
 app = Flask(__name__, static_url_path='')
@@ -920,6 +921,94 @@ def list_clicks():
         return jsonify({"error": "invalid limit/offset"}), 400
     rows = store.list(limit=limit, offset=offset)
     return jsonify({"rows": rows})
+
+
+@app.post('/api/clicks/prune-outliers')
+def prune_clicks():
+    data = request.get_json(silent=True) or {}
+    try:
+        threshold = float(data.get('max_error_deg', 15.0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "max_error_deg must be a number"}), 400
+    if not math.isfinite(threshold) or threshold <= 0.0:
+        return jsonify({"error": "max_error_deg must be > 0"}), 400
+    try:
+        limit = int(data.get('limit', 5000))
+    except (TypeError, ValueError):
+        return jsonify({"error": "limit must be an integer"}), 400
+    limit = max(1, min(50000, limit))
+    dry_run = bool(data.get('dry_run', False))
+
+    rows = store.list(limit=limit)
+    if not rows:
+        return jsonify({
+            "status": "ok",
+            "deleted": 0,
+            "evaluated": 0,
+            "threshold": threshold,
+            "dry_run": dry_run,
+            "candidates": 0,
+        })
+
+    # Mirror training focus used by _build_aimer so residuals stay comparable
+    focus = None
+    try:
+        z = store.get_setting('motion.zone', None)
+        if isinstance(z, dict):
+            x = float(z.get('x', 0.5))
+            y = float(z.get('y', 0.5))
+            w = float(z.get('w', 0.0))
+            h = float(z.get('h', 0.0))
+            fx = x + max(0.0, w) * 0.5
+            fy = y + max(0.0, h) * 0.5
+            fx = 0.0 if fx < 0.0 else 1.0 if fx > 1.0 else fx
+            fy = 0.0 if fy < 0.0 else 1.0 if fy > 1.0 else fy
+            focus = (fx, fy)
+    except Exception:
+        focus = None
+
+    model = LinearAimer.default()
+    model.fit_from_clicks(rows, focus=focus, sigma=0.2)
+
+    evaluated = 0
+    outlier_ids: list[int] = []
+    sample_residuals: list[dict[str, float | int]] = []
+    for r in rows:
+        try:
+            w = float(r['img_w'])
+            h = float(r['img_h'])
+            if w <= 0 or h <= 0:
+                continue
+            u = float(r['x_px']) / w
+            v = float(r['y_px']) / h
+            pred_pan, pred_tilt = model.predict(u, v)
+            err = math.hypot(float(r['pan']) - pred_pan, float(r['tilt']) - pred_tilt)
+        except Exception:
+            continue
+        evaluated += 1
+        if err > threshold:
+            outlier_ids.append(int(r['id']))
+            if len(sample_residuals) < 5:
+                sample_residuals.append({
+                    'id': int(r['id']),
+                    'error_deg': float(err),
+                    'pan': float(r['pan']),
+                    'tilt': float(r['tilt']),
+                })
+
+    deleted = 0
+    if outlier_ids and not dry_run:
+        deleted = store.delete_ids(outlier_ids)
+
+    return jsonify({
+        "status": "ok",
+        "deleted": deleted,
+        "candidates": len(outlier_ids),
+        "evaluated": evaluated,
+        "threshold": threshold,
+        "dry_run": dry_run,
+        "sample": sample_residuals,
+    })
 
 
 @app.get('/api/laser')

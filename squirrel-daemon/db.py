@@ -98,6 +98,15 @@ class ClickStore:
             cur = conn.execute("DELETE FROM clicks")
             return cur.rowcount if cur.rowcount is not None else 0
 
+    def delete_ids(self, ids: Iterable[int]) -> int:
+        id_list = [int(i) for i in ids if int(i) > 0]
+        if not id_list:
+            return 0
+        placeholders = ",".join(["?"] * len(id_list))
+        with self._connect() as conn:
+            cur = conn.execute(f"DELETE FROM clicks WHERE id IN ({placeholders})", id_list)
+            return cur.rowcount if cur.rowcount is not None else 0
+
     # --- Aim logs ---
     def record_aim(self, *, start_pan: float, start_tilt: float, dx: float, dy: float, dpan: float, dtilt: float, result_pan: float, result_tilt: float) -> int:
         with self._connect() as conn:

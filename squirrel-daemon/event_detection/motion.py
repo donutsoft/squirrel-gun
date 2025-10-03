@@ -172,9 +172,6 @@ class MotionDetector(EventDetector):
         if not self._enabled:
             return DetectionResult(frame=frame, events=[], metrics=self._metrics())
 
-        # Keep a working copy for overlay
-        work = frame.copy()
-
         # Only run motion detection every Nth frame
         counter = getattr(self, '_counter', 0)
         do_motion = (counter % max(1, int(self._frame_skip) + 1)) == 0
@@ -193,7 +190,7 @@ class MotionDetector(EventDetector):
             except Exception:
                 s = 0.5
             s = 0.5 if not (0.1 <= s <= 1.0) else s
-            small = cv2.resize(work, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
+            small = cv2.resize(frame, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
             gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
@@ -249,7 +246,7 @@ class MotionDetector(EventDetector):
             zone = self._zone
             if zone and isinstance(zone, tuple) and len(zone) == 4:
                 try:
-                    fh, fw = work.shape[:2]
+                    fh, fw = frame.shape[:2]
                     zx = int(max(0, min(fw, round(float(zone[0]) * fw))))
                     zy = int(max(0, min(fh, round(float(zone[1]) * fh))))
                     zw = int(max(0, min(fw - zx, round(float(zone[2]) * fw))))
@@ -265,7 +262,7 @@ class MotionDetector(EventDetector):
                     candidates = filtered
                     # Draw zone overlay for visualization
                     try:
-                        cv2.rectangle(work, (zx, zy), (zx + zw, zy + zh), (255, 0, 0), 2)
+                        cv2.rectangle(frame, (zx, zy), (zx + zw, zy + zh), (255, 0, 0), 2)
                     except Exception:
                         pass
                 except Exception:
@@ -320,10 +317,10 @@ class MotionDetector(EventDetector):
                 self._last_motion_rect = best
                 x, y, w, h = best
                 try:
-                    cv2.rectangle(work, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 except Exception:
                     pass
-                evt = self._make_event(best, work, now_ts)
+                evt = self._make_event(best, frame, now_ts)
                 events.append(evt)
                 self._events_published += 1
             else:
@@ -335,21 +332,21 @@ class MotionDetector(EventDetector):
                     self._last_motion_rect = best
                     x, y, w, h = best
                     try:
-                        cv2.rectangle(work, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                     except Exception:
                         pass
-                    evt = self._make_event(best, work, now_ts)
+                    evt = self._make_event(best, frame, now_ts)
                     events.append(evt)
                     self._events_published += 1
                 else:
                     # Show a yellow box while accumulating persistence
                     x, y, w, h = best
                     try:
-                        cv2.rectangle(work, (x, y), (x + w, y + h), (0, 255, 255), 1)
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 1)
                     except Exception:
                         pass
 
-        return DetectionResult(frame=work, events=events, metrics=self._metrics())
+        return DetectionResult(frame=frame, events=events, metrics=self._metrics())
 
     # --- helpers ---
     def _metrics(self) -> Dict[str, Any]:

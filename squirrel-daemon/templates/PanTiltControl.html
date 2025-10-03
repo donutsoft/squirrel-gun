@@ -133,6 +133,7 @@
         <h2>Recent Clicks</h2>
         <div class="hint">Latest recorded clicks with angles and coordinates.</div>
         <div class="actions" style="margin: 8px 0; display:flex; gap:8px;">
+          <button id="prune-clicks" class="secondary">Prune Outliers</button>
           <button id="clear-clicks" class="danger">Clear Clicks</button>
         </div>
         <div style="overflow:auto; max-height: 300px; border:1px solid #111827; border-radius:8px;">
@@ -546,6 +547,47 @@
           console.error('Error clearing clicks', e);
         } finally {
           clearBtn.disabled = false;
+          await refreshClicks();
+        }
+      });
+
+      const pruneBtn = document.getElementById('prune-clicks');
+      pruneBtn?.addEventListener('click', async () => {
+        const input = prompt('Remove clicks with error greater than how many degrees?', '15');
+        if (input === null) return;
+        const threshold = Number(input);
+        if (!Number.isFinite(threshold) || threshold <= 0) {
+          alert('Please enter a positive number.');
+          return;
+        }
+        const original = pruneBtn.textContent;
+        pruneBtn.disabled = true;
+        pruneBtn.textContent = 'Pruning...';
+        try {
+          const res = await fetch('/api/clicks/prune-outliers', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ max_error_deg: threshold })
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            alert(data.error || 'Failed to prune clicks');
+          } else {
+            const removed = Number.isFinite(Number(data.deleted)) ? Number(data.deleted) : 0;
+            const candidates = Number.isFinite(Number(data.candidates)) ? Number(data.candidates) : removed;
+            const skipped = Math.max(0, candidates - removed);
+            let msg = `Removed ${removed} click(s) (threshold ${threshold}°).`;
+            if (skipped > 0) {
+              msg += ` ${skipped} candidate(s) could not be deleted.`;
+            }
+            alert(msg);
+          }
+        } catch (e) {
+          console.error('Error pruning clicks', e);
+          alert('Error pruning clicks. See console for details.');
+        } finally {
+          pruneBtn.disabled = false;
+          pruneBtn.textContent = original;
           await refreshClicks();
         }
       });
