@@ -19,7 +19,9 @@ class WebcamController:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._latest: Optional[Any] = None
+        self._latest_raw: Optional[Any] = None
         self._seq = 0
+        self._raw_seq = 0
         self._cond = threading.Condition()
         # TurboJPEG encoder instance (required)
         self._tj = TurboJPEG()
@@ -137,7 +139,7 @@ class WebcamController:
         except Exception:
             return False
 
-    def capture(self, outfile: Path) -> Path:
+    def capture(self, outfile: Path) -> Optional[Path]:
         outfile = outfile.resolve()
         outfile.parent.mkdir(parents=True, exist_ok=True)
         # Fast path: if we already have a recent frame, encode it and write to disk
@@ -147,11 +149,85 @@ class WebcamController:
         if frame is not None:
             jpg = self._encode_frame(frame)
             if jpg:
-                with open(outfile, 'wb') as f:
-                    f.write(jpg)
+                try:
+                    with open(outfile, 'wb') as f:
+                        f.write(jpg)
+                    return outfile
+                except Exception:
+                    pass
+        if not self._running:
+            if self._capture_with_opencv(outfile):
                 return outfile
-        self._capture_with_opencv(outfile)
-        return outfile
+        return None
+
+    def _fresh_frame(self, timeout_sec: float = 2.0, raw: bool = False) -> Optional[Any]:
+        start_seq = -1
+        try:
+            with self._cond:
+                start_seq = int(self._raw_seq if raw else self._seq)
+        except Exception:
+            start_seq = -1
+
+        frame: Optional[Any] = None
+        deadline = time.monotonic() + max(0.05, float(timeout_sec))
+        with self._cond:
+            while time.monotonic() < deadline:
+                latest = self._latest_raw if raw else self._latest
+                seq = int(self._raw_seq if raw else self._seq)
+                if latest is not None and seq > start_seq:
+                    frame = latest
+                    break
+                remaining = max(0.0, deadline - time.monotonic())
+                self._cond.wait(timeout=min(0.1, remaining))
+
+            latest = self._latest_raw if raw else self._latest
+            seq = int(self._raw_seq if raw else self._seq)
+            if frame is None and latest is not None and seq > start_seq:
+                frame = latest
+
+        return frame
+
+    def capture_fresh(self, outfile: Path, timeout_sec: float = 2.0, raw: bool = False) -> Optional[Path]:
+        """Capture a frame newer than the current streamed frame when possible."""
+        outfile = outfile.resolve()
+        outfile.parent.mkdir(parents=True, exist_ok=True)
+
+        frame = self._fresh_frame(timeout_sec=timeout_sec, raw=raw)
+        if frame is not None:
+            jpg = self._encode_frame(frame)
+            if jpg:
+                try:
+                    with open(outfile, 'wb') as f:
+                        f.write(jpg)
+                    return outfile
+                except Exception:
+                    pass
+
+        if not self._running:
+            if self._capture_with_opencv(outfile):
+                return outfile
+        return None
+
+    def capture_after_discard(
+        self,
+        outfile: Path,
+        timeout_sec: float = 2.0,
+        raw: bool = False,
+        discard_frames: int = 0,
+    ) -> Optional[Path]:
+        """Discard a few fresh frames, then save the next one.
+
+        This is useful after changing illumination or GPIO-controlled devices,
+        where the camera may still be delivering frames captured before the
+        state change or before auto-exposure has settled.
+        """
+        discard_frames = max(0, int(discard_frames))
+        for _ in range(discard_frames):
+            try:
+                self._fresh_frame(timeout_sec=timeout_sec, raw=raw)
+            except Exception:
+                break
+        return self.capture_fresh(outfile, timeout_sec=timeout_sec, raw=raw)
 
     def _append_frame_to_buffer(self, frame: Any, ts: Optional[float] = None) -> None:
         if frame is None:
@@ -324,11 +400,13 @@ class WebcamController:
                 except Exception:
                     return None
         # Fallback: capture a fresh frame directly
-        try:
-            ok = self._capture_with_opencv(out_path)
-            return out_path if ok else None
-        except Exception:
-            return None
+        if not self._running:
+            try:
+                ok = self._capture_with_opencv(out_path)
+                return out_path if ok else None
+            except Exception:
+                return None
+        return None
 
     def start_recording(self, duration_sec: float = 30.0, extend: bool = True) -> Optional[Path]:
         """Start recording for duration_sec seconds.
@@ -483,6 +561,13 @@ class WebcamController:
                     ok, frame = cap.read()
                     if ok and frame is not None:
                         frame_ts = time.time()
+                        try:
+                            with self._cond:
+                                self._latest_raw = frame.copy()
+                                self._raw_seq += 1
+                                self._cond.notify_all()
+                        except Exception:
+                            pass
                         try:
                             self._append_frame_to_buffer(frame, ts=frame_ts)
                         except Exception:

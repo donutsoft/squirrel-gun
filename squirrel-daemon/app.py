@@ -6,11 +6,17 @@ from hardware_controllers.WaterController import WaterController
 from pathlib import Path
 from db import ClickStore
 from aim_model import LinearAimer
+from laser_dot_detector import LaserDotOptions, detect_laser_dot
 from event_bus import EventBus
 from .aiming import Calculate_Hose_Angles
 import time
 import re
 import math
+import threading
+import json
+import html
+import random
+from typing import Optional
 
 # Serve static files from root (e.g., "/logo.svg").
 app = Flask(__name__, static_url_path='')
@@ -108,6 +114,7 @@ _last_follow_ts = 0.0
 water_on_motion_enabled = False
 _last_water_fire_ts = 0.0
 _WATER_COOLDOWN_SEC = 60.0
+_calibration_lock = threading.Lock()
 
 # Attempt to center hardware on startup; ignore failures if hardware not present
 try:
@@ -159,6 +166,284 @@ def _build_aimer(min_rows: int = 10) -> tuple[LinearAimer, int, bool]:
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return hi if v > hi else lo if v < lo else v
+
+
+def _parse_degree_corner(data: dict, name: str) -> tuple[float, float]:
+    raw = data.get(name)
+    if not isinstance(raw, dict):
+        raise ValueError(f"{name} must include pan and tilt")
+    pan = float(raw.get("pan"))
+    tilt = float(raw.get("tilt"))
+    if not math.isfinite(pan) or not math.isfinite(tilt):
+        raise ValueError(f"{name} pan/tilt must be finite numbers")
+    pan = _clamp(pan, 0.0, float(getattr(pantilt, 'PAN_MAX_DEG', 270)))
+    tilt = _clamp(tilt, 0.0, float(getattr(pantilt, 'TILT_MAX_DEG', 180)))
+    return pan, tilt
+
+
+def _interpolate_calibration_grid(
+    *,
+    top_left: tuple[float, float],
+    top_right: tuple[float, float],
+    bottom_left: tuple[float, float],
+    bottom_right: tuple[float, float],
+    rows: int,
+    cols: int,
+) -> list[dict]:
+    points: list[dict] = []
+    for row in range(rows):
+        v = row / max(1, rows - 1)
+        left_pan = top_left[0] + ((bottom_left[0] - top_left[0]) * v)
+        left_tilt = top_left[1] + ((bottom_left[1] - top_left[1]) * v)
+        right_pan = top_right[0] + ((bottom_right[0] - top_right[0]) * v)
+        right_tilt = top_right[1] + ((bottom_right[1] - top_right[1]) * v)
+        col_range = range(cols - 1, -1, -1) if row % 2 else range(cols)
+        for col in col_range:
+            u = col / max(1, cols - 1)
+            points.append({
+                "row": row,
+                "col": col,
+                "pan": left_pan + ((right_pan - left_pan) * u),
+                "tilt": left_tilt + ((right_tilt - left_tilt) * u),
+            })
+    return points
+
+
+def _calibration_debug_url(path: Path) -> str:
+    static_root = (Path(__file__).parent / "static").resolve()
+    rel = path.resolve().relative_to(static_root)
+    return "/" + "/".join(rel.parts)
+
+
+def _write_calibration_debug_report(run_dir: Path, *, run_id: str, saved: list[dict], misses: list[dict]) -> Path:
+    rows = sorted(
+        list(saved) + list(misses),
+        key=lambda item: int(item.get("index", 0)),
+    )
+    parts = [
+        "<!doctype html>",
+        "<html><head><meta charset=\"utf-8\"><title>Calibration Debug</title>",
+        "<style>",
+        "body{font-family:system-ui,sans-serif;background:#0f172a;color:#e5e7eb;margin:24px}",
+        "h1{font-size:22px} .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}",
+        ".card{background:#111827;border:1px solid #1f2937;border-radius:8px;padding:12px}",
+        ".meta{color:#9ca3af;font-size:13px;margin:4px 0 10px}.miss{color:#fecaca}.saved{color:#bbf7d0}",
+        "img{display:block;width:100%;height:auto;background:#000;border:1px solid #374151;border-radius:6px;margin:8px 0}",
+        "a{color:#93c5fd} code{color:#fbbf24}",
+        "button{background:#ef4444;color:#fff;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;font-size:12px;margin-left:8px}",
+        "button:disabled{background:#4b5563;cursor:not-allowed}",
+        "</style></head><body>",
+        f"<h1>Calibration Debug {html.escape(run_id)}</h1>",
+        f"<p class=\"meta\">Saved {len(saved)} point(s), missed {len(misses)} point(s).</p>",
+        "<div class=\"grid\">",
+    ]
+    for row in rows:
+        db_id = row.get("id")
+        status = "saved" if db_id is not None else "miss"
+        reason = row.get("reason", "saved")
+        pan = float(row.get("pan", 0.0))
+        tilt = float(row.get("tilt", 0.0))
+        idx = int(row.get("index", 0))
+        r = row.get("row", "")
+        c = row.get("col", "")
+        debug = row.get("debug", {}) if isinstance(row.get("debug"), dict) else {}
+        dot = row.get("dot")
+        dot_json = html.escape(json.dumps(dot, sort_keys=True)) if dot is not None else "null"
+        
+        delete_btn = ""
+        if db_id is not None:
+            delete_btn = f"<button onclick=\"deletePoint({db_id}, this)\">Delete from DB</button>"
+
+        parts.extend([
+            "<section class=\"card\">",
+            f"<h2>#{idx} row {html.escape(str(r))}, col {html.escape(str(c))} {delete_btn}</h2>",
+            f"<div class=\"meta {status}\">{html.escape(str(reason))}</div>",
+            f"<div class=\"meta\">pan {pan:.2f}, tilt {tilt:.2f}; dot <code>{dot_json}</code></div>",
+        ])
+        for label, key in (("Laser off", "off_url"), ("Laser on", "on_url"), ("Annotated", "annotated_url"), ("Mask", "mask_url"), ("Score", "score_url")):
+            url = debug.get(key)
+            if not url:
+                continue
+            parts.append(f"<div class=\"meta\"><a href=\"{html.escape(url)}\">{html.escape(label)}</a></div>")
+            parts.append(f"<img src=\"{html.escape(url)}\" alt=\"{html.escape(label)}\">")
+        parts.append("</section>")
+    
+    parts.extend([
+        "</div>",
+        "<script>",
+        "async function deletePoint(id, btn) {",
+        "  if (!confirm('Delete this point from the click database?')) return;",
+        "  btn.disabled = true;",
+        "  try {",
+        "    const res = await fetch('/api/clicks/delete', {",
+        "      method: 'POST',",
+        "      headers: { 'Content-Type': 'application/json' },",
+        "      body: JSON.stringify({ ids: [id] })",
+        "    });",
+        "    if (res.ok) {",
+        "      btn.textContent = 'Deleted';",
+        "      btn.closest('.card').style.opacity = '0.5';",
+        "    } else {",
+        "      const data = await res.json();",
+        "      alert('Error: ' + (data.error || res.statusText));",
+        "      btn.disabled = false;",
+        "    }",
+        "  } catch (e) {",
+        "    alert('Error: ' + e);",
+        "    btn.disabled = false;",
+        "  }",
+        "}",
+        "</script>",
+        "</body></html>"
+    ])
+    report_path = run_dir / "index.html"
+    report_path.write_text("\n".join(parts), encoding="utf-8")
+    return report_path
+
+
+def _parse_laser_dot_options(data: dict) -> LaserDotOptions:
+    options_data = data.get("dot_options") if isinstance(data.get("dot_options"), dict) else {}
+    options = LaserDotOptions(
+        min_area=float(options_data.get("min_area", 20.0)),
+        max_area=float(options_data.get("max_area", 300.0)),
+        max_aspect=float(options_data.get("max_aspect", 2.5)),
+        min_width=float(options_data.get("min_width", 4.0)),
+        min_height=float(options_data.get("min_height", 4.0)),
+        percentile=float(options_data.get("percentile", 99.8)),
+        min_score=float(options_data.get("min_score", 18.0)),
+        blur_size=int(options_data.get("blur_size", 31)),
+        blue_tolerance=float(options_data.get("blue_tolerance", 25.0)),
+        open_size=int(options_data.get("open_size", 1)),
+        close_size=int(options_data.get("close_size", 9)),
+        min_delta_peak=float(options_data.get("min_delta_peak", 10.0)),
+        min_delta_mean=float(options_data.get("min_delta_mean", 1.5)),
+        min_on_peak=float(options_data.get("min_on_peak", 180.0)),
+        min_on_mean=float(options_data.get("min_on_mean", 80.0)),
+        peak_window=int(options_data.get("peak_window", 21)),
+        peak_candidates=int(options_data.get("peak_candidates", 8)),
+    )
+    if "threshold" in options_data and options_data.get("threshold") not in (None, ""):
+        options.threshold = float(options_data.get("threshold"))
+    return options
+
+
+def _calibration_dot_options_response(options: LaserDotOptions) -> dict:
+    return {
+        "min_area": options.min_area,
+        "max_aspect": options.max_aspect,
+        "min_width": options.min_width,
+        "min_height": options.min_height,
+        "min_delta_peak": options.min_delta_peak,
+        "min_delta_mean": options.min_delta_mean,
+        "min_score": options.min_score,
+        "percentile": options.percentile,
+        "close_size": options.close_size,
+        "min_on_peak": options.min_on_peak,
+        "min_on_mean": options.min_on_mean,
+        "peak_window": options.peak_window,
+        "peak_candidates": options.peak_candidates,
+    }
+
+
+def _new_calibration_run(prefix: str) -> tuple[str, Path]:
+    run_ts = time.time()
+    run_id = time.strftime(f"{prefix}_%Y%m%d_%H%M%S", time.localtime(run_ts)) + f"_{int((run_ts % 1) * 1000):03d}"
+    run_dir = Path(__file__).parent / "static" / "calibration_runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_id, run_dir
+
+
+def _capture_calibration_sample(
+    *,
+    run_dir: Path,
+    prefix: str,
+    pan: float,
+    tilt: float,
+    options: LaserDotOptions,
+    move_settle_sec: float,
+    laser_settle_sec: float,
+    capture_timeout_sec: float,
+    discard_frames: int,
+) -> tuple[dict, dict]:
+    global current
+
+    off_path = run_dir / f"{prefix}_off.jpg"
+    on_path = run_dir / f"{prefix}_on.jpg"
+    annotated_path = run_dir / f"{prefix}_annotated.jpg"
+    mask_path = run_dir / f"{prefix}_mask.png"
+    score_path = run_dir / f"{prefix}_score.png"
+    debug = {
+        "off_url": _calibration_debug_url(off_path),
+        "on_url": _calibration_debug_url(on_path),
+        "annotated_url": _calibration_debug_url(annotated_path),
+        "mask_url": _calibration_debug_url(mask_path),
+        "score_url": _calibration_debug_url(score_path),
+    }
+
+    laser.turn_off()
+    pantilt.setPanTilt(pan, tilt)
+    current = (pan, tilt)
+    if move_settle_sec > 0:
+        time.sleep(move_settle_sec)
+    try:
+        webcam.suppress_motion(move_settle_sec + laser_settle_sec + 1.0)
+    except Exception:
+        pass
+
+    if laser_settle_sec > 0:
+        time.sleep(laser_settle_sec)
+    webcam.capture_after_discard(
+        off_path,
+        timeout_sec=capture_timeout_sec,
+        raw=True,
+        discard_frames=discard_frames,
+    )
+
+    laser.turn_on()
+    if laser_settle_sec > 0:
+        time.sleep(laser_settle_sec)
+    webcam.capture_after_discard(
+        on_path,
+        timeout_sec=capture_timeout_sec,
+        raw=True,
+        discard_frames=discard_frames,
+    )
+
+    if not off_path.exists() or not on_path.exists():
+        return {
+            "dot": None,
+            "reason": "capture failed: image file not written",
+            "image_width": 0,
+            "image_height": 0,
+        }, debug
+
+    detected = detect_laser_dot(
+        on_path,
+        off_path,
+        options=options,
+        debug_paths={
+            "annotated": annotated_path,
+            "mask": mask_path,
+            "score": score_path,
+        },
+    )
+    return detected, debug
+
+
+def _dot_edge_reason(dot: dict, img_w: float, img_h: float, edge_margin_px: float, edge_margin_frac: float) -> tuple[Optional[str], float]:
+    dot_x = float(dot["x"])
+    dot_y = float(dot["y"])
+    dot_w = float(dot["w"])
+    dot_h = float(dot["h"])
+    effective_edge_margin = max(edge_margin_px, min(img_w, img_h) * edge_margin_frac)
+    if (
+        dot_x <= effective_edge_margin
+        or dot_y <= effective_edge_margin
+        or (dot_x + dot_w) >= (img_w - effective_edge_margin)
+        or (dot_y + dot_h) >= (img_h - effective_edge_margin)
+    ):
+        return "dot clipped at image edge", effective_edge_margin
+    return None, effective_edge_margin
 
 ## DB initialized by ClickStore on import
 
@@ -415,6 +700,8 @@ def webcam_capture():
     out_path = Path(__file__).parent / 'static' / 'webcam.jpg'
     try:
         saved = webcam.capture(out_path)
+        if not saved:
+            return jsonify({"error": "failed to capture image from webcam"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     # Return the image directly so visiting the endpoint displays it
@@ -758,6 +1045,262 @@ def motion_water_get():
     })
 
 
+@app.post('/api/calibration/automatic')
+def automatic_calibration():
+    global current, follow_motion_enabled
+
+    if laser is None:
+        return jsonify({"error": "laser controller is not available"}), 500
+    if not _calibration_lock.acquire(blocking=False):
+        return jsonify({"error": "automatic calibration is already running"}), 409
+
+    data = request.get_json(silent=True) or {}
+    try:
+        top_left = _parse_degree_corner(data, "top_left")
+        top_right = _parse_degree_corner(data, "top_right")
+        bottom_left = _parse_degree_corner(data, "bottom_left")
+        bottom_right = _parse_degree_corner(data, "bottom_right")
+        rows = max(2, min(25, int(data.get("rows", 5))))
+        cols = max(2, min(25, int(data.get("cols", 5))))
+        move_settle_sec = max(0.0, min(5.0, float(data.get("move_settle_sec", 0.35))))
+        laser_settle_sec = max(0.0, min(5.0, float(data.get("laser_settle_sec", 0.5))))
+        capture_timeout_sec = max(0.1, min(5.0, float(data.get("capture_timeout_sec", 2.0))))
+        discard_frames = max(0, min(15, int(data.get("discard_frames", 4))))
+        edge_margin_px = max(0.0, min(200.0, float(data.get("edge_margin_px", 20.0))))
+        edge_margin_frac = max(0.0, min(0.25, float(data.get("edge_margin_frac", 0.03))))
+        phase2_count = max(0, min(50, int(data.get("phase2_count", 10))))
+
+        options = _parse_laser_dot_options(data)
+    except (TypeError, ValueError) as e:
+        _calibration_lock.release()
+        return jsonify({"error": str(e)}), 400
+
+    points = _interpolate_calibration_grid(
+        top_left=top_left,
+        top_right=top_right,
+        bottom_left=bottom_left,
+        bottom_right=bottom_right,
+        rows=rows,
+        cols=cols,
+    )
+    original_current = current
+    original_follow = bool(globals().get("follow_motion_enabled", False))
+    original_laser_enabled = bool(globals().get("laser_enabled", True))
+    saved: list[dict] = []
+    misses: list[dict] = []
+    run_ts = time.time()
+    run_id = time.strftime("cal_%Y%m%d_%H%M%S", time.localtime(run_ts)) + f"_{int((run_ts % 1) * 1000):03d}"
+    run_dir = Path(__file__).parent / "static" / "calibration_runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    trained_p2 = False
+    try:
+        follow_motion_enabled = False
+        try:
+            webcam.suppress_motion(move_settle_sec + laser_settle_sec + 1.0)
+        except Exception:
+            pass
+
+        # Phase 1: Degree Bounds Sweep
+        for idx, point in enumerate(points):
+            pan = float(point["pan"])
+            tilt = float(point["tilt"])
+            prefix = f"p1_{idx:03d}_r{int(point['row']):02d}_c{int(point['col']):02d}"
+
+            detected, debug = _capture_calibration_sample(
+                run_dir=run_dir,
+                prefix=prefix,
+                pan=pan,
+                tilt=tilt,
+                options=options,
+                move_settle_sec=move_settle_sec,
+                laser_settle_sec=laser_settle_sec,
+                capture_timeout_sec=capture_timeout_sec,
+                discard_frames=discard_frames,
+            )
+
+            dot = detected.get("dot")
+            if dot is None:
+                misses.append({
+                    "index": idx,
+                    "phase": 1,
+                    "row": point["row"],
+                    "col": point["col"],
+                    "pan": pan,
+                    "tilt": tilt,
+                    "reason": "dot not found",
+                    "debug": debug,
+                    "scene": detected.get("scene"),
+                    "method": detected.get("method"),
+                })
+                continue
+
+            img_w = float(detected["image_width"])
+            img_h = float(detected["image_height"])
+            reason, effective_edge_margin = _dot_edge_reason(dot, img_w, img_h, edge_margin_px, edge_margin_frac)
+            if reason:
+                misses.append({
+                    "index": idx,
+                    "phase": 1,
+                    "row": point["row"],
+                    "col": point["col"],
+                    "pan": pan,
+                    "tilt": tilt,
+                    "reason": reason,
+                    "dot": dot,
+                    "debug": debug,
+                    "edge_margin_px": effective_edge_margin,
+                    "scene": detected.get("scene"),
+                    "method": detected.get("method"),
+                })
+                continue
+
+            x = float(dot["cx"])
+            y = float(dot["cy"])
+            click_id = store.record(pan, tilt, x, y, img_w, img_h)
+            saved.append({
+                "id": click_id,
+                "index": idx,
+                "phase": 1,
+                "row": point["row"],
+                "col": point["col"],
+                "pan": pan,
+                "tilt": tilt,
+                "x": x,
+                "y": y,
+                "width": img_w,
+                "height": img_h,
+                "dot": dot,
+                "debug": debug,
+                "scene": detected.get("scene"),
+                "method": detected.get("method"),
+            })
+
+        # Phase 2: Reverse-Mapping Random Point Validation
+        if phase2_count > 0:
+            # Re-train model from Phase 1 data
+            aimer, _, trained_p2 = _build_aimer()
+            if trained_p2:
+                for idx_p2 in range(phase2_count):
+                    # Random normalized coords, slightly inset to avoid edge issues
+                    u = random.uniform(0.1, 0.9)
+                    v = random.uniform(0.1, 0.9)
+                    pan, tilt = aimer.predict(u, v)
+                    pan = _clamp(pan, 0.0, float(getattr(pantilt, 'PAN_MAX_DEG', 270)))
+                    tilt = _clamp(tilt, 0.0, float(getattr(pantilt, 'TILT_MAX_DEG', 180)))
+
+                    prefix = f"p2_{idx_p2:03d}"
+                    detected, debug = _capture_calibration_sample(
+                        run_dir=run_dir,
+                        prefix=prefix,
+                        pan=pan,
+                        tilt=tilt,
+                        options=options,
+                        move_settle_sec=move_settle_sec,
+                        laser_settle_sec=laser_settle_sec,
+                        capture_timeout_sec=capture_timeout_sec,
+                        discard_frames=discard_frames,
+                    )
+
+                    dot = detected.get("dot")
+                    if dot is None:
+                        misses.append({
+                            "index": len(points) + idx_p2,
+                            "phase": 2,
+                            "row": "p2",
+                            "col": idx_p2,
+                            "pan": pan,
+                            "tilt": tilt,
+                            "reason": f"dot not found for image target ({u:.2f}, {v:.2f})",
+                            "debug": debug,
+                            "scene": detected.get("scene"),
+                            "method": detected.get("method"),
+                        })
+                        continue
+
+                    img_w = float(detected["image_width"])
+                    img_h = float(detected["image_height"])
+                    reason, effective_edge_margin = _dot_edge_reason(dot, img_w, img_h, edge_margin_px, edge_margin_frac)
+                    if reason:
+                        misses.append({
+                            "index": len(points) + idx_p2,
+                            "phase": 2,
+                            "row": "p2",
+                            "col": idx_p2,
+                            "pan": pan,
+                            "tilt": tilt,
+                            "reason": reason,
+                            "dot": dot,
+                            "debug": debug,
+                            "edge_margin_px": effective_edge_margin,
+                            "scene": detected.get("scene"),
+                            "method": detected.get("method"),
+                        })
+                        continue
+
+                    x = float(dot["cx"])
+                    y = float(dot["cy"])
+                    click_id = store.record(pan, tilt, x, y, img_w, img_h)
+                    saved.append({
+                        "id": click_id,
+                        "index": len(points) + idx_p2,
+                        "phase": 2,
+                        "row": "p2",
+                        "col": idx_p2,
+                        "pan": pan,
+                        "tilt": tilt,
+                        "x": x,
+                        "y": y,
+                        "width": img_w,
+                        "height": img_h,
+                        "dot": dot,
+                        "debug": debug,
+                        "scene": detected.get("scene"),
+                        "method": detected.get("method"),
+                    })
+
+    finally:
+        try:
+            if original_laser_enabled:
+                laser.turn_on()
+            else:
+                laser.turn_off()
+        except Exception:
+            pass
+        try:
+            pantilt.setPanTilt(original_current[0], original_current[1])
+            current = original_current
+        except Exception:
+            pass
+        follow_motion_enabled = original_follow
+        _calibration_lock.release()
+
+    report_path = _write_calibration_debug_report(run_dir, run_id=run_id, saved=saved, misses=misses)
+    report_url = _calibration_debug_url(report_path)
+
+    return jsonify({
+        "status": "ok",
+        "requested": len(points) + (phase2_count if trained_p2 else 0),
+        "saved_count": len(saved),
+        "miss_count": len(misses),
+        "debug_run_id": run_id,
+        "debug_report_url": report_url,
+        "debug_dir_url": _calibration_debug_url(run_dir),
+        "rows": rows,
+        "cols": cols,
+        "phase2_count": phase2_count if trained_p2 else 0,
+        "edge_margin_px": edge_margin_px,
+        "edge_margin_frac": edge_margin_frac,
+        "laser_settle_sec": laser_settle_sec,
+        "discard_frames": discard_frames,
+        "dot_options": _calibration_dot_options_response(options),
+        "saved": saved,
+        "misses": misses,
+        "pan": current[0],
+        "tilt": current[1],
+    })
+
+
 @app.post('/api/click')
 def record_click():
     data = request.get_json(silent=True) or {}
@@ -921,6 +1464,19 @@ def list_clicks():
         return jsonify({"error": "invalid limit/offset"}), 400
     rows = store.list(limit=limit, offset=offset)
     return jsonify({"rows": rows})
+
+
+@app.post('/api/clicks/delete')
+def delete_clicks():
+    data = request.get_json(silent=True) or {}
+    ids = data.get('ids')
+    if not isinstance(ids, list):
+        return jsonify({"error": "ids must be a list"}), 400
+    try:
+        deleted = store.delete_ids([int(i) for i in ids])
+        return jsonify({"status": "ok", "deleted": deleted})
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": str(e)}), 400
 
 
 @app.post('/api/clicks/prune-outliers')

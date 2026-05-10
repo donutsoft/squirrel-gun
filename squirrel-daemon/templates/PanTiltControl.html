@@ -122,6 +122,68 @@
       </div>
 
       <section class="panel" style="margin-top: 16px;">
+        <h2>Automatic Calibration</h2>
+        <div class="hint">Two-phase calibration: 1) Degree bounds grid sweep, 2) Random image point validation.</div>
+        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap:10px; margin-top:10px;">
+          <div>
+            <div class="hint" style="margin-top:0;">Top Left</div>
+            <label>Pan <input id="cal-tl-pan" type="number" min="0" max="270" step="0.1" value="90" /></label>
+            <label>Tilt <input id="cal-tl-tilt" type="number" min="0" max="180" step="0.1" value="60" /></label>
+          </div>
+          <div>
+            <div class="hint" style="margin-top:0;">Top Right</div>
+            <label>Pan <input id="cal-tr-pan" type="number" min="0" max="270" step="0.1" value="165" /></label>
+            <label>Tilt <input id="cal-tr-tilt" type="number" min="0" max="180" step="0.1" value="52" /></label>
+          </div>
+          <div>
+            <div class="hint" style="margin-top:0;">Bottom Left</div>
+            <label>Pan <input id="cal-bl-pan" type="number" min="0" max="270" step="0.1" value="94" /></label>
+            <label>Tilt <input id="cal-bl-tilt" type="number" min="0" max="180" step="0.1" value="87" /></label>
+          </div>
+          <div>
+            <div class="hint" style="margin-top:0;">Bottom Right</div>
+            <label>Pan <input id="cal-br-pan" type="number" min="0" max="270" step="0.1" value="159" /></label>
+            <label>Tilt <input id="cal-br-tilt" type="number" min="0" max="180" step="0.1" value="87" /></label>
+          </div>
+        </div>
+        <div class="inputs" style="grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));">
+          <label>
+            Rows
+            <input id="cal-rows" type="number" min="2" max="15" step="1" value="5" />
+          </label>
+          <label>
+            Columns
+            <input id="cal-cols" type="number" min="2" max="15" step="1" value="5" />
+          </label>
+          <label>
+            P2 Points
+            <input id="cal-phase2-count" type="number" min="0" max="50" step="1" value="10" />
+          </label>
+          <label>
+            Settle (s)
+            <input id="cal-settle" type="number" min="0" max="5" step="0.05" value="0.35" />
+          </label>
+          <label>
+            Laser settle (s)
+            <input id="cal-laser-settle" type="number" min="0" max="5" step="0.05" value="0.5" />
+          </label>
+          <label>
+            Discard frames
+            <input id="cal-discard-frames" type="number" min="0" max="15" step="1" value="4" />
+          </label>
+          <label>
+            Edge margin (px)
+            <input id="cal-edge-margin" type="number" min="0" max="200" step="1" value="20" />
+          </label>
+        </div>
+        <div class="actions" style="align-items:center; flex-wrap:wrap;">
+          <button id="automatic-calibrate" class="accent">Calibrate</button>
+          <div id="automatic-calibration-status" class="hint" style="margin-top:0;">Idle</div>
+          <a id="automatic-calibration-report" class="hint" style="margin-top:0; display:none;" target="_blank" rel="noopener">Debug report</a>
+        </div>
+      </section>
+
+      <section class="panel" style="margin-top: 16px;">
         <h2>Water</h2>
         <div class="actions" style="display:flex; gap:8px; align-items:center;">
           <button id="fire-water" class="accent danger">Fire 💦 (2s)</button>
@@ -196,21 +258,58 @@
       const detectorType = byId('detector-type');
       const motionMinArea = byId('motion-min-area');
       const laserEnabled = byId('laser-enabled');
-      img.addEventListener('click', async (e) => {
+      function imagePointFromEvent(e) {
         const rect = img.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const y = e.clientY - rect.top;
+        const naturalW = Number(img.naturalWidth) || rect.width;
+        const naturalH = Number(img.naturalHeight) || rect.height;
+        if (rect.width <= 0 || rect.height <= 0 || naturalW <= 0 || naturalH <= 0) return null;
+
+        const elementRatio = rect.width / rect.height;
+        const imageRatio = naturalW / naturalH;
+        let contentW = rect.width;
+        let contentH = rect.height;
+        let offsetX = 0;
+        let offsetY = 0;
+
+        if (elementRatio > imageRatio) {
+          contentH = rect.height;
+          contentW = contentH * imageRatio;
+          offsetX = (rect.width - contentW) / 2;
+        } else {
+          contentW = rect.width;
+          contentH = contentW / imageRatio;
+          offsetY = (rect.height - contentH) / 2;
+        }
+
+        const localX = e.clientX - rect.left - offsetX;
+        const localY = e.clientY - rect.top - offsetY;
+        if (localX < 0 || localY < 0 || localX > contentW || localY > contentH) return null;
+
+        const u = Math.min(1, Math.max(0, localX / contentW));
+        const v = Math.min(1, Math.max(0, localY / contentH));
+        return {
+          u,
+          v,
+          x: u * naturalW,
+          y: v * naturalH,
+          width: naturalW,
+          height: naturalH
+        };
+      }
+      img.addEventListener('click', async (e) => {
+        const point = imagePointFromEvent(e);
+        if (!point) return;
         // For aiming, send normalized coordinates only (0..1)
         const aimPayload = {
-          x: Math.min(1, Math.max(0, x / rect.width)),
-          y: Math.min(1, Math.max(0, y / rect.height))
+          x: point.u,
+          y: point.v
         };
-        // For click logging, send pixel coords and element size
+        // For click logging, send pixel coords in the stream's natural image space.
         const clickPayload = {
-          x: Math.round(x),
-          y: Math.round(y),
-          width: Math.round(rect.width),
-          height: Math.round(rect.height)
+          x: Math.round(point.x),
+          y: Math.round(point.y),
+          width: Math.round(point.width),
+          height: Math.round(point.height)
         };
         try {
           if (recordToggle.checked) {
@@ -277,6 +376,90 @@
 
       // Initial load
       refreshClicks();
+
+      const automaticCalibrate = byId('automatic-calibrate');
+      const automaticCalibrationStatus = byId('automatic-calibration-status');
+      const automaticCalibrationReport = byId('automatic-calibration-report');
+      function readCalibrationCorner(prefix) {
+        return {
+          pan: Number(byId(`cal-${prefix}-pan`).value),
+          tilt: Number(byId(`cal-${prefix}-tilt`).value)
+        };
+      }
+      function setCalibrationStatus(text) {
+        if (automaticCalibrationStatus) automaticCalibrationStatus.textContent = text;
+      }
+      automaticCalibrate?.addEventListener('click', async () => {
+        const rows = Math.max(2, Math.min(15, Math.floor(Number(byId('cal-rows').value) || 5)));
+        const cols = Math.max(2, Math.min(15, Math.floor(Number(byId('cal-cols').value) || 5)));
+        const phase2Count = Math.max(0, Math.min(50, Math.floor(Number(byId('cal-phase2-count').value) || 10)));
+        const settle = Math.max(0, Math.min(5, Number(byId('cal-settle').value) || 0));
+        const laserSettle = Math.max(0, Math.min(5, Number(byId('cal-laser-settle').value) || 0.5));
+        const discardFrames = Math.max(0, Math.min(15, Math.floor(Number(byId('cal-discard-frames').value) || 4)));
+        const edgeMargin = Math.max(0, Math.min(200, Math.floor(Number(byId('cal-edge-margin').value) || 20)));
+
+        byId('cal-rows').value = String(rows);
+        byId('cal-cols').value = String(cols);
+        byId('cal-phase2-count').value = String(phase2Count);
+        byId('cal-settle').value = String(settle);
+        byId('cal-laser-settle').value = String(laserSettle);
+        byId('cal-discard-frames').value = String(discardFrames);
+        byId('cal-edge-margin').value = String(edgeMargin);
+
+        const total = rows * cols + phase2Count;
+        const yes = confirm(`Run two-phase calibration over ${total} points? Phase 1: ${rows*cols} grid points. Phase 2: ${phase2Count} random validation points. The pan/tilt head and laser will move during capture.`);
+        if (!yes) return;
+
+        automaticCalibrate.disabled = true;
+        const originalText = automaticCalibrate.textContent;
+        automaticCalibrate.textContent = 'Calibrating...';
+        if (automaticCalibrationReport) automaticCalibrationReport.style.display = 'none';
+        setCalibrationStatus(`Running ${rows*cols} point sweep + ${phase2Count} random targets...`);
+        try {
+          const payload = {
+            top_left: readCalibrationCorner('tl'),
+            top_right: readCalibrationCorner('tr'),
+            bottom_left: readCalibrationCorner('bl'),
+            bottom_right: readCalibrationCorner('br'),
+            rows,
+            cols,
+            phase2_count: phase2Count,
+            move_settle_sec: settle,
+            laser_settle_sec: laserSettle,
+            discard_frames: discardFrames,
+            edge_margin_px: edgeMargin
+          };
+          const res = await fetch('/api/calibration/automatic', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          const data = await res.json().catch(() => ({}));
+          if (automaticCalibrationReport && data.debug_report_url) {
+            automaticCalibrationReport.href = data.debug_report_url;
+            automaticCalibrationReport.style.display = 'inline';
+          }
+          if (!res.ok) {
+            setCalibrationStatus(data.error || 'Calibration failed');
+            await refreshClicks();
+            alert(data.error || 'Calibration failed');
+            return;
+          }
+          if (typeof data.pan === 'number') pan.value = data.pan.toFixed(1);
+          if (typeof data.tilt === 'number') tilt.value = data.tilt.toFixed(1);
+          const marginText = typeof data.edge_margin_px === 'number' ? ` Edge margin ${Math.round(data.edge_margin_px)}px.` : '';
+          const timingText = ` Laser settle ${data.laser_settle_sec ?? laserSettle}s, discard ${data.discard_frames ?? discardFrames}.`;
+          setCalibrationStatus(`Saved ${data.saved_count || 0}/${data.requested || total}; missed ${data.miss_count || 0}.${marginText}${timingText}`);
+          await refreshClicks();
+        } catch (e) {
+          console.error('Automatic calibration failed', e);
+          setCalibrationStatus('Calibration failed');
+          alert('Automatic calibration failed. See console for details.');
+        } finally {
+          automaticCalibrate.disabled = false;
+          automaticCalibrate.textContent = originalText;
+        }
+      });
 
       // Motion config and follow
       async function setMotionConfig({ enabled, min_area, alpha, persist_ms } = {}) {
