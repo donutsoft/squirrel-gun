@@ -8,14 +8,14 @@ dependencies = [
     "flask>=3.1.2",
     "opencv-python==4.7.0.72",
     "paho-mqtt>=2.1.0",
-    "pigpio>=1.78",
-    "rpi-gpio>=0.7.1",
+    "gpiozero>=2.0.1",
     "scikit-learn>=1.5.1",
     "numpy<2",
     "pycoral==2.0.0",
     "pyturbojpeg>=1.8.2",
     "tflite-runtime==2.5.0.post1",
-    "ultralytics==8.3.201"
+    "ultralytics==8.3.201",
+    "lgpio>=0.2.2.0",
 ]
 python = "3.9"
 [tool.uv]

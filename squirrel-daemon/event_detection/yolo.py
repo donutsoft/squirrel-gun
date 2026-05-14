@@ -82,7 +82,7 @@ class YOLOEventDetector(EventDetector):
             'detections': None,
             'last_confidence': float(self._last_confidence),
             'events_published': int(self._events_published),
-            'using_tpu': None,
+            'using_tpu': True,
         }
 
     def config(self) -> Dict[str, Any]:

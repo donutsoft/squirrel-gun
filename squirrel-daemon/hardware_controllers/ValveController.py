@@ -2,7 +2,13 @@ import os
 import sys
 import time
 import fcntl
-import RPi.GPIO as GPIO
+
+from gpiozero import OutputDevice
+
+try:
+    from hardware_controllers.GpioFactory import configure_pin_factory
+except ImportError:
+    from GpioFactory import configure_pin_factory
 
 
 LOCK_PATH = "/tmp/valve_controller.lock"
@@ -34,22 +40,22 @@ def release_lock(lock_file):
 
 
 def run_valve(duration_seconds: float, pin: int = 24) -> None:
-    GPIO.setwarnings(False)
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(pin, GPIO.OUT)
     lock_file = acquire_lock(blocking=False)
     if lock_file is None:
         print("ValveController already running; exiting.")
         return
 
+    configure_pin_factory()
+    valve = OutputDevice(pin, active_high=True, initial_value=False)
+
     try:
         try:
-            GPIO.output(pin, GPIO.HIGH)
+            valve.on()
             time.sleep(duration_seconds)
         finally:
             # Ensure the valve is switched off at the very end
-            GPIO.output(pin, GPIO.LOW)
-            GPIO.cleanup()
+            valve.off()
+            valve.close()
     finally:
         release_lock(lock_file)
 
