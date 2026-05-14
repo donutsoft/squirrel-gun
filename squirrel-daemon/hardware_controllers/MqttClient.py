@@ -1,7 +1,5 @@
-from collections import defaultdict
 import paho.mqtt.client as mqtt
 import logging
-import time
 
 class MqttClient:
     def __init__(self):
@@ -14,13 +12,10 @@ class MqttClient:
         self._mqttClient.on_message = self.onMessage
         self._mqttClient.on_disconnect = self.onDisconnect
         
-        # Try to connect, but don't block if it fails
-        try:
-            self._mqttClient.connect('192.168.1.3', 1883)
-            self._mqttClient.loop_start()
-        except Exception as e:
-            self.logger.error(f"Failed to connect to MQTT server: {e}")
-            self._connected = False
+        rc = self._mqttClient.connect('192.168.1.3', 1883)
+        if rc != mqtt.MQTT_ERR_SUCCESS:
+            raise ConnectionError(f"Failed to start MQTT connection: {mqtt.error_string(rc)}")
+        self._mqttClient.loop_start()
 
     def onConnect(self, client, userdata, flags, rc):
         if rc == 0:
@@ -31,24 +26,20 @@ class MqttClient:
                 self._mqttClient.subscribe(topic)
         else:
             self._connected = False
-            self.logger.error(f"Failed to connect to MQTT server with code: {rc}")
+            raise ConnectionError(f"Failed to connect to MQTT server with code: {rc}")
 
     def onDisconnect(self, client, userdata, rc):
         self._connected = False
         if rc != 0:
             self.logger.warning(f"Unexpected disconnection from MQTT server (code: {rc})")
-            # Try to reconnect
-            try:
-                self._mqttClient.reconnect()
-            except Exception as e:
-                self.logger.error(f"Failed to reconnect to MQTT server: {e}")
+            self._mqttClient.reconnect()
 
     def onMessage(self, client, userdata, msg):
         try:
             if msg.topic in self.topics:
                 for callback in self.topics[msg.topic]:
                     callback(msg.payload.decode('utf-8'))
-        except Exception as e:
+        except Exception:
             self.logger.exception("Unhandled exception")
             raise
     
@@ -78,7 +69,6 @@ class MqttClient:
 
     def publish(self, topic, message):
         if not self._connected:
-            print(f"Cannot publish message - MQTT not connected")
-            return
+            raise RuntimeError("Cannot publish message - MQTT not connected")
         print("Sending message %s to topic %s", message, topic)
         self._mqttClient.publish(topic, message)

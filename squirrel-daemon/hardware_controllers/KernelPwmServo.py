@@ -1,4 +1,3 @@
-import os
 import time
 from pathlib import Path
 from typing import Union
@@ -24,31 +23,31 @@ class KernelPwmServo:
         self.max_pulse_us = int(max_pulse_us)
         self.min_angle = float(min_angle)
         self.max_angle = float(max_angle)
-        self._available = self._setup()
+        self._setup()
 
     def _write(self, name: str, value: Union[int, str]) -> None:
         (self.pwm_path / name).write_text(f"{value}\n", encoding="ascii")
 
-    def _setup(self) -> bool:
+    def _setup(self) -> None:
         if not self.chip_path.exists():
-            print(
+            raise FileNotFoundError(
                 f"[KernelPwmServo] {self.chip_path} not found; "
                 "enable the pwm-2chan overlay for GPIO 18/19."
             )
-            return False
 
         if not self.pwm_path.exists():
             try:
                 (self.chip_path / "export").write_text(f"{self.channel}\n", encoding="ascii")
             except OSError as exc:
                 if not self.pwm_path.exists():
-                    print(f"[KernelPwmServo] Could not export PWM channel {self.channel}: {exc}")
-                    return False
+                    raise RuntimeError(f"[KernelPwmServo] Could not export PWM channel {self.channel}") from exc
 
         for _ in range(20):
             if self.pwm_path.exists():
                 break
             time.sleep(0.01)
+        if not self.pwm_path.exists():
+            raise FileNotFoundError(f"[KernelPwmServo] PWM channel path did not appear: {self.pwm_path}")
 
         try:
             self._write("enable", 0)
@@ -60,15 +59,10 @@ class KernelPwmServo:
             self._write("duty_cycle", 0)
             self._write("enable", 1)
         except OSError as exc:
-            print(f"[KernelPwmServo] Could not initialize {self.pwm_path}: {exc}")
-            return False
+            raise RuntimeError(f"[KernelPwmServo] Could not initialize {self.pwm_path}") from exc
 
-        return True
 
     def set_angle(self, angle: float) -> None:
-        if not self._available:
-            return
-
         clamped = max(self.min_angle, min(self.max_angle, float(angle)))
         span = self.max_angle - self.min_angle
         fraction = 0.0 if span == 0 else (clamped - self.min_angle) / span

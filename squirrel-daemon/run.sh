@@ -12,7 +12,7 @@ prepare_pwm_channel() {
 
     if [ ! -d "${PWM_ROOT}" ]; then
         echo "PWM chip ${PWM_ROOT} is missing; enable dtoverlay=pwm-2chan and reboot." >&2
-        return 0
+        return 1
     fi
 
     if [ ! -d "${channel_path}" ]; then

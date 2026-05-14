@@ -24,87 +24,21 @@ pantilt = PanTiltController()
 webcam = WebcamController()
 store = ClickStore()
 water = WaterController()
-try:
-    laser = LaserController()
-except Exception as _e:
-    # Fallback: controller may not be available in dev
-    laser = None  # type: ignore
+laser = LaserController()
 bus = EventBus()
 
 # Track laser enabled state (default ON; overridden by persisted if present)
 laser_enabled = True
 
 # Wire WebcamController to publish motion events to the bus
-try:
-    webcam.set_motion_publisher(bus.publish)
-except Exception:
-    pass
+webcam.set_motion_publisher(bus.publish)
 
 # Subscribe webcam controller to the bus to start/extend recording on motion
-try:
-    # Initial values will be overridden by persisted settings load below if present
-    webcam.set_event_bus(bus, record_on_motion=True, duration_sec=30.0)
-except Exception:
-    pass
-
-# Load persisted settings and apply to webcam and follow-motion
-try:
-    persisted = store.get_settings([
-        'motion.enabled', 'motion.min_area', 'motion.alpha', 'motion.persist_ms', 'motion.bg_mode',
-        'motion.prefer_tracking', 'motion.frame_skip', 'motion.scale',
-        'record.record_on_motion', 'record.duration_sec', 'record.snapshot_on_motion',
-        'follow_motion.enabled',
-        'motion.zone',
-        'water_on_motion.enabled',
-        'laser.enabled',
-        'detector.type',
-    ])
-    # Apply detector type
-    if 'detector.type' in persisted:
-        try:
-            webcam.set_detector_type(persisted['detector.type'])
-        except Exception as e:
-            print(f"Warning: failed to set detector type: {e}")
-    # Apply motion settings (use current config as defaults)
-    cur_motion = webcam.motion_config()
-    webcam.set_motion_detection(
-        enabled=bool(persisted.get('motion.enabled', cur_motion.get('enabled'))),
-        min_area=persisted.get('motion.min_area', cur_motion.get('min_area')),
-        alpha=persisted.get('motion.alpha', cur_motion.get('alpha')),
-        persist_ms=persisted.get('motion.persist_ms', cur_motion.get('persist_ms')),
-        bg_mode=persisted.get('motion.bg_mode', cur_motion.get('bg_mode')),
-        prefer_tracking=persisted.get('motion.prefer_tracking', cur_motion.get('prefer_tracking')),
-        frame_skip=persisted.get('motion.frame_skip', cur_motion.get('frame_skip')),
-        scale=persisted.get('motion.scale', cur_motion.get('scale')),
-    )
-    # Apply recording settings
-    cur_rec = webcam.get_recording_config()
-    webcam.set_recording_config(
-        record_on_motion=persisted.get('record.record_on_motion', cur_rec.get('record_on_motion')),
-        duration_sec=persisted.get('record.duration_sec', cur_rec.get('duration_sec')),
-        snapshot_on_motion=persisted.get('record.snapshot_on_motion', cur_rec.get('snapshot_on_motion'))
-    )
-    # Apply follow motion flag
-    if 'follow_motion.enabled' in persisted:
-        follow_motion_enabled = bool(persisted['follow_motion.enabled'])
-    # Apply motion zone if present (normalized x,y,w,h)
-    if 'motion.zone' in persisted:
-        try:
-            webcam.set_motion_zone(persisted.get('motion.zone'))
-        except Exception:
-            pass
-    # Apply water-on-motion flag
-    if 'water_on_motion.enabled' in persisted:
-        water_on_motion_enabled = bool(persisted['water_on_motion.enabled'])
-    # Apply laser enabled flag (default True)
-    if 'laser.enabled' in persisted:
-        laser_enabled = bool(persisted['laser.enabled'])
-except Exception:
-    pass
+# Initial values will be overridden by persisted settings load below if present
+webcam.set_event_bus(bus, record_on_motion=True, duration_sec=30.0)
 
 # Track current angles in-process (servos don't report position)
 # Store current angles as a single immutable tuple so reads/writes are atomic
-global current
 current = (135.0, 90.0)
 # Default: don't aim the laser on motion (can be overridden by persisted setting)
 follow_motion_enabled = False
@@ -116,21 +50,60 @@ _last_water_fire_ts = 0.0
 _WATER_COOLDOWN_SEC = 60.0
 _calibration_lock = threading.Lock()
 
-# Attempt to center hardware on startup; ignore failures if hardware not present
-try:
-    pantilt.setPanTilt(current[0], current[1])
-except Exception as e:
-    print(f"Warning: Failed to center pan/tilt on startup: {e}")
+# Load persisted settings and apply to webcam and follow-motion
+persisted = store.get_settings([
+    'motion.enabled', 'motion.min_area', 'motion.alpha', 'motion.persist_ms', 'motion.bg_mode',
+    'motion.prefer_tracking', 'motion.frame_skip', 'motion.scale',
+    'record.record_on_motion', 'record.duration_sec', 'record.snapshot_on_motion',
+    'follow_motion.enabled',
+    'motion.zone',
+    'water_on_motion.enabled',
+    'laser.enabled',
+    'detector.type',
+])
+# Apply detector type
+if 'detector.type' in persisted:
+    webcam.set_detector_type(persisted['detector.type'])
+# Apply motion settings (use current config as defaults)
+cur_motion = webcam.motion_config()
+webcam.set_motion_detection(
+    enabled=bool(persisted.get('motion.enabled', cur_motion.get('enabled'))),
+    min_area=persisted.get('motion.min_area', cur_motion.get('min_area')),
+    alpha=persisted.get('motion.alpha', cur_motion.get('alpha')),
+    persist_ms=persisted.get('motion.persist_ms', cur_motion.get('persist_ms')),
+    bg_mode=persisted.get('motion.bg_mode', cur_motion.get('bg_mode')),
+    prefer_tracking=persisted.get('motion.prefer_tracking', cur_motion.get('prefer_tracking')),
+    frame_skip=persisted.get('motion.frame_skip', cur_motion.get('frame_skip')),
+    scale=persisted.get('motion.scale', cur_motion.get('scale')),
+)
+# Apply recording settings
+cur_rec = webcam.get_recording_config()
+webcam.set_recording_config(
+    record_on_motion=persisted.get('record.record_on_motion', cur_rec.get('record_on_motion')),
+    duration_sec=persisted.get('record.duration_sec', cur_rec.get('duration_sec')),
+    snapshot_on_motion=persisted.get('record.snapshot_on_motion', cur_rec.get('snapshot_on_motion'))
+)
+# Apply follow motion flag
+if 'follow_motion.enabled' in persisted:
+    follow_motion_enabled = bool(persisted['follow_motion.enabled'])
+# Apply motion zone if present (normalized x,y,w,h)
+if 'motion.zone' in persisted:
+    webcam.set_motion_zone(persisted.get('motion.zone'))
+# Apply water-on-motion flag
+if 'water_on_motion.enabled' in persisted:
+    water_on_motion_enabled = bool(persisted['water_on_motion.enabled'])
+# Apply laser enabled flag (default True)
+if 'laser.enabled' in persisted:
+    laser_enabled = bool(persisted['laser.enabled'])
 
-# Attempt to set laser state on startup
-try:
-    if laser is not None:
-        if laser_enabled:
-            laser.turn_on()
-        else:
-            laser.turn_off()
-except Exception as e:
-    print(f"Warning: Failed to initialize laser state: {e}")
+# Center hardware on startup.
+pantilt.setPanTilt(current[0], current[1])
+
+# Set laser state on startup.
+if laser_enabled:
+    laser.turn_on()
+else:
+    laser.turn_off()
 
 def _build_aimer(min_rows: int = 10) -> tuple[LinearAimer, int, bool]:
     """Create a fresh LinearAimer from click data in the DB.
@@ -1049,8 +1022,6 @@ def motion_water_get():
 def automatic_calibration():
     global current, follow_motion_enabled
 
-    if laser is None:
-        return jsonify({"error": "laser controller is not available"}), 500
     if not _calibration_lock.acquire(blocking=False):
         return jsonify({"error": "automatic calibration is already running"}), 409
 
@@ -1580,11 +1551,10 @@ def set_laser():
     if not isinstance(enabled, bool):
         return jsonify({"error": "enabled must be boolean"}), 400
     try:
-        if laser is not None:
-            if enabled:
-                laser.turn_on()
-            else:
-                laser.turn_off()
+        if enabled:
+            laser.turn_on()
+        else:
+            laser.turn_off()
     except Exception as e:
         return jsonify({"error": f"failed to set laser: {e}"}), 500
     laser_enabled = enabled

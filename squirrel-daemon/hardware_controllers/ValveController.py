@@ -4,11 +4,7 @@ import time
 import fcntl
 
 from gpiozero import OutputDevice
-
-try:
-    from hardware_controllers.GpioFactory import configure_pin_factory
-except ImportError:
-    from GpioFactory import configure_pin_factory
+from hardware_controllers.GpioFactory import configure_pin_factory
 
 
 LOCK_PATH = "/tmp/valve_controller.lock"

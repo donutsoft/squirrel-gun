@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 import json
-from sklearn.linear_model import Ridge, LinearRegression, HuberRegressor
+from sklearn.linear_model import HuberRegressor
 from sklearn.preprocessing import PolynomialFeatures
 
 
@@ -33,29 +33,24 @@ class LinearAimer:
 
     @staticmethod
     def load(path: Path) -> "LinearAimer":
-        try:
-            with open(path, 'r') as f:
-                data = json.load(f)
-            if 'pan' in data and 'tilt' in data:
-                pan_list = list(map(float, data['pan']))
-                tilt_list = list(map(float, data['tilt']))
-                # Backward compatibility: accept 3-coeff (linear) or 6-coeff (quadratic) models
-                if (len(pan_list) in (3, 6)) and (len(tilt_list) in (3, 6)):
-                    return LinearAimer(pan=pan_list, tilt=tilt_list, path=path)
-        except Exception:
-            pass
-        m = LinearAimer.default()
-        m.path = path
-        return m
+        with open(path, 'r') as f:
+            data = json.load(f)
+        if 'pan' not in data or 'tilt' not in data:
+            raise ValueError(f"Aim model must include pan and tilt coefficients: {path}")
+        pan_list = list(map(float, data['pan']))
+        tilt_list = list(map(float, data['tilt']))
+        # Backward compatibility: accept 3-coeff (linear) or 6-coeff (quadratic) models
+        if (len(pan_list) in (3, 6)) and (len(tilt_list) in (3, 6)):
+            return LinearAimer(pan=pan_list, tilt=tilt_list, path=path)
+        raise ValueError(
+            f"Aim model coefficient lengths must be 3 or 6: pan={len(pan_list)}, tilt={len(tilt_list)}"
+        )
 
     def save(self) -> None:
         if not self.path:
             return
-        try:
-            with open(self.path, 'w') as f:
-                json.dump({'pan': self.pan, 'tilt': self.tilt}, f)
-        except Exception:
-            pass
+        with open(self.path, 'w') as f:
+            json.dump({'pan': self.pan, 'tilt': self.tilt}, f)
 
     def to_dict(self) -> Dict[str, List[float]]:
         return {'pan': self.pan, 'tilt': self.tilt}
@@ -82,13 +77,9 @@ class LinearAimer:
             tilt = b0 + (b_u * u + b_v * v + b_uu * uu + b_uv * uv + b_vv * vv)
             return pan, tilt
 
-        # Fallback (unexpected lengths): treat as linear best-effort
-        try:
-            a0, a1, a2 = self.pan[:3]
-            b0, b1, b2 = self.tilt[:3]
-            return a0 + a1 * u + a2 * v, b0 + b1 * u + b2 * v
-        except Exception:
-            return 90.0, 90.0
+        raise ValueError(
+            f"Unexpected coefficient lengths: pan={len(self.pan)}, tilt={len(self.tilt)}"
+        )
 
     def fit_from_clicks(self, rows: List[Dict[str, float]], *, focus: Tuple[float, float] | None = None, sigma: float = 0.2) -> None:
         # Build feature matrix X = [[u, v], ...] and targets pan/tilt
@@ -127,33 +118,10 @@ class LinearAimer:
         poly = PolynomialFeatures(degree=2, include_bias=False)
         X = poly.fit_transform(X_base)
 
-        # Prefer robust regression to handle occasional bad clicks
-        try:
-            reg_pan = HuberRegressor(epsilon=1.35, alpha=1e-4, max_iter=1000)
-            reg_tilt = HuberRegressor(epsilon=1.35, alpha=1e-4, max_iter=1000)
-            reg_pan.fit(X, y_pan, sample_weight=weights)
-            reg_tilt.fit(X, y_tilt, sample_weight=weights)
-        except Exception:
-            # Fall back to Ridge for stability
-            try:
-                reg_pan = Ridge(alpha=1.0, fit_intercept=True)
-                reg_tilt = Ridge(alpha=1.0, fit_intercept=True)
-                reg_pan.fit(X, y_pan, sample_weight=weights)
-                reg_tilt.fit(X, y_tilt, sample_weight=weights)
-            except Exception:
-                # Fallback to simple linear regression if something goes wrong
-                lin_pan = LinearRegression(fit_intercept=True)
-                lin_tilt = LinearRegression(fit_intercept=True)
-                try:
-                    lin_pan.fit(X_base, y_pan, sample_weight=weights)
-                    lin_tilt.fit(X_base, y_tilt, sample_weight=weights)
-                except Exception:
-                    lin_pan.fit(X_base, y_pan)
-                    lin_tilt.fit(X_base, y_tilt)
-                self.pan = [float(lin_pan.intercept_), float(lin_pan.coef_[0]), float(lin_pan.coef_[1])]
-                self.tilt = [float(lin_tilt.intercept_), float(lin_tilt.coef_[0]), float(lin_tilt.coef_[1])]
-                self.save()
-                return
+        reg_pan = HuberRegressor(epsilon=1.35, alpha=1e-4, max_iter=1000)
+        reg_tilt = HuberRegressor(epsilon=1.35, alpha=1e-4, max_iter=1000)
+        reg_pan.fit(X, y_pan, sample_weight=weights)
+        reg_tilt.fit(X, y_tilt, sample_weight=weights)
 
         # Store as [intercept, coef_u, coef_v, coef_u2, coef_uv, coef_v2]
         # PolynomialFeatures order for 2 inputs with include_bias=False is: [u, v, u^2, u*v, v^2]

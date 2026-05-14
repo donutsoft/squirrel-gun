@@ -45,16 +45,10 @@ class WebcamController:
         # Recording state and config
         from pathlib import Path as _P
         self._recordings_dir = _P(__file__).resolve().parents[1] / 'static' / 'recordings'
-        try:
-            self._recordings_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
+        self._recordings_dir.mkdir(parents=True, exist_ok=True)
         # Screenshots directory (per-motion snapshot)
         self._snapshots_dir = self._recordings_dir / 'shots'
-        try:
-            self._snapshots_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
+        self._snapshots_dir.mkdir(parents=True, exist_ok=True)
         # No internal auto-record on motion; use event bus subscription instead
         self._record_on_motion_enabled = True
         self._record_duration_sec = 30.0
@@ -73,6 +67,7 @@ class WebcamController:
         self._last_motion_event_ts = 0.0
         self._pending_persist_meta: Optional[dict[str, float]] = None
         self._bus = None  # type: ignore
+        self._verify_capture_device()
 
     def _device_index(self) -> int:
         index = 0
@@ -96,8 +91,7 @@ class WebcamController:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.width))
         if self.height:
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.height))
-        # Hint the backend to keep a tiny buffer (best-effort; some backends ignore it)
-        
+        # Hint the backend to keep a tiny buffer; some backends ignore it.
         # cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         # Hint desired FPS to reduce internal buffering when possible
         cap.set(cv2.CAP_PROP_FPS, float(self._fps))
@@ -105,7 +99,14 @@ class WebcamController:
         # Prefer MJPG if the camera supports it; this often drops latency on UVC devices
         fourcc = cv2.VideoWriter_fourcc(*'MJPG')
         cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+        if not cap.isOpened():
+            cap.release()
+            raise RuntimeError(f"Unable to open camera device {self.device}")
         return cap
+
+    def _verify_capture_device(self) -> None:
+        cap = self._open_capture()
+        cap.release()
 
     def _encode_frame(self, frame: Any, quality: Optional[int] = None) -> Optional[bytes]:
         if frame is None:
@@ -149,12 +150,9 @@ class WebcamController:
         if frame is not None:
             jpg = self._encode_frame(frame)
             if jpg:
-                try:
-                    with open(outfile, 'wb') as f:
-                        f.write(jpg)
-                    return outfile
-                except Exception:
-                    pass
+                with open(outfile, 'wb') as f:
+                    f.write(jpg)
+                return outfile
         if not self._running:
             if self._capture_with_opencv(outfile):
                 return outfile
@@ -196,12 +194,9 @@ class WebcamController:
         if frame is not None:
             jpg = self._encode_frame(frame)
             if jpg:
-                try:
-                    with open(outfile, 'wb') as f:
-                        f.write(jpg)
-                    return outfile
-                except Exception:
-                    pass
+                with open(outfile, 'wb') as f:
+                    f.write(jpg)
+                return outfile
 
         if not self._running:
             if self._capture_with_opencv(outfile):
@@ -393,19 +388,13 @@ class WebcamController:
         if frame is not None:
             jpg = self._encode_frame(frame)
             if jpg:
-                try:
-                    with open(out_path, 'wb') as f:
-                        f.write(jpg)
-                    return out_path
-                except Exception:
-                    return None
-        # Fallback: capture a fresh frame directly
+                with open(out_path, 'wb') as f:
+                    f.write(jpg)
+                return out_path
+        # If streaming is stopped, capture a fresh frame directly.
         if not self._running:
-            try:
-                ok = self._capture_with_opencv(out_path)
-                return out_path if ok else None
-            except Exception:
-                return None
+            ok = self._capture_with_opencv(out_path)
+            return out_path if ok else None
         return None
 
     def start_recording(self, duration_sec: float = 30.0, extend: bool = True) -> Optional[Path]:
@@ -493,15 +482,10 @@ class WebcamController:
                         except Exception:
                             data = None
                         if data:
-                            try:
-                                shot_path.parent.mkdir(parents=True, exist_ok=True)
-                                with open(shot_path, 'wb') as f:
-                                    f.write(data)
-                            except Exception:
-                                # Fallback to grabbing latest frame if writing bytes failed
-                                self.save_snapshot(out_path=shot_path)
+                            shot_path.parent.mkdir(parents=True, exist_ok=True)
+                            with open(shot_path, 'wb') as f:
+                                f.write(data)
                         else:
-                            # Fallback to latest available
                             self.save_snapshot(out_path=shot_path)
                     except Exception:
                         pass
