@@ -29,25 +29,37 @@ class YOLOEventDetector(EventDetector):
         self._counter = 0
         self._events_published = 0
         self._last_confidence = 0.0
+        self._daemon_root = Path(__file__).resolve().parents[1]
+        self._detection_output_dir = self._daemon_root / "detections"
+        self._save_detection_images = True
         # Resolve model path relative to squirrel-daemon root and load via Ultralytics
-        self._model_path = (Path(__file__).resolve().parents[1] / model_filename)
+        self._model_path = (self._daemon_root / model_filename)
         if not self._model_path.exists():
             raise FileNotFoundError(f"Model file not found: {self._model_path}")
         self._model = YOLO(str(self._model_path), task='detect')
 
+    def _is_tpu_delegate_error(self, exc: BaseException) -> bool:
+        message = str(exc).lower()
+        return (
+            "libedgetpu" in message
+            or "edgetpu" in message
+            or "delegate" in message
+        )
+
     def _predict_tpu(self, image: Any) -> Any:
         try:
             return self._model.predict(image, verbose=False, conf=float(self._score_thresh))  # type: ignore
-        except ValueError as exc:
-            message = str(exc)
-            if "libedgetpu" not in message and "delegate" not in message.lower():
+        except (RuntimeError, ValueError) as exc:
+            if not self._is_tpu_delegate_error(exc):
                 raise
             raise RuntimeError(
                 "Edge TPU inference failed while loading the TFLite delegate. "
                 "This detector is TPU-only, so no CPU fallback was used. "
                 f"Model: {self._model_path}. "
+                f"Underlying error: {exc}. "
                 "Check that the Coral TPU is attached, the Edge TPU runtime is installed, "
-                "the current user can access the TPU device, and no other process is already using it."
+                "the current user can access the TPU device, and no other process is already using it. "
+                "Run `uv run check_edgetpu.py` on the Pi for device, permission, and delegate diagnostics."
             ) from exc
 
     # --- EventDetector API ---
@@ -63,6 +75,13 @@ class YOLOEventDetector(EventDetector):
             self._frame_skip = max(0, int(kwargs['frame_skip']))
         if 'classes' in kwargs and kwargs['classes'] is not None:
             self._allowed_classes = [int(c) for c in kwargs['classes']]
+        if 'save_detection_images' in kwargs and kwargs['save_detection_images'] is not None:
+            self._save_detection_images = bool(kwargs['save_detection_images'])
+        if 'detection_output_dir' in kwargs and kwargs['detection_output_dir'] is not None:
+            output_dir = Path(str(kwargs['detection_output_dir']))
+            if not output_dir.is_absolute():
+                output_dir = self._daemon_root / output_dir
+            self._detection_output_dir = output_dir
         if 'labels' in kwargs and kwargs['labels'] is not None:
             # Accept dict {id: name} or path to labels file
             if isinstance(kwargs['labels'], dict):
@@ -108,6 +127,8 @@ class YOLOEventDetector(EventDetector):
             'zone': None,
             'allowed_classes': list(self._allowed_classes) if self._allowed_classes is not None else None,
             'model_path': str(self._model_path),
+            'save_detection_images': bool(self._save_detection_images),
+            'detection_output_dir': str(self._detection_output_dir),
         }
 
     def reset_metrics(self) -> None:
@@ -145,6 +166,7 @@ class YOLOEventDetector(EventDetector):
         results = self._predict_tpu(lb)
         # Parse detections in letterbox space (TARGET x TARGET)
         detections_lb = self._parse_ultralytics(results, TARGET, TARGET)
+        saved_image_path = self._save_detection_image(lb, detections_lb, now_ts)
         # Map detections back to original frame coordinates
         detections = []
         for d in detections_lb:
@@ -181,12 +203,35 @@ class YOLOEventDetector(EventDetector):
                 ts=now_ts,
                 rect=(int(x1), int(y1), int(x2 - x1), int(y2 - y1)),
                 center=(cx, cy),
-                extra={'score': conf, 'class': cls}
+                extra={
+                    'score': conf,
+                    'class': cls,
+                    **({'image_path': str(saved_image_path)} if saved_image_path is not None else {}),
+                }
             ))
 
         if events:
             self._events_published += len(events)
         return DetectionResult(frame=work, events=events, metrics={'count': len(detections), 'last_confidence': self._last_confidence})
+
+    def _save_detection_image(self, image: Any, detections: Sequence[Dict[str, Any]], now_ts: float) -> Optional[Path]:
+        if not self._save_detection_images or not detections:
+            return None
+
+        best = max(detections, key=lambda item: float(item.get('score', 0.0)))
+        score = float(best.get('score', 0.0))
+        cls = int(best.get('class', -1))
+        millis = int((now_ts - int(now_ts)) * 1000.0)
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now_ts))
+        path = self._detection_output_dir / f"yolo_{stamp}_{millis:03d}_score{score:.3f}_cls{cls}.jpg"
+
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if cv2.imwrite(str(path), image):
+                return path
+        except Exception:
+            pass
+        return None
 
     # --- helpers ---
     def _parse_ultralytics(self, results: Any, img_w: int, img_h: int) -> List[Dict[str, Any]]:
