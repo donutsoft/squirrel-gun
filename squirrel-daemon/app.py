@@ -16,6 +16,7 @@ import threading
 import json
 import html
 import random
+import cv2  # type: ignore
 from typing import Optional
 
 # Serve static files from root (e.g., "/logo.svg").
@@ -35,7 +36,7 @@ webcam.set_motion_publisher(bus.publish)
 
 # Subscribe webcam controller to the bus to start/extend recording on motion
 # Initial values will be overridden by persisted settings load below if present
-webcam.set_event_bus(bus, record_on_motion=True, duration_sec=30.0)
+webcam.set_event_bus(bus, record_on_motion=True, duration_sec=10.0)
 
 # Track current angles in-process (servos don't report position)
 # Store current angles as a single immutable tuple so reads/writes are atomic
@@ -421,13 +422,69 @@ def _dot_edge_reason(dot: dict, img_w: float, img_h: float, edge_margin_px: floa
 ## DB initialized by ClickStore on import
 
 
-@app.route('/')
-def index():
-    return render_template('PanTiltControl.html')
+_REC_NAME_RE = re.compile(r'^(rec_(\d{8}_\d{6})(?:_\d{3})?)\.mp4$')
 
 
-@app.get('/recordings')
-def recordings_page():
+def _url_for_static_path(path: Path) -> str:
+    static_root = (Path(__file__).parent / 'static').resolve()
+    rel = path.resolve().relative_to(static_root)
+    return "/" + "/".join(rel.parts)
+
+
+def _extract_recording_thumbnail(video_path: Path, thumb_path: Path) -> Optional[Path]:
+    try:
+        thumb_path.parent.mkdir(parents=True, exist_ok=True)
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            cap.release()
+            return None
+        try:
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if total > 10:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, min(total - 1, total // 10)))
+            ok, frame = cap.read()
+        finally:
+            cap.release()
+        if not ok or frame is None:
+            return None
+        if cv2.imwrite(str(thumb_path), frame):
+            return thumb_path
+    except Exception:
+        pass
+    return None
+
+
+def _recording_thumbnail_url(video_path: Path) -> Optional[str]:
+    base = Path(__file__).parent / 'static' / 'recordings'
+    shots_dir = base / 'shots'
+    stem = video_path.stem
+    ts = stem[4:] if stem.startswith('rec_') else stem
+    base_ts = "_".join(ts.split("_")[:2])
+    exact_snapshot = shots_dir / f'snap_{ts}.jpg'
+    try:
+        if exact_snapshot.is_file():
+            return _url_for_static_path(exact_snapshot)
+    except Exception:
+        pass
+    if base_ts and base_ts == ts:
+        try:
+            suffix_matches = sorted(shots_dir.glob(f'snap_{base_ts}_*.jpg'))
+            if len(suffix_matches) == 1 and suffix_matches[0].is_file():
+                return _url_for_static_path(suffix_matches[0])
+        except Exception:
+            pass
+
+    thumb_path = shots_dir / f'thumb_{stem}.jpg'
+    try:
+        if thumb_path.is_file() and thumb_path.stat().st_mtime >= video_path.stat().st_mtime:
+            return _url_for_static_path(thumb_path)
+    except Exception:
+        pass
+    thumb = _extract_recording_thumbnail(video_path, thumb_path)
+    return _url_for_static_path(thumb) if thumb else None
+
+
+def _list_recordings() -> list[dict]:
     base = Path(__file__).parent / 'static' / 'recordings'
     files = []
     try:
@@ -438,6 +495,7 @@ def recordings_page():
                 files.append({
                     'name': p.name,
                     'url': f"/recordings/{p.name}",
+                    'thumbnail_url': _recording_thumbnail_url(p),
                     'size': stat.st_size,
                     'mtime': stat.st_mtime,
                     'display_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime)),
@@ -447,7 +505,17 @@ def recordings_page():
         files.sort(key=lambda x: x['mtime'], reverse=True)
     except Exception:
         pass
-    return render_template('Recordings.html', files=files)
+    return files
+
+
+@app.route('/')
+def index():
+    return render_template('PanTiltControl.html')
+
+
+@app.get('/recordings')
+def recordings_page():
+    return render_template('Recordings.html', files=_list_recordings())
 
 
 @app.get('/motion-zone')
@@ -457,26 +525,7 @@ def motion_zone_page():
 
 @app.get('/api/recordings')
 def recordings_api():
-    base = Path(__file__).parent / 'static' / 'recordings'
-    files = []
-    try:
-        base.mkdir(parents=True, exist_ok=True)
-        for p in base.glob('*.mp4'):
-            try:
-                stat = p.stat()
-                files.append({
-                    'name': p.name,
-                    'url': f"/recordings/{p.name}",
-                    'size': stat.st_size,
-                    'mtime': stat.st_mtime,
-                    'display_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime)),
-                })
-            except Exception:
-                pass
-        files.sort(key=lambda x: x['mtime'], reverse=True)
-    except Exception:
-        pass
-    return jsonify({'files': files})
+    return jsonify({'files': _list_recordings()})
 
 
 @app.get('/snapshots')
@@ -485,7 +534,7 @@ def snapshots_page():
     files = []
     try:
         base.mkdir(parents=True, exist_ok=True)
-        for p in base.glob('*.jpg'):
+        for p in base.glob('snap_*.jpg'):
             try:
                 stat = p.stat()
                 files.append({
@@ -585,9 +634,6 @@ def recording_stop():
         return jsonify({"error": str(e)}), 500
 
 
-_REC_NAME_RE = re.compile(r'^(rec_(\d{8}_\d{6}))\.mp4$')
-
-
 @app.post('/api/recordings/delete')
 def recordings_delete():
     data = request.get_json(silent=True) or {}
@@ -603,11 +649,18 @@ def recordings_delete():
             return jsonify({"error": "file not found"}), 404
         path.unlink()
         # Also delete associated snapshots (same timestamp)
-        ts = m.group(2)
+        ts = m.group(1)[4:]
+        base_ts = m.group(2)
         shots_dir = base / 'shots'
         deleted_shots = []
         # Delete the exact match and any suffix variants (older naming)
-        for sp in [shots_dir / f'snap_{ts}.jpg'] + list(shots_dir.glob(f'snap_{ts}*.jpg')):
+        shot_candidates = [
+            shots_dir / f'snap_{ts}.jpg',
+            shots_dir / f'thumb_{path.stem}.jpg',
+        ]
+        if ts == base_ts:
+            shot_candidates.extend(shots_dir.glob(f'snap_{base_ts}*.jpg'))
+        for sp in shot_candidates:
             try:
                 if sp.is_file():
                     sp.unlink()

@@ -35,6 +35,21 @@ class YOLOEventDetector(EventDetector):
             raise FileNotFoundError(f"Model file not found: {self._model_path}")
         self._model = YOLO(str(self._model_path), task='detect')
 
+    def _predict_tpu(self, image: Any) -> Any:
+        try:
+            return self._model.predict(image, verbose=False, conf=float(self._score_thresh))  # type: ignore
+        except ValueError as exc:
+            message = str(exc)
+            if "libedgetpu" not in message and "delegate" not in message.lower():
+                raise
+            raise RuntimeError(
+                "Edge TPU inference failed while loading the TFLite delegate. "
+                "This detector is TPU-only, so no CPU fallback was used. "
+                f"Model: {self._model_path}. "
+                "Check that the Coral TPU is attached, the Edge TPU runtime is installed, "
+                "the current user can access the TPU device, and no other process is already using it."
+            ) from exc
+
     # --- EventDetector API ---
     def enabled(self) -> bool:
         return bool(self._enabled)
@@ -127,7 +142,7 @@ class YOLOEventDetector(EventDetector):
         left = (TARGET - new_w) // 2
         lb[top:top+new_h, left:left+new_w] = resized
         # Run Ultralytics YOLO on the letterboxed image
-        results = self._model.predict(lb, verbose=False, conf=float(self._score_thresh))  # type: ignore
+        results = self._predict_tpu(lb)
         # Parse detections in letterbox space (TARGET x TARGET)
         detections_lb = self._parse_ultralytics(results, TARGET, TARGET)
         # Map detections back to original frame coordinates

@@ -51,17 +51,22 @@ class WebcamController:
         self._snapshots_dir.mkdir(parents=True, exist_ok=True)
         # No internal auto-record on motion; use event bus subscription instead
         self._record_on_motion_enabled = True
-        self._record_duration_sec = 30.0
+        self._record_duration_sec = 10.0
         self._snapshot_on_motion_enabled = True
         self._recording_active = False
         self._recording_end_ts = 0.0
         self._video_writer = None  # type: ignore
         self._recording_path: Optional[_P] = None  # type: ignore
         self._recording_lock = threading.Lock()
-        self._buffer_duration_sec = 30.0
-        self._motion_persist_delay_sec = 25.0
+        self._pre_motion_sec = 5.0
+        self._post_motion_sec = 5.0
+        self._buffer_duration_sec = self._pre_motion_sec + self._post_motion_sec + 2.0
         self._frame_buffer: deque[tuple[float, Any]] = deque()
         self._frame_buffer_lock = threading.Lock()
+        self._frame_buffer_bytes = 0
+        self._frame_buffer_max_bytes = 256 * 1024 * 1024
+        self._frame_buffer_target_fps = 3.0
+        self._last_buffered_frame_ts = 0.0
         self._pending_persist_timer: Optional[threading.Timer] = None
         self._persist_timer_lock = threading.Lock()
         self._last_motion_event_ts = 0.0
@@ -224,25 +229,53 @@ class WebcamController:
                 break
         return self.capture_fresh(outfile, timeout_sec=timeout_sec, raw=raw)
 
-    def _append_frame_to_buffer(self, frame: Any, ts: Optional[float] = None) -> None:
+    def _append_frame_to_buffer(self, frame: Any, ts: Optional[float] = None, force: bool = False) -> None:
         if frame is None:
+            return
+        if not bool(getattr(self, '_record_on_motion_enabled', False)):
+            with self._frame_buffer_lock:
+                self._frame_buffer.clear()
+                self._frame_buffer_bytes = 0
             return
         if ts is None:
             ts = time.time()
+        min_interval = 1.0 / max(0.1, float(getattr(self, '_frame_buffer_target_fps', 2.0)))
+        if not bool(force) and (float(ts) - float(getattr(self, '_last_buffered_frame_ts', 0.0))) < min_interval:
+            return
+        frame_bytes = int(getattr(frame, 'nbytes', 0) or 0)
+        frame_copy = frame.copy()
+        if frame_bytes <= 0:
+            frame_bytes = int(getattr(frame_copy, 'nbytes', 0) or 0)
         with self._frame_buffer_lock:
-            self._frame_buffer.append((float(ts), frame.copy()))
+            self._frame_buffer.append((float(ts), frame_copy))
+            self._frame_buffer_bytes += max(0, frame_bytes)
+            self._last_buffered_frame_ts = float(ts)
             cutoff = float(ts) - float(self._buffer_duration_sec)
             while self._frame_buffer and self._frame_buffer[0][0] < cutoff:
-                self._frame_buffer.popleft()
+                _, old_frame = self._frame_buffer.popleft()
+                old_bytes = int(getattr(old_frame, 'nbytes', 0) or 0)
+                self._frame_buffer_bytes = max(0, self._frame_buffer_bytes - max(0, old_bytes))
+            max_bytes = max(1, int(getattr(self, '_frame_buffer_max_bytes', 96 * 1024 * 1024)))
+            while self._frame_buffer and self._frame_buffer_bytes > max_bytes:
+                _, old_frame = self._frame_buffer.popleft()
+                old_bytes = int(getattr(old_frame, 'nbytes', 0) or 0)
+                self._frame_buffer_bytes = max(0, self._frame_buffer_bytes - max(0, old_bytes))
 
     def _snapshot_buffer(self) -> list[tuple[float, Any]]:
         with self._frame_buffer_lock:
             return list(self._frame_buffer)
 
-    def _persist_buffer_to_file(self, event_ts: Optional[float] = None) -> Optional[Path]:
+    def _persist_buffer_to_file(self, event_ts: Optional[float] = None, last_event_ts: Optional[float] = None) -> Optional[Path]:
         frames = self._snapshot_buffer()
         if not frames:
             return None
+        if event_ts is not None:
+            start_ts = float(event_ts) - float(getattr(self, '_pre_motion_sec', 5.0))
+            end_base = float(last_event_ts) if last_event_ts is not None else float(event_ts)
+            end_ts = end_base + float(getattr(self, '_post_motion_sec', 5.0))
+            frames = [(ts, frame) for ts, frame in frames if start_ts <= float(ts) <= end_ts]
+            if not frames:
+                return None
         # Use the dimensions from the most recent frame to configure the encoder
         _, last_frame = frames[-1]
         if last_frame is None or not hasattr(last_frame, 'shape'):
@@ -253,7 +286,11 @@ class WebcamController:
         base_ts = event_ts if event_ts is not None else frames[-1][0]
         fname = time.strftime('rec_%Y%m%d_%H%M%S', time.localtime(base_ts)) + f"_{int((base_ts % 1) * 1000):03d}.mp4"
         out_path = self._recordings_dir / fname
-        writer = self._open_video_writer(out_path, max(1, int(self._fps)), (w, h))
+        buffer_fps = max(1, int(self._fps))
+        if len(frames) > 1:
+            span = max(0.001, float(frames[-1][0]) - float(frames[0][0]))
+            buffer_fps = max(1, int(round(float(len(frames) - 1) / span)))
+        writer = self._open_video_writer(out_path, buffer_fps, (w, h))
         if writer is None:
             return None
         written = 0
@@ -289,22 +326,25 @@ class WebcamController:
             self._pending_persist_timer = None
             self._pending_persist_meta = None
         event_ts = None
+        last_event_ts = None
         if meta is not None:
             event_ts = meta.get('first_ts')
-        path = self._persist_buffer_to_file(event_ts=event_ts)
+            last_event_ts = meta.get('last_ts')
+        path = self._persist_buffer_to_file(event_ts=event_ts, last_event_ts=last_event_ts)
         if path is None:
             return
 
     def _schedule_motion_persist(self, event_ts: float) -> bool:
         created = False
-        delay = float(getattr(self, '_motion_persist_delay_sec', 25.0))
+        delay = float(getattr(self, '_post_motion_sec', 5.0))
         with self._persist_timer_lock:
             timer = self._pending_persist_timer
             if timer is not None:
-                try:
-                    timer.cancel()
-                except Exception:
-                    pass
+                if self._pending_persist_meta is not None:
+                    self._pending_persist_meta['last_ts'] = float(event_ts)
+                    self._pending_persist_meta['scheduled_at'] = time.time()
+                self._last_motion_event_ts = float(event_ts)
+                return False
             else:
                 created = True
             if self._pending_persist_meta is None:
@@ -329,6 +369,35 @@ class WebcamController:
             timer.start()
         self._last_motion_event_ts = float(event_ts)
         return created
+
+    def _save_motion_snapshot(self, event_ts: float, data: Optional[bytes] = None) -> Optional[Path]:
+        ts_name = time.strftime('%Y%m%d_%H%M%S', time.localtime(event_ts)) + f"_{int((event_ts % 1) * 1000):03d}"
+        shot_path = self._snapshots_dir / f'snap_{ts_name}.jpg'
+        try:
+            if data:
+                shot_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(shot_path, 'wb') as f:
+                    f.write(data)
+                return shot_path
+            return self.save_snapshot(out_path=shot_path)
+        except Exception:
+            return None
+
+    def _save_motion_snapshot_from_frame_async(self, event_ts: float, frame: Any) -> None:
+        try:
+            frame_copy = frame.copy()
+        except Exception:
+            frame_copy = frame
+
+        def _worker() -> None:
+            data = self._encode_frame(frame_copy)
+            self._save_motion_snapshot(event_ts, data=data)
+
+        try:
+            thread = threading.Thread(target=_worker, name="MotionSnapshot", daemon=True)
+            thread.start()
+        except Exception:
+            pass
 
     def _open_video_writer(self, path: Path, fps: int, frame_size: tuple[int, int]):
         """Open a VideoWriter with sane cross-platform defaults.
@@ -442,7 +511,7 @@ class WebcamController:
             return bool(self._recording_active and time.time() < self._recording_end_ts)
 
     # External integration: listen to event bus for motion events
-    def set_event_bus(self, bus: Any, record_on_motion: bool = True, duration_sec: float = 30.0) -> None:
+    def set_event_bus(self, bus: Any, record_on_motion: bool = True, duration_sec: float = 10.0) -> None:
         """Subscribe to motion events on the provided bus to trigger recording.
 
         The bus must support subscribe(topic, handler) and will receive 'motion' events.
@@ -452,16 +521,23 @@ class WebcamController:
         try:
             dur = max(1.0, float(duration_sec))
             self._record_duration_sec = dur
-            self._buffer_duration_sec = dur
+            self._post_motion_sec = min(5.0, max(1.0, dur - float(getattr(self, '_pre_motion_sec', 5.0))))
+            self._buffer_duration_sec = float(getattr(self, '_pre_motion_sec', 5.0)) + self._post_motion_sec + 2.0
         except Exception:
-            self._record_duration_sec = 30.0
-            self._buffer_duration_sec = 30.0
+            self._record_duration_sec = 10.0
+            self._post_motion_sec = 5.0
+            self._buffer_duration_sec = 12.0
 
         def _on_motion(evt: Any) -> None:
             if not self._record_on_motion_enabled:
                 return
             try:
                 self._motion_triggers_received += 1
+                try:
+                    if isinstance(evt, dict) and evt.get('recording_handled'):
+                        return
+                except Exception:
+                    pass
                 evt_ts = None
                 try:
                     if isinstance(evt, dict) and 'ts' in evt:
@@ -501,20 +577,34 @@ class WebcamController:
 
     # Recording config helpers
     def get_recording_config(self) -> dict:
+        with self._frame_buffer_lock:
+            buffered_frames = len(self._frame_buffer)
+            buffered_bytes = int(self._frame_buffer_bytes)
         return {
             'record_on_motion': bool(self._record_on_motion_enabled),
             'duration_sec': float(self._record_duration_sec),
             'snapshot_on_motion': bool(self._snapshot_on_motion_enabled),
+            'buffered_frames': int(buffered_frames),
+            'buffered_bytes': int(buffered_bytes),
+            'buffer_max_bytes': int(getattr(self, '_frame_buffer_max_bytes', 0)),
+            'buffer_target_fps': float(getattr(self, '_frame_buffer_target_fps', 0.0)),
+            'pre_motion_sec': float(getattr(self, '_pre_motion_sec', 5.0)),
+            'post_motion_sec': float(getattr(self, '_post_motion_sec', 5.0)),
         }
 
     def set_recording_config(self, record_on_motion: Optional[bool] = None, duration_sec: Optional[float] = None, snapshot_on_motion: Optional[bool] = None) -> None:
         if record_on_motion is not None:
             self._record_on_motion_enabled = bool(record_on_motion)
+            if not self._record_on_motion_enabled:
+                with self._frame_buffer_lock:
+                    self._frame_buffer.clear()
+                    self._frame_buffer_bytes = 0
         if duration_sec is not None:
             try:
                 dur = max(1.0, float(duration_sec))
                 self._record_duration_sec = dur
-                self._buffer_duration_sec = dur
+                self._post_motion_sec = min(5.0, max(1.0, dur - float(getattr(self, '_pre_motion_sec', 5.0))))
+                self._buffer_duration_sec = float(getattr(self, '_pre_motion_sec', 5.0)) + self._post_motion_sec + 2.0
             except Exception:
                 pass
         if snapshot_on_motion is not None:
@@ -562,6 +652,22 @@ class WebcamController:
                             try:
                                 res = self._detector.process(raw_frame, now_ts=frame_ts)
                                 frame = res.frame
+                                recording_handled = False
+                                if res.events:
+                                    new_session = False
+                                    if bool(getattr(self, '_record_on_motion_enabled', False)):
+                                        try:
+                                            new_session = self._schedule_motion_persist(frame_ts)
+                                            recording_handled = True
+                                        except Exception:
+                                            new_session = False
+                                    if new_session:
+                                        try:
+                                            self._append_frame_to_buffer(raw_frame, ts=frame_ts, force=True)
+                                        except Exception:
+                                            pass
+                                        if bool(getattr(self, '_snapshot_on_motion_enabled', True)):
+                                            self._save_motion_snapshot_from_frame_async(frame_ts, frame)
                                 if self._publish is not None and res.events:
                                     for e in res.events:
                                         # Compute normalized coords
@@ -581,14 +687,11 @@ class WebcamController:
                                             'u': u, 'v': v,
                                             'width': int(self.width), 'height': int(self.height),
                                         }
+                                        if recording_handled:
+                                            evt['recording_handled'] = True
                                         # Include metrics if present
                                         if e.extra:
                                             evt.update(e.extra)
-                                        # Attach JPEG of the overlay frame for fidelity
-                                        try:
-                                            evt['jpeg'] = self._tj.encode(frame, quality=int(self._quality), pixel_format=TJPF_BGR, jpeg_subsample=TJSAMP_420)
-                                        except Exception:
-                                            pass
                                         try:
                                             self._motion_events_published += 1
                                             self._publish('motion', evt)

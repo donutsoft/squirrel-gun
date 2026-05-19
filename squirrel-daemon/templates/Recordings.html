@@ -12,7 +12,7 @@
         <img src="{{ url_for('static', filename='logo.png') }}" alt="Sad Squirrel Logo" />
         <div>
           <h1>Recordings</h1>
-          <div class="sub">Auto-saved 30s clips when motion is detected.</div>
+          <div class="sub">Auto-saved clips keep about 5s before and 5s after motion.</div>
           <div style="margin-top:6px;">
             <a href="/" style="text-decoration: none;">⟵ Back to Control</a>
           </div>
@@ -36,7 +36,7 @@
             </div>
             <a href="{{ f.url }}" title="Open video" target="_blank" style="display:block;">
               <img
-                src="/recordings/shots/snap_{{ f.name[4:-4] }}.jpg"
+                src="{{ f.thumbnail_url or url_for('static', filename='logo.png') }}"
                 alt="Snapshot for {{ f.name }}"
                 style="width:100%; border-radius:8px; background:#000; object-fit:cover; aspect-ratio:16/9;"
                 onerror="this.onerror=null; this.src='{{ url_for('static', filename='logo.png') }}';"
