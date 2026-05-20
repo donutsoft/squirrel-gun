@@ -1,5 +1,4 @@
 import os
-import sys
 import subprocess
 from .MqttClient import MqttClient
 
@@ -9,9 +8,8 @@ class WaterController:
 
     def startWatering(self, duration):
         print(f"Starting watering for {duration} seconds.")
-        # Launch a new Python process to run the valve controller with duration
-        daemon_root = os.path.dirname(os.path.dirname(__file__))
-        cmd = [sys.executable, "-m", "hardware_controllers.ValveController", str(float(duration))]
-        subprocess.Popen(cmd, cwd=daemon_root)
+        controller_path = os.path.join(os.path.dirname(__file__), "ValveController.sh")
+        cmd = [controller_path, str(float(duration))]
+        subprocess.Popen(cmd)
 
         self.mqtt.publish("squirrel/fire", '{"state": "fired"}')
