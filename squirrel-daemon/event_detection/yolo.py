@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from pathlib import Path
 import time
@@ -32,6 +33,11 @@ class YOLOEventDetector(EventDetector):
         self._daemon_root = Path(__file__).resolve().parents[1]
         self._detection_output_dir = self._daemon_root / "detections"
         self._save_detection_images = True
+        self._bbox_limits_path: Optional[Path] = self._daemon_root / "yolo_bbox_limits.json"
+        self._max_bbox_width_frac: Optional[float] = None
+        self._max_bbox_height_frac: Optional[float] = None
+        self._max_bbox_area_frac: Optional[float] = None
+        self._load_bbox_size_limits(self._bbox_limits_path)
         # Resolve model path relative to squirrel-daemon root and load via Ultralytics
         self._model_path = (self._daemon_root / model_filename)
         if not self._model_path.exists():
@@ -82,6 +88,26 @@ class YOLOEventDetector(EventDetector):
             if not output_dir.is_absolute():
                 output_dir = self._daemon_root / output_dir
             self._detection_output_dir = output_dir
+        if 'bbox_limits_path' in kwargs:
+            if kwargs['bbox_limits_path'] is None:
+                self._bbox_limits_path = None
+                self._max_bbox_width_frac = None
+                self._max_bbox_height_frac = None
+                self._max_bbox_area_frac = None
+            else:
+                p = Path(str(kwargs['bbox_limits_path']))
+                if not p.is_absolute():
+                    p = self._daemon_root / p
+                self._bbox_limits_path = p
+                self._load_bbox_size_limits(p)
+        for key, attr in (
+            ('max_bbox_width_frac', '_max_bbox_width_frac'),
+            ('max_bbox_height_frac', '_max_bbox_height_frac'),
+            ('max_bbox_area_frac', '_max_bbox_area_frac'),
+        ):
+            if key in kwargs:
+                value = kwargs[key]
+                setattr(self, attr, None if value is None else float(value))
         if 'labels' in kwargs and kwargs['labels'] is not None:
             # Accept dict {id: name} or path to labels file
             if isinstance(kwargs['labels'], dict):
@@ -129,6 +155,10 @@ class YOLOEventDetector(EventDetector):
             'model_path': str(self._model_path),
             'save_detection_images': bool(self._save_detection_images),
             'detection_output_dir': str(self._detection_output_dir),
+            'bbox_limits_path': str(self._bbox_limits_path) if self._bbox_limits_path is not None else None,
+            'max_bbox_width_frac': self._max_bbox_width_frac,
+            'max_bbox_height_frac': self._max_bbox_height_frac,
+            'max_bbox_area_frac': self._max_bbox_area_frac,
         }
 
     def reset_metrics(self) -> None:
@@ -166,6 +196,9 @@ class YOLOEventDetector(EventDetector):
         results = self._predict_tpu(lb)
         # Parse detections in letterbox space (TARGET x TARGET)
         detections_lb = self._parse_ultralytics(results, TARGET, TARGET)
+        raw_detection_count = len(detections_lb)
+        detections_lb = [d for d in detections_lb if self._bbox_size_allowed(d, TARGET, TARGET)]
+        filtered_detection_count = raw_detection_count - len(detections_lb)
         saved_image_path = self._save_detection_image(lb, detections_lb, now_ts)
         # Map detections back to original frame coordinates
         detections = []
@@ -212,7 +245,50 @@ class YOLOEventDetector(EventDetector):
 
         if events:
             self._events_published += len(events)
-        return DetectionResult(frame=work, events=events, metrics={'count': len(detections), 'last_confidence': self._last_confidence})
+        return DetectionResult(frame=work, events=events, metrics={
+            'count': len(detections),
+            'raw_count': raw_detection_count,
+            'filtered_count': filtered_detection_count,
+            'last_confidence': self._last_confidence,
+        })
+
+    def _load_bbox_size_limits(self, path: Optional[Path]) -> None:
+        self._max_bbox_width_frac = None
+        self._max_bbox_height_frac = None
+        self._max_bbox_area_frac = None
+        if path is None or not path.exists():
+            return
+
+        try:
+            data = json.loads(path.read_text())
+            self._max_bbox_width_frac = self._optional_positive_float(data.get('max_width_frac'))
+            self._max_bbox_height_frac = self._optional_positive_float(data.get('max_height_frac'))
+            self._max_bbox_area_frac = self._optional_positive_float(data.get('max_area_frac'))
+        except Exception:
+            return
+
+    @staticmethod
+    def _optional_positive_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        parsed = float(value)
+        if parsed <= 0.0:
+            return None
+        return min(1.0, parsed)
+
+    def _bbox_size_allowed(self, detection: Dict[str, Any], img_w: int, img_h: int) -> bool:
+        width = max(0.0, float(detection['x2']) - float(detection['x1']))
+        height = max(0.0, float(detection['y2']) - float(detection['y1']))
+        if width <= 0.0 or height <= 0.0:
+            return False
+
+        if self._max_bbox_width_frac is not None and width / float(img_w) > float(self._max_bbox_width_frac):
+            return False
+        if self._max_bbox_height_frac is not None and height / float(img_h) > float(self._max_bbox_height_frac):
+            return False
+        if self._max_bbox_area_frac is not None and (width * height) / float(img_w * img_h) > float(self._max_bbox_area_frac):
+            return False
+        return True
 
     def _save_detection_image(self, image: Any, detections: Sequence[Dict[str, Any]], now_ts: float) -> Optional[Path]:
         if not self._save_detection_images or not detections:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 import random
 import shutil
@@ -24,6 +25,7 @@ _MAC_DEFAULT_DEVICE: Optional[str] = "mps" if platform.system() == "Darwin" else
 _VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _LETTERBOX_PAD_COLOR = 114
+_DEFAULT_BBOX_LIMITS_FILE = _SCRIPT_DIR.parent / "squirrel-daemon" / "yolo_bbox_limits.json"
 
 
 class YOLOBBoxDetector:
@@ -332,6 +334,75 @@ def _class_name(names, class_id: int) -> str:
         return str(class_id)
 
 
+def write_bbox_size_limits(
+    bbox_file: Union[str, Path],
+    positives_dir: Union[str, Path],
+    output_path: Union[str, Path],
+    *,
+    size_multiplier: float = 2.0,
+) -> Path:
+    """Write normalized max bbox limits for daemon-side false-positive filtering."""
+    bbox_path = Path(bbox_file)
+    positives_path = Path(positives_dir)
+    out = Path(output_path)
+    multiplier = max(1.0, float(size_multiplier))
+
+    max_width_frac = 0.0
+    max_height_frac = 0.0
+    max_area_frac = 0.0
+    box_count = 0
+
+    with bbox_path.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        req = ["image", "xmin", "ymin", "xmax", "ymax"]
+        for k in req:
+            if k not in reader.fieldnames:
+                raise ValueError(f"Missing column '{k}' in {bbox_path}")
+
+        for row in reader:
+            image_name = row["image"].strip()
+            image_path = positives_path / image_name
+            try:
+                with Image.open(image_path) as im:
+                    image_w, image_h = im.size
+            except Exception:
+                continue
+
+            if image_w <= 0 or image_h <= 0:
+                continue
+
+            x1 = float(row["xmin"])
+            y1 = float(row["ymin"])
+            x2 = float(row["xmax"])
+            y2 = float(row["ymax"])
+            width = abs(x2 - x1)
+            height = abs(y2 - y1)
+            if width <= 0.0 or height <= 0.0:
+                continue
+
+            width_frac = width / float(image_w)
+            height_frac = height / float(image_h)
+            max_width_frac = max(max_width_frac, width_frac)
+            max_height_frac = max(max_height_frac, height_frac)
+            max_area_frac = max(max_area_frac, width_frac * height_frac)
+            box_count += 1
+
+    if box_count <= 0:
+        raise ValueError(f"no valid bbox rows found in {bbox_path}")
+
+    data = {
+        "bbox_count": box_count,
+        "size_multiplier": multiplier,
+        "max_width_frac": min(1.0, max_width_frac * multiplier),
+        "max_height_frac": min(1.0, max_height_frac * multiplier),
+        "max_area_frac": min(1.0, max_area_frac * multiplier * multiplier),
+    }
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    return out
+
+
 def letterbox_frame(frame, target: int = 320):
     """Resize a frame into a square gray-letterboxed image."""
     try:
@@ -614,6 +685,8 @@ if __name__ == "__main__":
     p_train.add_argument("--seed", type=int, default=0)
     p_train.add_argument("--workers", type=int, default=None, help="Dataloader workers (default: 0 on mps, else 8)")
     p_train.add_argument("--amp", type=lambda v: v.lower() in ("1","true","yes"), default=None, help="Use AMP mixed precision (default: False on mps, else True)")
+    p_train.add_argument("--bbox_limits_file", type=Path, default=_DEFAULT_BBOX_LIMITS_FILE, help="Daemon bbox size limits JSON written from training boxes")
+    p_train.add_argument("--bbox_size_multiplier", type=float, default=2.0, help="Linear multiplier applied to the largest annotated bbox")
 
     p_pred = sub.add_parser("predict", help="Run inference using trained weights")
     p_pred.add_argument("--weights", type=Path, default=None, help="Path to .pt weights (default: newest runs/detect weights)")
@@ -692,6 +765,8 @@ if __name__ == "__main__":
                 set_if("val_split", "val_split", float)
                 set_if("device", "device", str)
                 set_if("seed", "seed", int)
+                set_if("bbox_limits_file", "bbox_limits_file", Path)
+                set_if("bbox_size_multiplier", "bbox_size_multiplier", float)
                 if "workers" in c and not _attr_supplied("workers"):
                     w = c["workers"].strip()
                     setattr(args, "workers", int(w) if w else None)
@@ -763,6 +838,13 @@ if __name__ == "__main__":
             negatives_dir=args.negatives_dir,
             seed=args.seed,
         )
+        limits_path = write_bbox_size_limits(
+            bbox_file=args.bbox_file,
+            positives_dir=args.positives_dir,
+            output_path=args.bbox_limits_file,
+            size_multiplier=args.bbox_size_multiplier,
+        )
+        print(f"[BBOX] Wrote daemon bbox limits: {limits_path}")
         model = det.train(
             model=args.model,
             epochs=args.epochs,

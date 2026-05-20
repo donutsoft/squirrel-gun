@@ -1,0 +1,7 @@
+{
+  "bbox_count": 480,
+  "max_area_frac": 0.09375,
+  "max_height_frac": 0.3,
+  "max_width_frac": 0.45,
+  "size_multiplier": 2.0
+}
