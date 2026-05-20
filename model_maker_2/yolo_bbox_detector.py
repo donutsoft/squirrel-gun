@@ -250,6 +250,12 @@ class YOLOBBoxDetector:
         n_val = max(1, int(len(imgs) * val_split)) if len(imgs) > 1 else 0
         val_set = set(imgs[:n_val])
 
+        for dirname in ("images", "labels"):
+            for split in ("train", "val"):
+                split_dir = self.yolo_root / dirname / split
+                if split_dir.exists():
+                    shutil.rmtree(split_dir)
+
         for split in ("train", "val"):
             (self.yolo_root / "images" / split).mkdir(parents=True, exist_ok=True)
             (self.yolo_root / "labels" / split).mkdir(parents=True, exist_ok=True)
