@@ -30,6 +30,14 @@ class YOLOEventDetector(EventDetector):
         self._counter = 0
         self._events_published = 0
         self._last_confidence = 0.0
+        self._process_time_total_sec = 0.0
+        self._process_time_count = 0
+        self._last_process_time_sec = 0.0
+        self._timing_stage_names = ('preprocess', 'inference', 'postprocess', 'save_image', 'annotate')
+        self._last_timing_stages_sec = {name: 0.0 for name in self._timing_stage_names}
+        self._timing_stage_totals_sec = {name: 0.0 for name in self._timing_stage_names}
+        self._warmed_up = False
+        self._warmup_time_sec = 0.0
         self._daemon_root = Path(__file__).resolve().parents[1]
         self._detection_output_dir = self._daemon_root / "detections"
         self._save_detection_images = True
@@ -43,6 +51,7 @@ class YOLOEventDetector(EventDetector):
         if not self._model_path.exists():
             raise FileNotFoundError(f"Model file not found: {self._model_path}")
         self._model = YOLO(str(self._model_path), task='detect')
+        self._warmup_model()
 
     def _is_tpu_delegate_error(self, exc: BaseException) -> bool:
         message = str(exc).lower()
@@ -67,6 +76,14 @@ class YOLOEventDetector(EventDetector):
                 "the current user can access the TPU device, and no other process is already using it. "
                 "Run `uv run check_edgetpu.py` on the Pi for device, permission, and delegate diagnostics."
             ) from exc
+
+    def _warmup_model(self) -> None:
+        """Force delegate/model initialization before the first real event frame."""
+        start = time.perf_counter()
+        warmup_frame = np.full((320, 320, 3), 114, dtype=np.uint8)
+        self._predict_tpu(warmup_frame)
+        self._warmup_time_sec = max(0.0, time.perf_counter() - start)
+        self._warmed_up = True
 
     # --- EventDetector API ---
     def enabled(self) -> bool:
@@ -143,6 +160,12 @@ class YOLOEventDetector(EventDetector):
             'last_confidence': float(self._last_confidence),
             'events_published': int(self._events_published),
             'using_tpu': True,
+            'process_time_ms': float(self._last_process_time_sec * 1000.0),
+            'avg_process_time_ms': float(self._avg_process_time_sec() * 1000.0),
+            'processed_frames': int(self._process_time_count),
+            'warmed_up': bool(self._warmed_up),
+            'warmup_time_ms': float(self._warmup_time_sec * 1000.0),
+            **self._timing_stage_metrics(),
         }
 
     def config(self) -> Dict[str, Any]:
@@ -159,11 +182,18 @@ class YOLOEventDetector(EventDetector):
             'max_bbox_width_frac': self._max_bbox_width_frac,
             'max_bbox_height_frac': self._max_bbox_height_frac,
             'max_bbox_area_frac': self._max_bbox_area_frac,
+            'warmed_up': bool(self._warmed_up),
+            'warmup_time_ms': float(self._warmup_time_sec * 1000.0),
         }
 
     def reset_metrics(self) -> None:
         self._events_published = 0
         self._last_confidence = 0.0
+        self._process_time_total_sec = 0.0
+        self._process_time_count = 0
+        self._last_process_time_sec = 0.0
+        self._last_timing_stages_sec = {name: 0.0 for name in self._timing_stage_names}
+        self._timing_stage_totals_sec = {name: 0.0 for name in self._timing_stage_names}
 
     # --- Core processing ---
     def process(self, frame: Any, now_ts: Optional[float] = None) -> DetectionResult:
@@ -178,6 +208,7 @@ class YOLOEventDetector(EventDetector):
         if (c % max(1, int(self._frame_skip) + 1)) != 0:
             return DetectionResult(frame=frame, events=[], metrics={})
 
+        process_start = time.perf_counter()
         work = frame.copy()
         h, w = work.shape[:2]
         # Preprocess: letterbox to 320x320 with gray 0x72 (114) like extract_frames.py
@@ -192,14 +223,18 @@ class YOLOEventDetector(EventDetector):
         top = (TARGET - new_h) // 2
         left = (TARGET - new_w) // 2
         lb[top:top+new_h, left:left+new_w] = resized
+        preprocess_end = time.perf_counter()
         # Run Ultralytics YOLO on the letterboxed image
         results = self._predict_tpu(lb)
+        inference_end = time.perf_counter()
         # Parse detections in letterbox space (TARGET x TARGET)
         detections_lb = self._parse_ultralytics(results, TARGET, TARGET)
         raw_detection_count = len(detections_lb)
         detections_lb = [d for d in detections_lb if self._bbox_size_allowed(d, TARGET, TARGET)]
         filtered_detection_count = raw_detection_count - len(detections_lb)
+        save_start = time.perf_counter()
         saved_image_path = self._save_detection_image(lb, detections_lb, now_ts)
+        save_end = time.perf_counter()
         # Map detections back to original frame coordinates
         detections = []
         for d in detections_lb:
@@ -216,6 +251,7 @@ class YOLOEventDetector(EventDetector):
             cx = (x1 + x2) / 2.0
             cy = (y1 + y2) / 2.0
             detections.append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'cx': cx, 'cy': cy, 'score': d['score'], 'class': d.get('class', -1)})
+        postprocess_end = time.perf_counter()
 
         # No zone filtering for YOLO detector
 
@@ -245,12 +281,53 @@ class YOLOEventDetector(EventDetector):
 
         if events:
             self._events_published += len(events)
+        annotate_end = time.perf_counter()
+        self._record_timing_stages({
+            'preprocess': preprocess_end - process_start,
+            'inference': inference_end - preprocess_end,
+            'postprocess': (save_start - inference_end) + (postprocess_end - save_end),
+            'save_image': save_end - save_start,
+            'annotate': annotate_end - postprocess_end,
+        })
+        self._record_process_time(process_start)
         return DetectionResult(frame=work, events=events, metrics={
             'count': len(detections),
             'raw_count': raw_detection_count,
             'filtered_count': filtered_detection_count,
             'last_confidence': self._last_confidence,
+            'process_time_ms': float(self._last_process_time_sec * 1000.0),
+            'avg_process_time_ms': float(self._avg_process_time_sec() * 1000.0),
+            'processed_frames': int(self._process_time_count),
+            **self._timing_stage_metrics(),
         })
+
+    def _record_process_time(self, start: float) -> None:
+        elapsed = max(0.0, time.perf_counter() - float(start))
+        self._last_process_time_sec = elapsed
+        self._process_time_total_sec += elapsed
+        self._process_time_count += 1
+
+    def _avg_process_time_sec(self) -> float:
+        if self._process_time_count <= 0:
+            return 0.0
+        return float(self._process_time_total_sec) / float(self._process_time_count)
+
+    def _record_timing_stages(self, stages: Dict[str, float]) -> None:
+        for name in self._timing_stage_names:
+            elapsed = max(0.0, float(stages.get(name, 0.0)))
+            self._last_timing_stages_sec[name] = elapsed
+            self._timing_stage_totals_sec[name] += elapsed
+
+    def _timing_stage_metrics(self) -> Dict[str, float]:
+        metrics: Dict[str, float] = {}
+        count = max(0, int(self._process_time_count))
+        for name in self._timing_stage_names:
+            last_sec = float(self._last_timing_stages_sec.get(name, 0.0))
+            total_sec = float(self._timing_stage_totals_sec.get(name, 0.0))
+            avg_sec = (total_sec / float(count)) if count > 0 else 0.0
+            metrics[f'{name}_time_ms'] = last_sec * 1000.0
+            metrics[f'avg_{name}_time_ms'] = avg_sec * 1000.0
+        return metrics
 
     def _load_bbox_size_limits(self, path: Optional[Path]) -> None:
         self._max_bbox_width_frac = None

@@ -950,9 +950,56 @@ def motion_zone_clear():
 def motion_center():
     info = webcam.motion_info()
     present = info.get('rect') is not None and info.get('enabled')
-    return jsonify({
+    detector_type = webcam.get_detector_type()
+    process_time_ms = info.get('process_time_ms')
+    avg_process_time_ms = info.get('avg_process_time_ms')
+    yolo_process_time_ms = info.get('yolo_process_time_ms')
+    yolo_avg_process_time_ms = info.get('yolo_avg_process_time_ms')
+    yolo_processed_frames = info.get('yolo_processed_frames')
+    if detector_type == 'yolo':
+        yolo_process_time_ms = process_time_ms
+        yolo_avg_process_time_ms = avg_process_time_ms
+        yolo_processed_frames = info.get('processed_frames')
+    yolo_warmed_up = info.get('yolo_warmed_up')
+    yolo_warmup_time_ms = info.get('yolo_warmup_time_ms')
+    if detector_type == 'yolo':
+        yolo_warmed_up = info.get('warmed_up')
+        yolo_warmup_time_ms = info.get('warmup_time_ms')
+    yolo_timing = {
+        key: info.get(key)
+        for key in (
+            'yolo_preprocess_time_ms',
+            'yolo_avg_preprocess_time_ms',
+            'yolo_inference_time_ms',
+            'yolo_avg_inference_time_ms',
+            'yolo_postprocess_time_ms',
+            'yolo_avg_postprocess_time_ms',
+            'yolo_save_image_time_ms',
+            'yolo_avg_save_image_time_ms',
+            'yolo_annotate_time_ms',
+            'yolo_avg_annotate_time_ms',
+        )
+        if key in info
+    }
+    if detector_type == 'yolo':
+        for key in (
+            'preprocess_time_ms',
+            'avg_preprocess_time_ms',
+            'inference_time_ms',
+            'avg_inference_time_ms',
+            'postprocess_time_ms',
+            'avg_postprocess_time_ms',
+            'save_image_time_ms',
+            'avg_save_image_time_ms',
+            'annotate_time_ms',
+            'avg_annotate_time_ms',
+        ):
+            if key in info:
+                yolo_timing[f'yolo_{key}'] = info.get(key)
+    payload = {
         'present': bool(present),
         'enabled': bool(info.get('enabled')),
+        'detector': detector_type,
         'rect': info.get('rect'),
         'center': info.get('center'),
         'u': info.get('u'),
@@ -962,10 +1009,23 @@ def motion_center():
         'fg_pixels': info.get('fg_pixels'),
         'largest_area': info.get('largest_area'),
         'peak_largest_area': info.get('peak_largest_area'),
+        'process_time_ms': process_time_ms,
+        'avg_process_time_ms': avg_process_time_ms,
+        'processed_frames': info.get('processed_frames'),
+        'motion_process_time_ms': info.get('motion_process_time_ms', process_time_ms),
+        'motion_avg_process_time_ms': info.get('motion_avg_process_time_ms', avg_process_time_ms),
+        'motion_processed_frames': info.get('motion_processed_frames', info.get('processed_frames')),
+        'yolo_process_time_ms': yolo_process_time_ms,
+        'yolo_avg_process_time_ms': yolo_avg_process_time_ms,
+        'yolo_processed_frames': yolo_processed_frames,
+        'yolo_warmed_up': yolo_warmed_up,
+        'yolo_warmup_time_ms': yolo_warmup_time_ms,
         'squirrel_detected': info.get('squirrel_detected'),
         'yolo_count': info.get('yolo_count'),
         'last_squirrel_confidence': info.get('last_squirrel_confidence'),
-    })
+    }
+    payload.update(yolo_timing)
+    return jsonify(payload)
 
 
 @app.get('/api/motion/counters')

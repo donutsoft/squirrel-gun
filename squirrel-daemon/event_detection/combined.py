@@ -59,18 +59,34 @@ class CombinedMotionYOLOEventDetector(EventDetector):
 
     def info(self, frame_size: Tuple[int, int]) -> Dict[str, Any]:
         info = self._motion.info(frame_size)
+        yolo_info = self._yolo.info(frame_size)
+        yolo_timing = {
+            f'yolo_{key}': value
+            for key, value in yolo_info.items()
+            if key.endswith('_time_ms') and key not in ('process_time_ms', 'avg_process_time_ms')
+        }
         info.update({
             'detector': 'combined',
             'squirrel_detected': bool(self._last_yolo_count > 0),
             'yolo_count': int(self._last_yolo_count),
             'last_squirrel_confidence': float(self._last_squirrel_confidence),
             'events_published': int(self._events_published),
+            'motion_process_time_ms': info.get('process_time_ms'),
+            'motion_avg_process_time_ms': info.get('avg_process_time_ms'),
+            'motion_processed_frames': info.get('processed_frames'),
+            'yolo_process_time_ms': yolo_info.get('process_time_ms'),
+            'yolo_avg_process_time_ms': yolo_info.get('avg_process_time_ms'),
+            'yolo_processed_frames': yolo_info.get('processed_frames'),
+            'yolo_warmed_up': yolo_info.get('warmed_up'),
+            'yolo_warmup_time_ms': yolo_info.get('warmup_time_ms'),
+            **yolo_timing,
         })
         return info
 
     def config(self) -> Dict[str, Any]:
         cfg = self._motion.config()
         yolo_cfg = self._yolo.config()
+        yolo_info = self._yolo.info((0, 0))
         cfg.update({
             'detector': 'combined',
             'yolo_score_thresh': yolo_cfg.get('score_thresh'),
@@ -83,6 +99,8 @@ class CombinedMotionYOLOEventDetector(EventDetector):
             'squirrel_detected': bool(self._last_yolo_count > 0),
             'yolo_count': int(self._last_yolo_count),
             'last_squirrel_confidence': float(self._last_squirrel_confidence),
+            'yolo_avg_process_time_ms': yolo_info.get('avg_process_time_ms'),
+            'yolo_processed_frames': yolo_info.get('processed_frames'),
         })
         return cfg
 
@@ -147,6 +165,17 @@ class CombinedMotionYOLOEventDetector(EventDetector):
             'last_squirrel_confidence': float(self._last_squirrel_confidence),
             'squirrel_detected': bool(squirrel_detected),
             'yolo': yolo_metrics,
+            'motion_process_time_ms': motion_result.metrics.get('process_time_ms'),
+            'motion_avg_process_time_ms': motion_result.metrics.get('avg_process_time_ms'),
+            'motion_processed_frames': motion_result.metrics.get('processed_frames'),
+            'yolo_process_time_ms': yolo_metrics.get('process_time_ms'),
+            'yolo_avg_process_time_ms': yolo_metrics.get('avg_process_time_ms'),
+            'yolo_processed_frames': yolo_metrics.get('processed_frames'),
+            **{
+                f'yolo_{key}': value
+                for key, value in yolo_metrics.items()
+                if key.endswith('_time_ms') and key not in ('process_time_ms', 'avg_process_time_ms')
+            },
         })
 
     def _compose_frame(self, motion_frame: Any, yolo_frame: Any, squirrel_detected: bool) -> Any:

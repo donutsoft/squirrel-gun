@@ -41,6 +41,9 @@ class MotionDetector(EventDetector):
         self._last_largest_area = 0
         self._peak_largest_area = 0
         self._events_published = 0
+        self._process_time_total_sec = 0.0
+        self._process_time_count = 0
+        self._last_process_time_sec = 0.0
 
     # --- EventDetector API ---
     def enabled(self) -> bool:
@@ -134,6 +137,9 @@ class MotionDetector(EventDetector):
             'fg_pixels': int(self._last_fg_pixels),
             'largest_area': int(self._last_largest_area),
             'peak_largest_area': int(self._peak_largest_area),
+            'process_time_ms': float(self._last_process_time_sec * 1000.0),
+            'avg_process_time_ms': float(self._avg_process_time_sec() * 1000.0),
+            'processed_frames': int(self._process_time_count),
         }
         if rect is not None and w and h:
             x, y, rw, rh = rect
@@ -164,12 +170,17 @@ class MotionDetector(EventDetector):
     def reset_metrics(self) -> None:
         self._peak_largest_area = 0
         self._events_published = 0
+        self._process_time_total_sec = 0.0
+        self._process_time_count = 0
+        self._last_process_time_sec = 0.0
 
     # --- Core processing ---
     def process(self, frame: Any, now_ts: Optional[float] = None) -> DetectionResult:
+        process_start = time.perf_counter()
         if now_ts is None:
             now_ts = time.time()
         if not self._enabled:
+            self._record_process_time(process_start)
             return DetectionResult(frame=frame, events=[], metrics=self._metrics())
 
         # Only run motion detection every Nth frame
@@ -346,6 +357,7 @@ class MotionDetector(EventDetector):
                     except Exception:
                         pass
 
+        self._record_process_time(process_start)
         return DetectionResult(frame=frame, events=events, metrics=self._metrics())
 
     # --- helpers ---
@@ -355,7 +367,21 @@ class MotionDetector(EventDetector):
             'largest_area': int(self._last_largest_area),
             'peak_largest_area': int(self._peak_largest_area),
             'events_published': int(self._events_published),
+            'process_time_ms': float(self._last_process_time_sec * 1000.0),
+            'avg_process_time_ms': float(self._avg_process_time_sec() * 1000.0),
+            'processed_frames': int(self._process_time_count),
         }
+
+    def _record_process_time(self, start: float) -> None:
+        elapsed = max(0.0, time.perf_counter() - float(start))
+        self._last_process_time_sec = elapsed
+        self._process_time_total_sec += elapsed
+        self._process_time_count += 1
+
+    def _avg_process_time_sec(self) -> float:
+        if self._process_time_count <= 0:
+            return 0.0
+        return float(self._process_time_total_sec) / float(self._process_time_count)
 
     def _make_event(self, rect: Tuple[int, int, int, int], frame: Any, ts: float) -> DetectionEvent:
         x, y, w, h = rect
@@ -370,4 +396,3 @@ class MotionDetector(EventDetector):
             width=None, height=None,
             extra={'fg_pixels': int(self._last_fg_pixels), 'largest_area': int(self._last_largest_area)},
         )
-

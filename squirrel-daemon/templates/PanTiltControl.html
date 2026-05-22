@@ -91,7 +91,7 @@
               </label>
             </div>
             <div style="display:flex; align-items:center; gap:16px; margin: 4px 0; flex-wrap:wrap;">
-              <div class="hint" id="motion-stats">Last motion: 0 px (largest: 0, peak: 0)</div>
+              <div class="hint" id="motion-stats">Last motion: 0 px (largest: 0, peak: 0, motion avg: 0.0 ms, YOLO avg: n/a)</div>
               <div id="rec-ind" style="display:inline-flex; align-items:center; gap:6px; font-weight:600;">
                 <span id="rec-dot" style="width:10px; height:10px; border-radius:50%; background:#6b7280; display:inline-block;"></span>
                 <span id="rec-text" style="color:#6b7280;">Idle</span>
@@ -622,8 +622,16 @@
             const fg = typeof j.fg_pixels === 'number' ? j.fg_pixels : 0;
             const lg = typeof j.largest_area === 'number' ? j.largest_area : 0;
             const pk = typeof j.peak_largest_area === 'number' ? j.peak_largest_area : 0;
+            const fmtMs = (v) => (typeof v === 'number' && Number.isFinite(v)) ? `${v.toFixed(1)} ms` : 'n/a';
+            const detector = typeof j.detector === 'string' ? j.detector : 'motion';
+            const motionAvg = detector === 'yolo' ? null : j.motion_avg_process_time_ms;
+            const yoloAvg = j.yolo_avg_process_time_ms;
+            const yoloInferAvg = j.yolo_avg_inference_time_ms;
+            const timing = detector === 'yolo'
+              ? `YOLO avg: ${fmtMs(yoloAvg)}, infer avg: ${fmtMs(yoloInferAvg)}`
+              : `motion avg: ${fmtMs(motionAvg)}, YOLO avg: ${fmtMs(yoloAvg)}, infer avg: ${fmtMs(yoloInferAvg)}`;
             const el = document.getElementById('motion-stats');
-            if (el) el.textContent = `Last motion: ${fg} px (largest: ${lg}, peak: ${pk})`;
+            if (el) el.textContent = `Last motion: ${fg} px (largest: ${lg}, peak: ${pk}, ${timing})`;
           } catch (_) {}
         }, 1000);
 
