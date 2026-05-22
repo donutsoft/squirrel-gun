@@ -647,11 +647,13 @@ class WebcamController:
                             self._append_frame_to_buffer(frame, ts=frame_ts)
                         except Exception:
                             pass
-                        raw_frame = frame
+                        # Detectors draw preview overlays in-place, so keep a
+                        # clean frame for recordings before detection mutates it.
+                        raw_frame = frame.copy()
                         # Run motion detector (draw overlays within detector)
                         if self._detector.enabled():
                             try:
-                                res = self._detector.process(raw_frame, now_ts=frame_ts)
+                                res = self._detector.process(frame, now_ts=frame_ts)
                                 frame = res.frame
                                 recording_handled = False
                                 if res.events:
