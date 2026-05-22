@@ -62,6 +62,7 @@
                 <select id="detector-type">
                   <option value="motion">Motion</option>
                   <option value="yolo">YOLO</option>
+                  <option value="combined">Motion + YOLO</option>
                 </select>
               </label>
               <label style="display:inline-flex; align-items:center; gap:6px;">
@@ -606,7 +607,7 @@
           const r = await fetch('/api/detector/type');
           if (r.ok) {
             const j = await r.json();
-            if (j.type === 'yolo' || j.type === 'motion') detectorType.value = j.type;
+            if (j.type === 'yolo' || j.type === 'motion' || j.type === 'combined') detectorType.value = j.type;
           }
         } catch (_) {}
         // Start polling motion stats

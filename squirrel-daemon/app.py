@@ -962,6 +962,9 @@ def motion_center():
         'fg_pixels': info.get('fg_pixels'),
         'largest_area': info.get('largest_area'),
         'peak_largest_area': info.get('peak_largest_area'),
+        'squirrel_detected': info.get('squirrel_detected'),
+        'yolo_count': info.get('yolo_count'),
+        'last_squirrel_confidence': info.get('last_squirrel_confidence'),
     })
 
 
@@ -1013,7 +1016,7 @@ def detector_type_get():
 def detector_type_set():
     data = request.get_json(silent=True) or {}
     kind = str(data.get('type', 'motion')).lower().strip()
-    if kind not in ('motion', 'yolo'):
+    if kind not in ('motion', 'yolo', 'combined'):
         return jsonify({ 'error': 'invalid type' }), 400
     try:
         t = webcam.set_detector_type(kind)
@@ -1456,6 +1459,8 @@ def _on_motion_water(evt: dict) -> None:
     global water_on_motion_enabled, _last_water_fire_ts
     try:
         if not water_on_motion_enabled:
+            return
+        if isinstance(evt, dict) and evt.get('detector') == 'combined' and not bool(evt.get('squirrel_detected')):
             return
         now = time.time()
         # Enforce cooldown between water firings

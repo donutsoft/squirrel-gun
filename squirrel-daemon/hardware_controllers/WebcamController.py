@@ -5,6 +5,7 @@ import time
 import threading
 import cv2  # type: ignore
 from turbojpeg import TurboJPEG, TJPF_BGR, TJSAMP_420  # type: ignore
+from event_detection.combined import CombinedMotionYOLOEventDetector
 from event_detection.motion import MotionDetector
 from event_detection.yolo import YOLOEventDetector
 
@@ -903,7 +904,7 @@ class WebcamController:
         if zone is None:
             self._zone = None
             # Apply to motion detector only
-            if self._detector_type == 'motion':
+            if self._detector_type in ('motion', 'combined'):
                 self._detector.set_zone(None)
             return
         # Normalize and persist
@@ -919,7 +920,7 @@ class WebcamController:
         w = max(0.0, min(1.0 - x, w))
         h = max(0.0, min(1.0 - y, h))
         self._zone = (x, y, w, h)
-        if self._detector_type == 'motion':
+        if self._detector_type in ('motion', 'combined'):
             self._detector.set_zone(self._zone)
 
     def motion_zone(self) -> Optional[tuple[float, float, float, float]]:
@@ -931,7 +932,7 @@ class WebcamController:
     # Detector switching
     def set_detector_type(self, kind: str) -> str:
         kind = str(kind).lower().strip()
-        if kind not in ('motion', 'yolo'):
+        if kind not in ('motion', 'yolo', 'combined'):
             raise ValueError('invalid detector type')
         if kind == getattr(self, '_detector_type', 'motion'):
             return self._detector_type
@@ -940,8 +941,12 @@ class WebcamController:
             # Apply stored zone when enabling motion
             if self._zone is not None:
                 det.set_zone(self._zone)
-        else:
+        elif kind == 'yolo':
             det = YOLOEventDetector()
+        else:
+            det = CombinedMotionYOLOEventDetector()
+            if self._zone is not None:
+                det.set_zone(self._zone)
         self._detector = det
         self._detector_type = kind
         return self._detector_type
