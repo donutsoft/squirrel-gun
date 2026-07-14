@@ -1,33 +1,23 @@
-from gpiozero import OutputDevice
+import os
+from typing import Optional
 
-from hardware_controllers.GpioFactory import configure_pin_factory
-
-
-configure_pin_factory()
+from hardware_controllers.SerialHardwareController import get_serial_hardware_controller
 
 
 class LaserController:
-    _devices = {}
-
-    def __init__(self, pin: int = 23):
+    def __init__(self, pin: Optional[int] = None):
+        if pin is None:
+            pin = int(os.environ.get("SQUIRREL_LASER_PIN", "3"))
         self._pin = int(pin)
-        if self._pin not in LaserController._devices:
-            LaserController._devices[self._pin] = OutputDevice(
-                self._pin,
-                active_high=True,
-                initial_value=False,
-            )
-        self._device = LaserController._devices[self._pin]
+        self._serial = get_serial_hardware_controller()
 
     def turn_on(self):
         print("Turning on the laser.")
-        self._device.on()
+        self._serial.command("ON", self._pin)
 
     def turn_off(self):
         print("Turning off the laser.")
-        self._device.off()
+        self._serial.command("OFF", self._pin)
 
     def cleanup(self):
-        self._device.off()
-        self._device.close()
-        LaserController._devices.pop(self._pin, None)
+        self.turn_off()

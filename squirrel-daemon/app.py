@@ -28,8 +28,8 @@ water = WaterController()
 laser = LaserController()
 bus = EventBus()
 
-# Track laser enabled state (default ON; overridden by persisted if present)
-laser_enabled = True
+# Track laser enabled state. Hardware starts safe/off on boot; users can enable it explicitly.
+laser_enabled = False
 
 # Wire WebcamController to publish motion events to the bus
 webcam.set_motion_publisher(bus.publish)
@@ -93,18 +93,13 @@ if 'motion.zone' in persisted:
 # Apply water-on-motion flag
 if 'water_on_motion.enabled' in persisted:
     water_on_motion_enabled = bool(persisted['water_on_motion.enabled'])
-# Apply laser enabled flag (default True)
-if 'laser.enabled' in persisted:
-    laser_enabled = bool(persisted['laser.enabled'])
+# Laser power is intentionally not restored from persisted settings on startup.
 
 # Center hardware on startup.
 pantilt.setPanTilt(current[0], current[1])
 
-# Set laser state on startup.
-if laser_enabled:
-    laser.turn_on()
-else:
-    laser.turn_off()
+# Force laser off on startup even if the microcontroller was already running.
+laser.turn_off()
 
 def _build_aimer(min_rows: int = 10) -> tuple[LinearAimer, int, bool]:
     """Create a fresh LinearAimer from click data in the DB.
