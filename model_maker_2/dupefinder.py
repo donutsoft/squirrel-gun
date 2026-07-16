@@ -31,7 +31,7 @@ import cv2
 # =======================
 # One or more roots to scan (recursive). You can add more folders here.
 imgRoots = [
-    "negatives",  # <-- change me
+    os.path.join(os.path.dirname(__file__), "false_positives", "frames"),
 ]
 
 # File extensions to include (case-insensitive)
@@ -41,6 +41,11 @@ maxImages = None                 # None or int to cap during testing
 phashHamming = 5                 # <=5 => near-duplicate by pHash
 useSsim = True
 ssimThreshold = 0.93             # higher = stricter (drop more)
+# Do not collapse frames that contain a meaningful localized change, such as a
+# squirrel-sized bright/dark object moving against an otherwise fixed camera.
+differencePixelThreshold = 15
+meaningfulDifferencePixels = 250
+meaningfulDifferenceComponent = 50
 
 # OpenCLIP model (use LAION weights to avoid QuickGELU warning)
 clipModelName = "ViT-B-32"
@@ -122,6 +127,19 @@ def medianLuma(path):
     arr = imgToGrayLuma(path, maxSide=256)
     return float(np.median(arr))
 
+def hasMeaningfulLocalDifference(first, second):
+    """Return True when two similar scenes contain a localized visual change."""
+    diff = cv2.absdiff(first, second)
+    mask = (diff >= differencePixelThreshold).astype(np.uint8)
+    if int(mask.sum()) < meaningfulDifferencePixels:
+        return False
+
+    _count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+    if len(stats) <= 1:
+        return False
+    largest_component = int(stats[1:, cv2.CC_STAT_AREA].max())
+    return largest_component >= meaningfulDifferenceComponent
+
 def computePHashes(paths):
     hashes = []
     for p in tqdm(paths, desc="pHash"):
@@ -172,23 +190,30 @@ def quickDedupeByPHash(paths, phashes, maxDist=5):
             for k in cluster[1:]:
                 delete.add(k)
         else:
-            # Pick sharpest as representative; drop others only if SSIM is high
-            sharpness = []
+            # Process sharpest frames first, then compare each candidate against
+            # every representative already kept. Comparing only against the
+            # single sharpest frame lets two near-identical frames survive when
+            # both differ slightly from that frame.
+            sharpness = {}
+            grayImages = {}
             for k in cluster:
                 arr = imgToGrayLuma(paths[k], maxSide=256)
-                sharpness.append(cv2.Laplacian(arr, cv2.CV_64F).var())
-            rep = cluster[int(np.argmax(sharpness))]
-            keep.add(rep)
-            arrRep = imgToGrayLuma(paths[rep], maxSide=384)
-            for k in cluster:
-                if k == rep:
-                    continue
-                arrB = imgToGrayLuma(paths[k], maxSide=384)
-                s = ssim(arrRep, arrB, data_range=255)
-                if s >= ssimThreshold:
+                sharpness[k] = cv2.Laplacian(arr, cv2.CV_64F).var()
+                grayImages[k] = imgToGrayLuma(paths[k], maxSide=384)
+
+            representatives = []
+            for k in sorted(cluster, key=lambda idx: sharpness[idx], reverse=True):
+                arrB = grayImages[k]
+                isDuplicate = any(
+                    ssim(grayImages[rep], arrB, data_range=255) >= ssimThreshold
+                    and not hasMeaningfulLocalDifference(grayImages[rep], arrB)
+                    for rep in representatives
+                )
+                if isDuplicate:
                     delete.add(k)
                 else:
                     keep.add(k)
+                    representatives.append(k)
 
     keep = sorted(list(keep - delete))
     delete = sorted(list(delete))
@@ -220,34 +245,28 @@ def cosineDedup(paths, embs, simThresh=0.97):
     # Pure NumPy, no FAISS. embs are L2-normalized.
     sims = embs @ embs.T  # (n, n)
     n = sims.shape[0]
-    visited = [False]*n
-    keep, delete = [], set()
 
-    for i in range(n):
-        if visited[i]:
-            continue
-        neighbors = [i]
-        visited[i] = True
-        # collect neighbors above threshold (one-hop)
-        for j in range(n):
-            if j == i or visited[j]:
-                continue
-            if sims[i, j] >= simThresh:
-                neighbors.append(j)
-                visited[j] = True
-        if len(neighbors) == 1:
-            keep.append(i)
+    # Keep the sharpest image from each similarity neighborhood. As with the
+    # pHash/SSIM pass, compare against all kept representatives instead of
+    # forming one-hop groups around an arbitrary first image.
+    sharpness = []
+    grayImages = []
+    for path in paths:
+        arr = imgToGrayLuma(path, maxSide=256)
+        sharpness.append(cv2.Laplacian(arr, cv2.CV_64F).var())
+        grayImages.append(imgToGrayLuma(path, maxSide=384))
+
+    keep, delete = [], []
+    for i in sorted(range(n), key=lambda idx: sharpness[idx], reverse=True):
+        if any(
+            sims[i, rep] >= simThresh
+            and not hasMeaningfulLocalDifference(grayImages[i], grayImages[rep])
+            for rep in keep
+        ):
+            delete.append(i)
         else:
-            sharpness = []
-            for k in neighbors:
-                arr = imgToGrayLuma(paths[k], maxSide=256)
-                sharpness.append(cv2.Laplacian(arr, cv2.CV_64F).var())
-            rep = neighbors[int(np.argmax(sharpness))]
-            keep.append(rep)
-            for k in neighbors:
-                if k != rep:
-                    delete.add(k)
-    return sorted(keep), sorted(list(delete))
+            keep.append(i)
+    return sorted(keep), sorted(delete)
 
 def kCenterGreedy(embs, targetK, initIdx=None):
     n = embs.shape[0]
@@ -451,38 +470,9 @@ def main():
             embsKept = computeEmbeddings(keptPaths, model, preprocess, device, embedBatchSize)
             sel = kCenterGreedy(embsKept, target)
             keptAllRel = [keptAllRel[s] for s in sel]
-        elif len(keptAllRel) < target:
-            # Top up by selecting additional diverse images from all originals
-            # using k-center seeded with current kept absolute indices
-            # Map current kept to absolute indices before topping up
-            keepAbs_seed = sorted(keepIdx1[i] for i in keptAllRel)
-            # Compute embeddings for all originals
-            embsAll = computeEmbeddings(paths, model, preprocess, device, embedBatchSize)
-            selAbs = kCenterGreedy(embsAll, targetK=target, initIdx=keepAbs_seed)
-            # Convert absolute selection back into absolute indices directly
-            keepAbs_final = sorted(selAbs)
-            # Overwrite pipeline to finalize using these absolute indices
-            keepAbs = keepAbs_final
-            deleteAbs = set(range(len(paths))) - set(keepAbs)
-            # Short-circuit the usual mapping below by jumping to output section
-            # Output keep file and move deletes
-            with open(keepFile, "w") as f:
-                for i in keepAbs:
-                    f.write(paths[i] + "\n")
-            moved = 0
-            for i in sorted(deleteAbs):
-                src = paths[i]
-                rel = rel_under_roots(src, imgRoots)
-                dst = os.path.join(dupesDir, rel)
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                try:
-                    shutil.move(src, dst)
-                    moved += 1
-                except Exception as e:
-                    print(f"Failed to move {src} -> {dst}: {e}")
-            print(f"Final keep: {len(keepAbs)}; moved {moved} images to '{dupesDir}'")
-            print(f"Wrote {keepFile}")
-            return
+        # If fewer than the requested target remain, keep the deduplicated set
+        # as-is. Never top up from the original images: that would reintroduce
+        # duplicates removed by the earlier passes.
 
     # -------------------------------
     # Map RELATIVE indices back to ORIGINAL 'paths' and write files

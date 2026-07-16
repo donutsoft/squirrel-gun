@@ -30,7 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET = Path("model_maker_2/yolo")
 DEFAULT_OUTPUT = Path("squirrel-daemon/best_full_integer_quant_edgetpu.tflite")
 REMOTE_OUTPUT_NAME = "best_full_integer_quant_edgetpu.tflite"
-DEFAULT_JUPYTER_TOKEN = "7eea26785b6ef849673ed712415b9c69a9600f5aa4a537c5"
+DEFAULT_JUPYTER_TOKEN = "78eab98d343af613599ecbc0d651f4022bba4d857901d100"
 
 class JupyterError(RuntimeError):
     pass
