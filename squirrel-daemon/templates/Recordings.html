@@ -13,14 +13,18 @@
         <div>
           <h1>Recordings</h1>
           <div class="sub">Auto-saved clips keep about 5s before and 5s after motion.</div>
-          <div style="margin-top:6px;">
+          <div style="margin-top:6px; display:flex; gap:12px; flex-wrap:wrap;">
             <a href="/" style="text-decoration: none;">⟵ Back to Control</a>
+            <a href="/training-frames" style="text-decoration: none;">Review Training Frames</a>
           </div>
         </div>
       </header>
 
       <section class="panel">
         <h2>Saved Clips</h2>
+        <div class="hint" style="margin:0 0 10px 0;">
+          Training images persist in {{ training_data_root }}.
+        </div>
         <div class="actions" style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
           <button id="delete-all" class="danger">Delete All</button>
           <div class="hint">Deletes all saved recordings.</div>
@@ -29,7 +33,7 @@
         <div class="hint">Newest first. Click to play.</div>
         <div style="display:grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px;">
           {% for f in files %}
-          <div class="panel" style="padding:8px;">
+          <div class="panel recording-card" style="padding:8px;" data-name="{{ f.name }}">
             <div style="font-weight:600; font-size: 14px;">{{ f.name }}</div>
             <div class="hint" style="margin:4px 0 8px 0;">
               {{ (f.size // 1024) }} KB • {{ f.display_time }}
@@ -42,6 +46,19 @@
                 onerror="this.onerror=null; this.src='{{ url_for('static', filename='logo.png') }}';"
               />
             </a>
+            <div style="margin-top:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+              <button class="accent btn-label" data-label="true_positive">True Positive</button>
+              <button class="btn-label" data-label="false_positive">False Positive</button>
+            </div>
+            <div
+              class="hint label-status"
+              style="margin-top:6px; min-height:1.2em;"
+              data-state="{{ f.label_status.state }}"
+              data-label="{{ f.label_status.label or '' }}"
+              data-processed="{{ f.label_status.processed_frames or 0 }}"
+              data-total="{{ f.label_status.total_frames or '' }}"
+              data-saved="{{ f.label_status.saved_frames or 0 }}"
+            ></div>
             <div style="margin-top:6px; display:flex; gap:8px; align-items:center;">
               <a href="{{ f.url }}" download>Download</a>
               <button class="danger btn-delete" data-name="{{ f.name }}">Delete</button>
@@ -56,6 +73,82 @@
     </div>
 
     <script>
+      function humanLabel(value) {
+        if (value === 'true_positive') return 'true positive';
+        if (value === 'false_positive') return 'false positive';
+        return value || 'unlabeled';
+      }
+
+      function renderLabelStatus(card, status) {
+        const node = card.querySelector('.label-status');
+        const buttons = card.querySelectorAll('.btn-label');
+        const busy = status.state === 'queued' || status.state === 'running';
+        buttons.forEach(button => { button.disabled = busy; });
+        if (!node) return;
+        if (status.state === 'running' || status.state === 'queued') {
+          const total = status.total_frames ? ` / ${status.total_frames}` : '';
+          node.textContent = `${status.state === 'queued' ? 'Queued' : 'Processing'} ${humanLabel(status.label)}: ${status.processed_frames || 0}${total} frames`;
+        } else if (status.state === 'complete') {
+          node.textContent = `Labeled ${humanLabel(status.label)} • ${status.saved_frames || 0} training frame(s) saved`;
+        } else if (status.state === 'error') {
+          node.textContent = `Labeling failed: ${status.error || 'unknown error'}`;
+        } else {
+          node.textContent = 'Not labeled';
+        }
+      }
+
+      async function pollLabelStatus(card) {
+        const name = card.dataset.name;
+        if (!name) return;
+        try {
+          const response = await fetch(`/api/recordings/label/status?name=${encodeURIComponent(name)}`);
+          const status = await response.json();
+          renderLabelStatus(card, status);
+          if (status.state === 'queued' || status.state === 'running') {
+            window.setTimeout(() => pollLabelStatus(card), 1000);
+          }
+        } catch (error) {
+          renderLabelStatus(card, { state: 'error', error: String(error) });
+        }
+      }
+
+      document.querySelectorAll('.recording-card').forEach(card => {
+        const statusNode = card.querySelector('.label-status');
+        const initial = {
+          state: statusNode?.dataset.state || 'unlabeled',
+          label: statusNode?.dataset.label || null,
+          processed_frames: Number(statusNode?.dataset.processed || 0),
+          total_frames: Number(statusNode?.dataset.total || 0) || null,
+          saved_frames: Number(statusNode?.dataset.saved || 0),
+        };
+        renderLabelStatus(card, initial);
+        if (initial.state === 'queued' || initial.state === 'running') pollLabelStatus(card);
+
+        card.querySelectorAll('.btn-label').forEach(button => {
+          button.addEventListener('click', async () => {
+            const name = card.dataset.name;
+            const label = button.dataset.label;
+            if (!name || !label) return;
+            if (!confirm(`Label ${name} as ${humanLabel(label)} and mine its frames?`)) return;
+            card.querySelectorAll('.btn-label').forEach(item => { item.disabled = true; });
+            try {
+              const response = await fetch('/api/recordings/label', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, label }),
+              });
+              const status = await response.json();
+              if (!response.ok) throw new Error(status.error || response.statusText);
+              renderLabelStatus(card, status);
+              pollLabelStatus(card);
+            } catch (error) {
+              renderLabelStatus(card, { state: 'error', error: String(error) });
+              card.querySelectorAll('.btn-label').forEach(item => { item.disabled = false; });
+            }
+          });
+        });
+      });
+
       // Delete a single recording
       function attachDeleteHandlers() {
         document.querySelectorAll('.btn-delete').forEach(btn => {

@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Training Frames</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <div class="card">
+      <header>
+        <img src="{{ url_for('static', filename='logo.png') }}" alt="Sad Squirrel Logo" />
+        <div>
+          <h1>Training Frames</h1>
+          <div class="sub">Review mined frames and remove unsuitable training examples.</div>
+          <div style="margin-top:6px; display:flex; gap:12px; flex-wrap:wrap;">
+            <a href="/recordings" style="text-decoration:none;">⟵ Recordings</a>
+            <a href="/" style="text-decoration:none;">Control</a>
+          </div>
+        </div>
+      </header>
+
+      <section class="panel">
+        <h2>Persistent Dataset</h2>
+        <div class="hint" style="margin-top:0; overflow-wrap:anywhere;">Images: {{ data_root }}</div>
+        <div class="hint" style="overflow-wrap:anywhere;">Bounding boxes: {{ bbox_path }}</div>
+      </section>
+
+      {% for kind, frames in [('positives', positives), ('negatives', negatives)] %}
+      <section class="panel" style="margin-top:16px;">
+        <h2>{{ kind|capitalize }} ({{ frames|length }})</h2>
+        {% if frames %}
+        <div class="training-grid" style="display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:12px;">
+          {% for frame in frames %}
+          <article class="panel training-frame" style="padding:8px;" data-kind="{{ kind }}" data-name="{{ frame.name }}">
+            <a href="/training-frames/{{ kind }}/{{ frame.name }}" target="_blank" style="display:block;">
+              <img
+                src="/training-frames/{{ kind }}/{{ frame.name }}"
+                alt="{{ frame.name }}"
+                style="display:block; width:100%; aspect-ratio:1; object-fit:contain; background:#000; border-radius:8px;"
+              />
+            </a>
+            <div style="font-weight:600; font-size:13px; margin-top:7px; overflow-wrap:anywhere;">{{ frame.name }}</div>
+            <div class="hint" style="margin-top:4px;">
+              {{ (frame.size // 1024) }} KB • {{ frame.display_time }}
+              {% if kind == 'positives' %} • {{ frame.boxes|length }} box(es){% endif %}
+              {% if frame.score is not none %} • confidence {{ '%.3f'|format(frame.score) }}{% endif %}
+            </div>
+            {% if frame.source_recording %}<div class="hint" style="margin-top:4px; overflow-wrap:anywhere;">Source: {{ frame.source_recording }}</div>{% endif %}
+            {% if frame.boxes %}
+            <div class="hint" style="margin-top:4px;">
+              {% for box in frame.boxes %}
+                [{{ box.xmin }}, {{ box.ymin }}, {{ box.xmax }}, {{ box.ymax }}]{% if not loop.last %}<br>{% endif %}
+              {% endfor %}
+            </div>
+            {% endif %}
+            <button class="danger btn-delete-frame" style="margin-top:8px;">Delete Frame</button>
+          </article>
+          {% endfor %}
+        </div>
+        {% else %}
+        <div class="hint">No {{ kind }} have been mined yet.</div>
+        {% endif %}
+      </section>
+      {% endfor %}
+    </div>
+
+    <script>
+      document.querySelectorAll('.btn-delete-frame').forEach(button => {
+        button.addEventListener('click', async () => {
+          const card = button.closest('.training-frame');
+          const kind = card?.dataset.kind;
+          const name = card?.dataset.name;
+          if (!card || !kind || !name || !confirm(`Delete ${name}?`)) return;
+          button.disabled = true;
+          try {
+            const response = await fetch('/api/training-frames/delete', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ kind, name }),
+            });
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || response.statusText);
+            card.remove();
+          } catch (error) {
+            alert(`Failed to delete frame: ${error}`);
+            button.disabled = false;
+          }
+        });
+      });
+    </script>
+  </body>
+</html>

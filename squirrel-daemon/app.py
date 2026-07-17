@@ -8,6 +8,7 @@ from db import ClickStore
 from aim_model import LinearAimer
 from laser_dot_detector import LaserDotOptions, detect_laser_dot
 from event_bus import EventBus
+from recording_labeler import LabelingInProgress, RecordingLabelService
 from .aiming import Calculate_Hose_Angles
 import time
 import re
@@ -24,6 +25,10 @@ app = Flask(__name__, static_url_path='')
 pantilt = PanTiltController()
 webcam = WebcamController()
 store = ClickStore()
+training_data = RecordingLabelService(
+    store.path.parent / 'squirrel-training-data',
+    webcam.get_squirrel_detector,
+)
 water = WaterController()
 laser = LaserController()
 bus = EventBus()
@@ -494,6 +499,7 @@ def _list_recordings() -> list[dict]:
                     'size': stat.st_size,
                     'mtime': stat.st_mtime,
                     'display_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime)),
+                    'label_status': training_data.status(p.name),
                 })
             except Exception:
                 pass
@@ -510,7 +516,34 @@ def index():
 
 @app.get('/recordings')
 def recordings_page():
-    return render_template('Recordings.html', files=_list_recordings())
+    return render_template(
+        'Recordings.html',
+        files=_list_recordings(),
+        training_data_root=str(training_data.data_root),
+    )
+
+
+@app.get('/training-frames')
+def training_frames_page():
+    frames = training_data.list_frames()
+    return render_template(
+        'TrainingFrames.html',
+        positives=frames['positives'],
+        negatives=frames['negatives'],
+        data_root=frames['data_root'],
+        bbox_path=frames['bbox_path'],
+    )
+
+
+@app.get('/training-frames/<kind>/<name>')
+def training_frame_image(kind: str, name: str):
+    try:
+        path = training_data.frame_path(kind, name)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    if not path.is_file():
+        return jsonify({'error': 'frame not found'}), 404
+    return send_file(path, mimetype='image/jpeg', conditional=True)
 
 
 @app.get('/motion-zone')
@@ -521,6 +554,62 @@ def motion_zone_page():
 @app.get('/api/recordings')
 def recordings_api():
     return jsonify({'files': _list_recordings()})
+
+
+@app.post('/api/recordings/label')
+def recordings_label():
+    data = request.get_json(silent=True) or {}
+    name = str(data.get('name', '')).strip()
+    label = str(data.get('label', '')).strip()
+    if not _REC_NAME_RE.match(name):
+        return jsonify({'error': 'invalid filename'}), 400
+    if label not in ('true_positive', 'false_positive'):
+        return jsonify({'error': 'label must be true_positive or false_positive'}), 400
+
+    base = (Path(__file__).parent / 'static' / 'recordings').resolve()
+    path = (base / name).resolve()
+    if base not in path.parents or not path.is_file():
+        return jsonify({'error': 'file not found'}), 404
+    active_path = getattr(webcam, '_recording_path', None)
+    if webcam.is_recording() and active_path is not None and Path(active_path).resolve() == path:
+        return jsonify({'error': 'stop the active recording before labeling it'}), 409
+
+    try:
+        job = training_data.start(path, label)
+        return jsonify(job), 202
+    except LabelingInProgress as exc:
+        return jsonify({'error': str(exc), **training_data.status(name)}), 409
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.get('/api/recordings/label/status')
+def recordings_label_status():
+    name = str(request.args.get('name', '')).strip()
+    if not _REC_NAME_RE.match(name):
+        return jsonify({'error': 'invalid filename'}), 400
+    return jsonify(training_data.status(name))
+
+
+@app.get('/api/training-frames')
+def training_frames_api():
+    return jsonify(training_data.list_frames())
+
+
+@app.post('/api/training-frames/delete')
+def training_frames_delete():
+    data = request.get_json(silent=True) or {}
+    kind = str(data.get('kind', '')).strip()
+    name = str(data.get('name', '')).strip()
+    try:
+        result = training_data.delete_frame(kind, name)
+        return jsonify({'status': 'ok', **result})
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except FileNotFoundError:
+        return jsonify({'error': 'frame not found'}), 404
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
 
 
 @app.get('/snapshots')

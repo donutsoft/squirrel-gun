@@ -31,6 +31,8 @@ class WebcamController:
         # Active event detector
         self._detector_type = 'motion'
         self._detector = MotionDetector()
+        self._squirrel_detector: Optional[YOLOEventDetector] = None
+        self._squirrel_detector_lock = threading.Lock()
         # Store motion zone centrally; applied only to motion detector
         self._zone: Optional[Tuple[float, float, float, float]] = None
         # Low-latency streaming mode flag (default ON)
@@ -932,6 +934,14 @@ class WebcamController:
         return (float(z[0]), float(z[1]), float(z[2]), float(z[3]))
 
     # Detector switching
+    def get_squirrel_detector(self) -> YOLOEventDetector:
+        """Return the single YOLO instance shared by live and labeling work."""
+        if self._squirrel_detector is None:
+            with self._squirrel_detector_lock:
+                if self._squirrel_detector is None:
+                    self._squirrel_detector = YOLOEventDetector()
+        return self._squirrel_detector
+
     def set_detector_type(self, kind: str) -> str:
         kind = str(kind).lower().strip()
         if kind not in ('motion', 'yolo', 'combined'):
@@ -944,9 +954,9 @@ class WebcamController:
             if self._zone is not None:
                 det.set_zone(self._zone)
         elif kind == 'yolo':
-            det = YOLOEventDetector()
+            det = self.get_squirrel_detector()
         else:
-            det = CombinedMotionYOLOEventDetector()
+            det = CombinedMotionYOLOEventDetector(self.get_squirrel_detector())
             if self._zone is not None:
                 det.set_zone(self._zone)
         self._detector = det

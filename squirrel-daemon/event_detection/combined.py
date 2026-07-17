@@ -18,12 +18,15 @@ class CombinedMotionYOLOEventDetector(EventDetector):
     confirmation is attached to the motion event metadata.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, yolo_detector: Optional[YOLOEventDetector] = None) -> None:
         self._motion = MotionDetector()
-        self._yolo = YOLOEventDetector()
+        self._yolo = yolo_detector or YOLOEventDetector()
         self._events_published = 0
         self._last_squirrel_confidence = 0.0
         self._last_yolo_count = 0
+
+    def yolo_detector(self) -> YOLOEventDetector:
+        return self._yolo
 
     def enabled(self) -> bool:
         return self._motion.enabled()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from pathlib import Path
 import time
@@ -38,6 +39,7 @@ class YOLOEventDetector(EventDetector):
         self._timing_stage_totals_sec = {name: 0.0 for name in self._timing_stage_names}
         self._warmed_up = False
         self._warmup_time_sec = 0.0
+        self._inference_lock = threading.Lock()
         self._daemon_root = Path(__file__).resolve().parents[1]
         self._detection_output_dir = self._daemon_root / "detections"
         self._save_detection_images = True
@@ -61,9 +63,14 @@ class YOLOEventDetector(EventDetector):
             or "delegate" in message
         )
 
-    def _predict_tpu(self, image: Any) -> Any:
+    def _predict_tpu(self, image: Any, score_thresh: Optional[float] = None) -> Any:
+        threshold = self._score_thresh if score_thresh is None else float(score_thresh)
         try:
-            return self._model.predict(image, verbose=False, conf=float(self._score_thresh))  # type: ignore
+            # The live camera loop and recording-label worker share one Edge TPU
+            # interpreter. Ultralytics/TFLite inference is not safe to enter from
+            # both threads at once.
+            with self._inference_lock:
+                return self._model.predict(image, verbose=False, conf=threshold)  # type: ignore
         except (RuntimeError, ValueError) as exc:
             if not self._is_tpu_delegate_error(exc):
                 raise
@@ -195,6 +202,58 @@ class YOLOEventDetector(EventDetector):
         self._last_timing_stages_sec = {name: 0.0 for name in self._timing_stage_names}
         self._timing_stage_totals_sec = {name: 0.0 for name in self._timing_stage_names}
 
+    def predict_candidates(
+        self,
+        frame: Any,
+        *,
+        score_thresh: float,
+    ) -> Tuple[Any, List[Dict[str, Any]]]:
+        """Return a 320px letterboxed frame and detections in that space.
+
+        Recording labeling deliberately uses a lower threshold than live event
+        detection so hard positives just below the configured live threshold
+        are available for training.
+        """
+        threshold = float(score_thresh)
+        if not 0.0 < threshold <= 1.0:
+            raise ValueError("score_thresh must be greater than 0 and at most 1")
+        letterboxed, _scale, _left, _top = self._letterbox(frame)
+        results = self._predict_tpu(letterboxed, score_thresh=threshold)
+        detections = self._parse_ultralytics(
+            results,
+            letterboxed.shape[1],
+            letterboxed.shape[0],
+            score_thresh=threshold,
+        )
+        detections = [
+            detection
+            for detection in detections
+            if self._bbox_size_allowed(
+                detection,
+                letterboxed.shape[1],
+                letterboxed.shape[0],
+            )
+        ]
+        return letterboxed, detections
+
+    @staticmethod
+    def _letterbox(frame: Any) -> Tuple[Any, float, int, int]:
+        target = 320
+        pad_color = 114
+        height, width = frame.shape[:2]
+        if width <= 0 or height <= 0:
+            raise ValueError("frame must have positive width and height")
+        scale = min(target / float(width), target / float(height))
+        new_width = max(1, int(round(width * scale)))
+        new_height = max(1, int(round(height * scale)))
+        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        resized = cv2.resize(frame, (new_width, new_height), interpolation=interpolation)
+        letterboxed = np.full((target, target, 3), pad_color, dtype=resized.dtype)
+        top = (target - new_height) // 2
+        left = (target - new_width) // 2
+        letterboxed[top:top + new_height, left:left + new_width] = resized
+        return letterboxed, scale, left, top
+
     # --- Core processing ---
     def process(self, frame: Any, now_ts: Optional[float] = None) -> DetectionResult:
         if now_ts is None:
@@ -211,26 +270,18 @@ class YOLOEventDetector(EventDetector):
         process_start = time.perf_counter()
         work = frame.copy()
         h, w = work.shape[:2]
-        # Preprocess: letterbox to 320x320 with gray 0x72 (114) like extract_frames.py
-        TARGET = 320
-        PAD_COLOR = 114
-        scale = min(TARGET / float(w), TARGET / float(h))
-        new_w = max(1, int(round(w * scale)))
-        new_h = max(1, int(round(h * scale)))
-        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-        resized = cv2.resize(work, (new_w, new_h), interpolation=interp)
-        lb = np.full((TARGET, TARGET, 3), PAD_COLOR, dtype=resized.dtype)
-        top = (TARGET - new_h) // 2
-        left = (TARGET - new_w) // 2
-        lb[top:top+new_h, left:left+new_w] = resized
+        # Preprocess: letterbox to 320x320 with gray 0x72 (114) like the
+        # persistent training dataset.
+        lb, scale, left, top = self._letterbox(work)
+        target = int(lb.shape[0])
         preprocess_end = time.perf_counter()
         # Run Ultralytics YOLO on the letterboxed image
         results = self._predict_tpu(lb)
         inference_end = time.perf_counter()
         # Parse detections in letterbox space (TARGET x TARGET)
-        detections_lb = self._parse_ultralytics(results, TARGET, TARGET)
+        detections_lb = self._parse_ultralytics(results, target, target)
         raw_detection_count = len(detections_lb)
-        detections_lb = [d for d in detections_lb if self._bbox_size_allowed(d, TARGET, TARGET)]
+        detections_lb = [d for d in detections_lb if self._bbox_size_allowed(d, target, target)]
         filtered_detection_count = raw_detection_count - len(detections_lb)
         save_start = time.perf_counter()
         saved_image_path = self._save_detection_image(lb, detections_lb, now_ts)
@@ -387,7 +438,13 @@ class YOLOEventDetector(EventDetector):
         return None
 
     # --- helpers ---
-    def _parse_ultralytics(self, results: Any, img_w: int, img_h: int) -> List[Dict[str, Any]]:
+    def _parse_ultralytics(
+        self,
+        results: Any,
+        img_w: int,
+        img_h: int,
+        score_thresh: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
         detections: List[Dict[str, Any]] = []
         if not results:
             return detections
@@ -399,9 +456,10 @@ class YOLOEventDetector(EventDetector):
         xyxy = np.array(xyxy)
         conf = np.array(conf).flatten()
         classes = np.array(cls).flatten() if cls is not None else np.full(conf.shape, -1)
+        threshold = self._score_thresh if score_thresh is None else float(score_thresh)
         for i in range(len(conf)):
             score = float(conf[i])
-            if score < float(self._score_thresh):
+            if score < threshold:
                 continue
             icls = int(classes[i])
             if self._allowed_classes is not None and icls not in self._allowed_classes:
