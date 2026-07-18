@@ -5,22 +5,26 @@ Features:
 - Click and drag to create rectangles (multiple per image)
 - Undo last box ('u'), delete all for image ('d')
 - Navigate images: next ('n' or Enter), previous ('p')
-- Save annotations to a text file ('s') and auto-save on changes
+- Save annotations to a CSV file ('s') and auto-save on changes
 - Resume from existing annotations file
 
-Saved format (one box per line):
-  <image_path> x1 y1 x2 y2
+Saved CSV format:
+  image,label,xmin,ymin,xmax,ymax
 
 Coordinates are absolute pixels in the original image size (not scaled).
 
 Usage examples:
-  python image_extractor/bbox_viewer.py \
-      --images-dir image_extractor/recordings \
-      --out image_extractor/bboxes.txt
+  python bbox_viewer.py --changed-only
 
   python image_extractor/bbox_viewer.py \
       --images-dir image_extractor/stills \
       --ext jpg --ext png --out image_extractor/bboxes.txt
+
+  # Only browse images currently changed in git
+  python image_extractor/bbox_viewer.py \
+      --images-dir dataset/positives \
+      --out dataset/bboxes.txt \
+      --changed-only
 """
 
 from __future__ import annotations
@@ -28,12 +32,18 @@ from __future__ import annotations
 import argparse
 import os
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import shutil
 from pathlib import Path
+import subprocess
 from typing import Dict, List, Tuple
 
 import cv2
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_IMAGES_DIR = REPO_ROOT / "dataset" / "positives"
+DEFAULT_OUT_PATH = REPO_ROOT / "dataset" / "bboxes.txt"
 
 
 Point = Tuple[int, int]
@@ -45,6 +55,7 @@ class State:
     img_index: int
     image_paths: List[Path]
     boxes_by_image: Dict[str, List[Box]]
+    labels_by_image: Dict[str, str] = field(default_factory=dict)
     drawing: bool = False
     start_pt: Point | None = None
     current_pt: Point | None = None
@@ -100,9 +111,9 @@ def put_help_overlay(img):
         y += 22
 
 
-def load_annotations_raw(path: Path) -> List[Tuple[str, Box]]:
-    """Load raw entries as (key_str, box) without resolving to Paths."""
-    entries: List[Tuple[str, Box]] = []
+def load_annotations_raw(path: Path) -> List[Tuple[str, str, Box]]:
+    """Load entries as (key_str, label, box) without resolving to Paths."""
+    entries: List[Tuple[str, str, Box]] = []
     if not path.exists():
         return entries
     with path.open("r") as f:
@@ -111,46 +122,49 @@ def load_annotations_raw(path: Path) -> List[Tuple[str, Box]]:
             if not line:
                 continue
             try:
-                parts = line.split()
-                img_path_str = parts[0]
-                x1, y1, x2, y2 = map(int, parts[1:5])
-                entries.append((img_path_str, (x1, y1, x2, y2)))
+                if "," in line:
+                    # Also accept the CSV form used by dataset/bboxes.txt:
+                    # filename,label,xmin,ymin,xmax,ymax
+                    parts = next(csv.reader([line]))
+                    img_path_str = parts[0].strip()
+                    label = parts[1].strip() or "rat"
+                    x1, y1, x2, y2 = map(int, (value.strip() for value in parts[2:6]))
+                else:
+                    parts = line.split()
+                    img_path_str = parts[0]
+                    label = "rat"
+                    x1, y1, x2, y2 = map(int, parts[1:5])
+                entries.append((img_path_str, label, (x1, y1, x2, y2)))
             except Exception:
                 # Skip malformed lines
                 continue
     return entries
 
 
-def save_annotations(path: Path, boxes_by_image: Dict[str, List[Box]]):
-    lines: List[str] = []
-    # Keep deterministic ordering
-    for key in sorted(boxes_by_image.keys()):
-        for (x1, y1, x2, y2) in boxes_by_image[key]:
-            lines.append(f"{key} {x1} {y1} {x2} {y2}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as f:
-        f.write("\n".join(lines) + ("\n" if lines else ""))
-
-
-def save_annotations_csv(csv_path: Path, boxes_by_image: Dict[str, List[Box]], label: str = "rat"):
+def save_annotations_csv(
+    csv_path: Path,
+    boxes_by_image: Dict[str, List[Box]],
+    labels_by_image: Dict[str, str] | None = None,
+    default_label: str = "rat",
+):
     """
     Save annotations to CSV with rows:
-      filename,label,x1,y1,x2,y2
+      image,label,xmin,ymin,xmax,ymax
 
     - filename: basename of the image file (no directories)
-    - label: constant string, by default "rat"
+    - label: loaded per-image label, or default_label for new images
     - coordinates: absolute pixel coordinates in the original image
     """
-    rows: List[List[str | int]] = []
-    for key in sorted(boxes_by_image.keys()):
-        fname = os.path.basename(key)
-        for (x1, y1, x2, y2) in boxes_by_image[key]:
-            rows.append([fname, label, x1, y1, x2, y2])
+    labels_by_image = labels_by_image or {}
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    # No header per request: just filename, "rat", coords
     with csv_path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerows(rows)
+        writer.writerow(["image", "label", "xmin", "ymin", "xmax", "ymax"])
+        for key in sorted(boxes_by_image.keys()):
+            fname = os.path.basename(key)
+            label = labels_by_image.get(key, default_label)
+            for (x1, y1, x2, y2) in boxes_by_image[key]:
+                writer.writerow([fname, label, x1, y1, x2, y2])
 
 
 def collect_images(images_dir: Path | None, images: List[Path], exts: List[str]) -> List[Path]:
@@ -182,6 +196,42 @@ def collect_images(images_dir: Path | None, images: List[Path], exts: List[str])
     return paths
 
 
+def get_changed_paths(repo_dir: Path | None = None) -> set[Path]:
+    """Return paths Git reports as changed in the working tree."""
+    cwd = str(repo_dir or Path.cwd())
+    try:
+        root_result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        repo_root = Path(root_result.stdout.strip()).resolve()
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            cwd=str(repo_root),
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("Unable to inspect changed files; run the viewer inside a git repository") from exc
+
+    # -z keeps filenames containing whitespace unambiguous. A porcelain v1
+    # record has a two-character status followed by a space and the path.
+    return {
+        (repo_root / record[3:].decode("utf-8", errors="surrogateescape")).resolve()
+        for record in status_result.stdout.split(b"\0")
+        if len(record) >= 4 and record[2:3] == b" "
+    }
+
+
+def filter_changed_images(image_paths: List[Path], repo_dir: Path | None = None) -> List[Path]:
+    """Keep only collected images whose exact paths Git reports as changed."""
+    changed_paths = get_changed_paths(repo_dir)
+    return [path for path in image_paths if path.resolve() in changed_paths]
+
+
 def load_and_prepare_image(img_path: Path, max_dim: int) -> Tuple[any, float, any]:
     img = cv2.imread(str(img_path))
     if img is None:
@@ -197,7 +247,7 @@ def load_and_prepare_image(img_path: Path, max_dim: int) -> Tuple[any, float, an
     return disp, scale, img
 
 
-def run_viewer(state: State, out_path: Path, csv_out_path: Path, max_dim: int, key_for_save, resolve_key_to_path, delete_image_fn):
+def run_viewer(state: State, csv_out_path: Path, max_dim: int, key_for_save, resolve_key_to_path, delete_image_fn):
     win = "BBox Annotator"
     cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
 
@@ -256,8 +306,8 @@ def run_viewer(state: State, out_path: Path, csv_out_path: Path, max_dim: int, k
                 img_p = state.image_paths[state.img_index]
                 key = key_for_save(img_p)
                 state.boxes_by_image.setdefault(key, []).append((x1, y1, x2, y2))
-                save_annotations(out_path, state.boxes_by_image)
-                save_annotations_csv(csv_out_path, state.boxes_by_image)
+                state.labels_by_image.setdefault(key, "rat")
+                save_annotations_csv(csv_out_path, state.boxes_by_image, state.labels_by_image)
             state.start_pt = None
             state.current_pt = None
             refresh_display()
@@ -286,20 +336,17 @@ def run_viewer(state: State, out_path: Path, csv_out_path: Path, max_dim: int, k
                 lst.pop()
                 if not lst:
                     state.boxes_by_image.pop(key, None)
-                save_annotations(out_path, state.boxes_by_image)
-                save_annotations_csv(csv_out_path, state.boxes_by_image)
+                save_annotations_csv(csv_out_path, state.boxes_by_image, state.labels_by_image)
                 refresh_display()
         elif key == ord('d'):
             img_p = state.image_paths[state.img_index]
             k = key_for_save(img_p)
             if k in state.boxes_by_image:
                 state.boxes_by_image.pop(k)
-                save_annotations(out_path, state.boxes_by_image)
-                save_annotations_csv(csv_out_path, state.boxes_by_image)
+                save_annotations_csv(csv_out_path, state.boxes_by_image, state.labels_by_image)
                 refresh_display()
         elif key == ord('s'):
-            save_annotations(out_path, state.boxes_by_image)
-            save_annotations_csv(csv_out_path, state.boxes_by_image)
+            save_annotations_csv(csv_out_path, state.boxes_by_image, state.labels_by_image)
             refresh_display()
         elif key == ord('x'):
             # Delete current image via provided deleter
@@ -310,8 +357,7 @@ def run_viewer(state: State, out_path: Path, csv_out_path: Path, max_dim: int, k
             k = key_for_save(curr_img)
             if k in state.boxes_by_image:
                 state.boxes_by_image.pop(k, None)
-                save_annotations(out_path, state.boxes_by_image)
-                save_annotations_csv(csv_out_path, state.boxes_by_image)
+                save_annotations_csv(csv_out_path, state.boxes_by_image, state.labels_by_image)
             deleted, msg = delete_image_fn(curr_img)
             # Update list and move selection
             if deleted:
@@ -329,18 +375,34 @@ def run_viewer(state: State, out_path: Path, csv_out_path: Path, max_dim: int, k
                 cv2.imshow(win, base)
 
     # Final save on exit
-    save_annotations(out_path, state.boxes_by_image)
-    save_annotations_csv(csv_out_path, state.boxes_by_image)
+    save_annotations_csv(csv_out_path, state.boxes_by_image, state.labels_by_image)
     cv2.destroyAllWindows()
 
 
 def main():
     ap = argparse.ArgumentParser(description="Interactive bounding box annotator")
-    ap.add_argument("--images-dir", type=Path, default=None, help="Directory to scan for images (recursive)")
+    ap.add_argument(
+        "--images-dir",
+        type=Path,
+        default=DEFAULT_IMAGES_DIR,
+        help="Directory to scan for images (recursive)",
+    )
     ap.add_argument("--image", action="append", default=[], help="Specific image path(s) or directory(ies); can repeat")
     ap.add_argument("--ext", action="append", default=["jpg", "jpeg", "png"], help="Image extensions to include (no dot)")
-    ap.add_argument("--out", type=Path, default=Path("image_extractor/bboxes.txt"), help="Output annotations text file")
+    ap.add_argument(
+        "--out",
+        type=Path,
+        default=DEFAULT_OUT_PATH,
+        help="CSV annotation file used for input and output",
+    )
     ap.add_argument("--max-dim", type=int, default=1280, help="Max display dimension (longer side)")
+    ap.add_argument(
+        "--changed-only",
+        "--staged-only",
+        dest="changed_only",
+        action="store_true",
+        help="Only show images Git reports as changed (including untracked files)",
+    )
     ap.add_argument("--delete-mode", choices=["trash", "rm"], default="trash", help="How to delete images: move to trash dir or remove")
     ap.add_argument("--trash-dir", type=Path, default=None, help="Trash directory for deleted images (default: .trash under images-dir)")
     args = ap.parse_args()
@@ -352,6 +414,14 @@ def main():
 
     # Normalize paths to absolute to avoid duplicates from differing relpaths
     image_paths = [p.resolve() for p in image_paths]
+
+    if args.changed_only:
+        try:
+            image_paths = filter_changed_images(image_paths)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+        if not image_paths:
+            raise SystemExit("No changed images found among the selected image paths.")
 
     # Determine key saving strategy: relative to images-dir if given, else basename
     def key_for_save(p: Path) -> str:
@@ -395,13 +465,16 @@ def main():
 
     # Load existing annotations and map to keys used by key_for_save
     boxes_by_image: Dict[str, List[Box]] = {}
-    for key_str, box in load_annotations_raw(args.out):
+    labels_by_image: Dict[str, str] = {}
+    for key_str, label, box in load_annotations_raw(args.out):
         p = resolve_key_to_path(key_str)
         if p is None:
             # Store using original key to avoid data loss across sessions
-            boxes_by_image.setdefault(key_str, []).append(box)
+            key = key_str
         else:
-            boxes_by_image.setdefault(key_for_save(p), []).append(box)
+            key = key_for_save(p)
+        boxes_by_image.setdefault(key, []).append(box)
+        labels_by_image.setdefault(key, label)
 
     # Configure delete behavior
     if args.trash_dir is not None:
@@ -444,14 +517,16 @@ def main():
         except Exception as e:
             return False, f"Delete failed: {e}"
 
-    # Determine CSV output path derived from --out
-    if args.out.suffix:
-        csv_out_path = args.out.with_suffix(".csv")
-    else:
-        csv_out_path = Path(str(args.out) + ".csv")
+    # The configured annotation file is the CSV output consumed by training.
+    csv_out_path = args.out
 
-    state = State(img_index=0, image_paths=image_paths, boxes_by_image=boxes_by_image)
-    run_viewer(state, args.out, csv_out_path, args.max_dim, key_for_save, resolve_key_to_path, delete_image_fn)
+    state = State(
+        img_index=0,
+        image_paths=image_paths,
+        boxes_by_image=boxes_by_image,
+        labels_by_image=labels_by_image,
+    )
+    run_viewer(state, csv_out_path, args.max_dim, key_for_save, resolve_key_to_path, delete_image_fn)
 
 
 if __name__ == "__main__":
