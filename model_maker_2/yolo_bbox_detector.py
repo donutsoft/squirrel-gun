@@ -260,6 +260,13 @@ class YOLOBBoxDetector:
             (self.yolo_root / "images" / split).mkdir(parents=True, exist_ok=True)
             (self.yolo_root / "labels" / split).mkdir(parents=True, exist_ok=True)
 
+        # Ultralytics' dataset hash uses paths and file sizes, but not file
+        # contents. Rewriting a class id (for example, "1" to "0") therefore
+        # does not invalidate its cache. Always discard caches when regenerating
+        # labels so training cannot consume stale class ids or boxes.
+        for split in ("train", "val"):
+            (self.yolo_root / "labels" / f"{split}.cache").unlink(missing_ok=True)
+
         for img_path, items in by_image.items():
             split = "val" if img_path in val_set else "train"
             # Link/copy image

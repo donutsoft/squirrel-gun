@@ -12,12 +12,16 @@ class LaserController:
         self._serial = get_serial_hardware_controller()
 
     def turn_on(self):
+        self._serial.trace_event(f"laser-on-start pin={self._pin}")
         print("Turning on the laser.")
-        self._serial.command("ON", self._pin)
+        response = self._serial.command("ON", self._pin)
+        self._serial.trace_event(f"laser-on-complete pin={self._pin} response={response!r}")
 
     def turn_off(self):
+        self._serial.trace_event(f"laser-off-start pin={self._pin}")
         print("Turning off the laser.")
-        self._serial.command("OFF", self._pin)
+        response = self._serial.command("OFF", self._pin)
+        self._serial.trace_event(f"laser-off-complete pin={self._pin} response={response!r}")
 
     def cleanup(self):
         self.turn_off()

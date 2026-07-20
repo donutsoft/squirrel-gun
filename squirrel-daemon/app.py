@@ -1611,13 +1611,21 @@ def _on_motion_water(evt: dict) -> None:
         if (now - _last_water_fire_ts) < float(_WATER_COOLDOWN_SEC):
             return
         _last_water_fire_ts = now
+        water._serial.trace_event(
+            f"auto-water-eligible event_ts={evt.get('ts') if isinstance(evt, dict) else None!r} "
+            f"detector={evt.get('detector') if isinstance(evt, dict) else None!r}"
+        )
 
         # Fire asynchronously to avoid blocking the event bus thread
         def _do_fire():
+            water._serial.trace_event("auto-water-thread-start")
             try:
                 water.startWatering(2.0)
-            except Exception:
-                pass
+                water._serial.trace_event("auto-water-thread-success")
+            except Exception as exc:
+                water._serial.trace_event(
+                    f"auto-water-thread-error type={type(exc).__name__} value={exc!r}"
+                )
 
         import threading as _th
         _th.Thread(target=_do_fire, name='WaterOnMotion', daemon=True).start()
