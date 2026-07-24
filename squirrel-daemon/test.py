@@ -276,7 +276,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default="best_full_integer_quant_edgetpu.tflite",
         help="Model filename under squirrel-daemon, or an absolute/relative path",
     )
-    parser.add_argument("--conf", type=float, default=0.4, help="Minimum detection confidence")
+    parser.add_argument("--conf", type=float, default=0.6, help="Minimum detection confidence")
     parser.add_argument(
         "--every",
         type=int,

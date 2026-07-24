@@ -149,7 +149,7 @@ class RecordingLabelServiceTests(unittest.TestCase):
         }, names)
         rows = service._read_bbox_rows()
         self.assertEqual(3, len(rows))
-        self.assertEqual({"squirrel"}, {row["label"] for row in rows})
+        self.assertEqual({"rat"}, {row["label"] for row in rows})
         self.assertEqual({"10", "50"}, {row["xmin"] for row in rows})
 
     def test_deleting_positive_also_removes_its_bbox_rows(self):
