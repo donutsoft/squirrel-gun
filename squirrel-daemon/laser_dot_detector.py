@@ -311,6 +311,10 @@ def detect_laser_dot(
     debug_paths: Optional[Dict[str, Path]] = None,
     expected_xy: Optional[tuple[float, float]] = None,
     max_expected_distance: Optional[float] = None,
+    expected_uv: Optional[tuple[float, float]] = None,
+    max_expected_distance_fraction: Optional[float] = None,
+    verification_on_image_path: Optional[Path] = None,
+    verification_off_image_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     options = options or LaserDotOptions()
     on_image = _load_image(Path(on_image_path))
@@ -325,11 +329,64 @@ def detect_laser_dot(
         if scene == "night"
         else _red_diff_score(on_image, off_image, options)
     )
-    on_gray = cv2.cvtColor(on_image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    verified = (
+        verification_on_image_path is not None
+        or verification_off_image_path is not None
+    )
+    if (
+        verification_on_image_path is None
+        or verification_off_image_path is None
+    ) and verified:
+        raise ValueError("verification requires both laser-on and laser-off images")
+    if verified:
+        verification_on = _load_image(Path(verification_on_image_path))
+        verification_off = _load_image(Path(verification_off_image_path))
+        if (
+            verification_on.shape != on_image.shape
+            or verification_off.shape != on_image.shape
+        ):
+            raise ValueError("Verification images must match the primary image dimensions")
+        verification_scene = _scene_mode(verification_on)
+        if verification_scene != scene:
+            raise ValueError(
+                f"Scene mode changed during laser verification: {scene} -> {verification_scene}"
+            )
+        verification_score, verification_support = (
+            _bright_diff_score(verification_on, verification_off, options)
+            if scene == "night"
+            else _red_diff_score(verification_on, verification_off, options)
+        )
+        # Only the laser is synchronized with both on captures. Wind, insects,
+        # and exposure noise should not brighten the same pixels in both cycles.
+        score = np.minimum(score, verification_score)
+        delta_support = np.minimum(delta_support, verification_support)
+        on_gray = np.minimum(
+            cv2.cvtColor(on_image, cv2.COLOR_BGR2GRAY).astype(np.float32),
+            cv2.cvtColor(verification_on, cv2.COLOR_BGR2GRAY).astype(np.float32),
+        )
+        method += "-verified"
+    else:
+        on_gray = cv2.cvtColor(on_image, cv2.COLOR_BGR2GRAY).astype(np.float32)
     mask = _threshold_mask(score, options)
     candidates, _mask = _candidates_from_score(score, mask, delta_support, on_gray, options)
     candidates = _dedupe_candidates(candidates + _peak_candidates(score, delta_support, on_gray, options))
     h, w = on_image.shape[:2]
+    if expected_xy is not None and expected_uv is not None:
+        raise ValueError("provide expected_xy or expected_uv, not both")
+    if expected_uv is not None:
+        expected_xy = (
+            float(expected_uv[0]) * float(w),
+            float(expected_uv[1]) * float(h),
+        )
+    if max_expected_distance is not None and max_expected_distance_fraction is not None:
+        raise ValueError(
+            "provide max_expected_distance or max_expected_distance_fraction, not both"
+        )
+    if max_expected_distance_fraction is not None:
+        max_expected_distance = (
+            max(0.0, float(max_expected_distance_fraction))
+            * float(np.hypot(w, h))
+        )
     if expected_xy is not None:
         expected_x, expected_y = expected_xy
         for candidate in candidates:
@@ -405,6 +462,7 @@ def detect_laser_dot(
     return {
         "scene": scene,
         "method": method,
+        "verified": verified,
         "dot": dot,
         "candidates": candidates,
         "image_width": int(w),

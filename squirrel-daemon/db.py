@@ -83,6 +83,28 @@ class ClickStore:
             )
             return int(cur.lastrowid)
 
+    def record_many(self, rows: Iterable[Dict[str, Any]]) -> List[int]:
+        """Atomically persist a validated calibration dataset."""
+        created_at = time.time()
+        ids: List[int] = []
+        with self._connect() as conn:
+            for row in rows:
+                cur = conn.execute(
+                    "INSERT INTO clicks(created_at, pan, tilt, x_px, y_px, img_w, img_h) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        created_at,
+                        float(row["pan"]),
+                        float(row["tilt"]),
+                        float(row["x_px"]),
+                        float(row["y_px"]),
+                        float(row["img_w"]),
+                        float(row["img_h"]),
+                    ),
+                )
+                ids.append(int(cur.lastrowid))
+        return ids
+
     def list(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         limit = max(1, min(1000, int(limit)))
         offset = max(0, int(offset))

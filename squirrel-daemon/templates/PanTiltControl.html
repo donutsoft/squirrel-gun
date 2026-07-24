@@ -52,10 +52,7 @@
         <section class="panel webcam-panel">
           <h2>Webcam</h2>
           <div>
-            <label style="display:inline-flex; align-items:center; gap:6px; margin-bottom:6px;">
-              <input id="record-clicks" type="checkbox" />
-              <span>Record clicks (save degrees)</span>
-            </label>
+            <div class="hint" style="margin:0 0 6px;">Left-click to aim. Right-click to record the point with the current angles.</div>
             <div style="display:flex; gap:12px; align-items:center; margin:6px 0; flex-wrap:wrap;">
               <label style="display:inline-flex; align-items:center; gap:6px;">
                 <span>Detector</span>
@@ -124,61 +121,53 @@
 
       <section class="panel" style="margin-top: 16px;">
         <h2>Automatic Calibration</h2>
-        <div class="hint">Two-phase calibration: 1) Degree bounds grid sweep, 2) Random image point validation.</div>
-        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap:10px; margin-top:10px;">
-          <div>
-            <div class="hint" style="margin-top:0;">Top Left</div>
-            <label>Pan <input id="cal-tl-pan" type="number" min="0" max="270" step="0.1" value="90" /></label>
-            <label>Tilt <input id="cal-tl-tilt" type="number" min="0" max="180" step="0.1" value="60" /></label>
-          </div>
-          <div>
-            <div class="hint" style="margin-top:0;">Top Right</div>
-            <label>Pan <input id="cal-tr-pan" type="number" min="0" max="270" step="0.1" value="165" /></label>
-            <label>Tilt <input id="cal-tr-tilt" type="number" min="0" max="180" step="0.1" value="52" /></label>
-          </div>
-          <div>
-            <div class="hint" style="margin-top:0;">Bottom Left</div>
-            <label>Pan <input id="cal-bl-pan" type="number" min="0" max="270" step="0.1" value="94" /></label>
-            <label>Tilt <input id="cal-bl-tilt" type="number" min="0" max="180" step="0.1" value="87" /></label>
-          </div>
-          <div>
-            <div class="hint" style="margin-top:0;">Bottom Right</div>
-            <label>Pan <input id="cal-br-pan" type="number" min="0" max="270" step="0.1" value="159" /></label>
-            <label>Tilt <input id="cal-br-tilt" type="number" min="0" max="180" step="0.1" value="87" /></label>
-          </div>
+        <div class="hint">
+          One click learns from where the laser actually lands, then repeats a screen-wide grid until
+          the aiming error reaches the target or the round limit. The head and laser move while it runs.
         </div>
-        <div class="inputs" style="grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));">
-          <label>
-            Rows
-            <input id="cal-rows" type="number" min="2" max="15" step="1" value="5" />
-          </label>
-          <label>
-            Columns
-            <input id="cal-cols" type="number" min="2" max="15" step="1" value="5" />
-          </label>
-          <label>
-            P2 Points
-            <input id="cal-phase2-count" type="number" min="0" max="50" step="1" value="10" />
-          </label>
-          <label>
-            Settle (s)
-            <input id="cal-settle" type="number" min="0" max="5" step="0.05" value="0.35" />
-          </label>
-          <label>
-            Laser settle (s)
-            <input id="cal-laser-settle" type="number" min="0" max="5" step="0.05" value="0.5" />
-          </label>
-          <label>
-            Discard frames
-            <input id="cal-discard-frames" type="number" min="0" max="15" step="1" value="4" />
-          </label>
-          <label>
-            Edge margin (px)
-            <input id="cal-edge-margin" type="number" min="0" max="200" step="1" value="20" />
-          </label>
-        </div>
+        <details style="margin-top:10px;">
+          <summary>Advanced accuracy settings</summary>
+          <div class="inputs" style="grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));">
+            <label>
+              Grid rows
+              <input id="cal-rows" type="number" min="2" max="15" step="1" value="5" />
+            </label>
+            <label>
+              Grid columns
+              <input id="cal-cols" type="number" min="2" max="15" step="1" value="5" />
+            </label>
+            <label>
+              Max rounds
+              <input id="cal-max-rounds" type="number" min="1" max="10" step="1" value="6" />
+            </label>
+            <label>
+              Target RMSE (px)
+              <input id="cal-target-rmse" type="number" min="1" max="250" step="1" value="12" />
+            </label>
+            <label>
+              Max error (px)
+              <input id="cal-target-max-error" type="number" min="1" max="500" step="1" value="30" />
+            </label>
+            <label>
+              Settle (s)
+              <input id="cal-settle" type="number" min="0" max="5" step="0.05" value="0.35" />
+            </label>
+            <label>
+              Laser settle (s)
+              <input id="cal-laser-settle" type="number" min="0" max="5" step="0.05" value="0.5" />
+            </label>
+            <label>
+              Discard frames
+              <input id="cal-discard-frames" type="number" min="0" max="15" step="1" value="4" />
+            </label>
+            <label>
+              Edge margin (px)
+              <input id="cal-edge-margin" type="number" min="0" max="200" step="1" value="20" />
+            </label>
+          </div>
+        </details>
         <div class="actions" style="align-items:center; flex-wrap:wrap;">
-          <button id="automatic-calibrate" class="accent">Calibrate</button>
+          <button id="automatic-calibrate" class="accent">Calibrate Automatically</button>
           <div id="automatic-calibration-status" class="hint" style="margin-top:0;">Idle</div>
           <a id="automatic-calibration-report" class="hint" style="margin-top:0; display:none;" target="_blank" rel="noopener">Debug report</a>
         </div>
@@ -250,10 +239,9 @@
       pan.addEventListener('change', send);
       tilt.addEventListener('change', send);
 
-      // Record clicks on the webcam image with coordinates and current angles
+      // Left-click aims; right-click records image coordinates and current angles.
       const img = byId('webcam-stream');
       // Stream is served by Flask MJPEG endpoint with low-latency defaults
-      const recordToggle = byId('record-clicks');
       const motionEnable = byId('motion-enable');
       const motionFollow = byId('motion-follow');
       const detectorType = byId('detector-type');
@@ -297,50 +285,63 @@
           height: naturalH
         };
       }
-      img.addEventListener('click', async (e) => {
-        const point = imagePointFromEvent(e);
-        if (!point) return;
-        // For aiming, send normalized coordinates only (0..1)
+      async function aimAtImagePoint(point) {
         const aimPayload = {
           x: point.u,
           y: point.v
         };
-        // For click logging, send pixel coords in the stream's natural image space.
+        const aimRes = await fetch('/api/aim', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(aimPayload)
+        });
+        if (!aimRes.ok) {
+          console.error('Failed to aim');
+          return;
+        }
+        const data = await aimRes.json();
+        if (typeof data.pan === 'number') pan.value = data.pan.toFixed(1);
+        if (typeof data.tilt === 'number') tilt.value = data.tilt.toFixed(1);
+      }
+
+      async function recordImagePoint(point) {
         const clickPayload = {
           x: Math.round(point.x),
           y: Math.round(point.y),
           width: Math.round(point.width),
           height: Math.round(point.height)
         };
+        const recRes = await fetch('/api/click', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(clickPayload)
+        });
+        if (!recRes.ok) {
+          console.error('Failed to record click');
+          return;
+        }
+        await refreshClicks();
+      }
+
+      img.addEventListener('click', async (e) => {
+        if (e.button !== 0) return;
+        const point = imagePointFromEvent(e);
+        if (!point) return;
         try {
-          if (recordToggle.checked) {
-            // Only record click; do NOT move servos
-            const recRes = await fetch('/api/click', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(clickPayload)
-            });
-            if (!recRes.ok) {
-              console.error('Failed to record click');
-            }
-            await refreshClicks();
-          } else {
-            // Aim the system and update inputs from the response
-            const aimRes = await fetch('/api/aim', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(aimPayload)
-            });
-            if (!aimRes.ok) {
-              console.error('Failed to aim');
-            } else {
-              const data = await aimRes.json();
-              if (typeof data.pan === 'number') pan.value = data.pan.toFixed(1);
-              if (typeof data.tilt === 'number') tilt.value = data.tilt.toFixed(1);
-            }
-          }
+          await aimAtImagePoint(point);
         } catch (err) {
-          console.error('Error handling click', err);
+          console.error('Error aiming at image point', err);
+        }
+      });
+
+      img.addEventListener('contextmenu', async (e) => {
+        e.preventDefault();
+        const point = imagePointFromEvent(e);
+        if (!point) return;
+        try {
+          await recordImagePoint(point);
+        } catch (err) {
+          console.error('Error recording image point', err);
         }
       });
 
@@ -381,19 +382,15 @@
       const automaticCalibrate = byId('automatic-calibrate');
       const automaticCalibrationStatus = byId('automatic-calibration-status');
       const automaticCalibrationReport = byId('automatic-calibration-report');
-      function readCalibrationCorner(prefix) {
-        return {
-          pan: Number(byId(`cal-${prefix}-pan`).value),
-          tilt: Number(byId(`cal-${prefix}-tilt`).value)
-        };
-      }
       function setCalibrationStatus(text) {
         if (automaticCalibrationStatus) automaticCalibrationStatus.textContent = text;
       }
       automaticCalibrate?.addEventListener('click', async () => {
         const rows = Math.max(2, Math.min(15, Math.floor(Number(byId('cal-rows').value) || 5)));
         const cols = Math.max(2, Math.min(15, Math.floor(Number(byId('cal-cols').value) || 5)));
-        const phase2Count = Math.max(0, Math.min(50, Math.floor(Number(byId('cal-phase2-count').value) || 10)));
+        const maxRounds = Math.max(1, Math.min(10, Math.floor(Number(byId('cal-max-rounds').value) || 6)));
+        const targetRmse = Math.max(1, Math.min(250, Number(byId('cal-target-rmse').value) || 12));
+        const targetMaxError = Math.max(targetRmse, Math.min(500, Number(byId('cal-target-max-error').value) || 30));
         const settle = Math.max(0, Math.min(5, Number(byId('cal-settle').value) || 0));
         const laserSettle = Math.max(0, Math.min(5, Number(byId('cal-laser-settle').value) || 0.5));
         const discardFrames = Math.max(0, Math.min(15, Math.floor(Number(byId('cal-discard-frames').value) || 4)));
@@ -401,30 +398,26 @@
 
         byId('cal-rows').value = String(rows);
         byId('cal-cols').value = String(cols);
-        byId('cal-phase2-count').value = String(phase2Count);
+        byId('cal-max-rounds').value = String(maxRounds);
+        byId('cal-target-rmse').value = String(targetRmse);
+        byId('cal-target-max-error').value = String(targetMaxError);
         byId('cal-settle').value = String(settle);
         byId('cal-laser-settle').value = String(laserSettle);
         byId('cal-discard-frames').value = String(discardFrames);
         byId('cal-edge-margin').value = String(edgeMargin);
 
-        const total = rows * cols + phase2Count;
-        const yes = confirm(`Run two-phase calibration over ${total} points? Phase 1: ${rows*cols} grid points. Phase 2: ${phase2Count} random validation points. The pan/tilt head and laser will move during capture.`);
-        if (!yes) return;
-
         automaticCalibrate.disabled = true;
         const originalText = automaticCalibrate.textContent;
         automaticCalibrate.textContent = 'Calibrating...';
         if (automaticCalibrationReport) automaticCalibrationReport.style.display = 'none';
-        setCalibrationStatus(`Running ${rows*cols} point sweep + ${phase2Count} random targets...`);
+        setCalibrationStatus(`Learning on a ${rows}×${cols} grid for up to ${maxRounds} rounds...`);
         try {
           const payload = {
-            top_left: readCalibrationCorner('tl'),
-            top_right: readCalibrationCorner('tr'),
-            bottom_left: readCalibrationCorner('bl'),
-            bottom_right: readCalibrationCorner('br'),
             rows,
             cols,
-            phase2_count: phase2Count,
+            max_rounds: maxRounds,
+            target_rmse_px: targetRmse,
+            target_max_error_px: targetMaxError,
             move_settle_sec: settle,
             laser_settle_sec: laserSettle,
             discard_frames: discardFrames,
@@ -448,9 +441,15 @@
           }
           if (typeof data.pan === 'number') pan.value = data.pan.toFixed(1);
           if (typeof data.tilt === 'number') tilt.value = data.tilt.toFixed(1);
-          const marginText = typeof data.edge_margin_px === 'number' ? ` Edge margin ${Math.round(data.edge_margin_px)}px.` : '';
-          const timingText = ` Laser settle ${data.laser_settle_sec ?? laserSettle}s, discard ${data.discard_frames ?? discardFrames}.`;
-          setCalibrationStatus(`Saved ${data.saved_count || 0}/${data.requested || total}; missed ${data.miss_count || 0}.${marginText}${timingText}`);
+          const metrics = data.activation_metrics || data.final_metrics || {};
+          const rmseText = typeof metrics.rmse_px === 'number' ? `${metrics.rmse_px.toFixed(1)}px RMSE` : 'no measured error';
+          const maxText = typeof metrics.max_error_px === 'number' ? `, ${metrics.max_error_px.toFixed(1)}px max` : '';
+          const outcome = data.activation_status === 'converged'
+            ? 'Converged and activated'
+            : data.activation_status === 'usable_checkpoint'
+              ? 'Best validated model activated; target accuracy not fully reached'
+              : 'Stopped; previous calibration kept';
+          setCalibrationStatus(`${outcome} after ${data.rounds_completed || 0} round(s): ${rmseText}${maxText}; measured ${data.measured_count || 0}, activated ${data.activated_count || 0}, missed ${data.miss_count || 0}.`);
           await refreshClicks();
         } catch (e) {
           console.error('Automatic calibration failed', e);

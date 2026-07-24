@@ -73,8 +73,18 @@ This document captures the working knowledge added while extending the project: 
 - Main page: `squirrel-daemon/templates/PanTiltControl.html`.
   - Pan/Tilt buttons and numeric inputs.
   - Live MJPEG stream (`/webcam/stream`).
+  - Left-clicking the stream aims at that point; right-clicking records that pixel with the current pan/tilt angles without moving.
   - Motion controls: enable overlay, set min area, enable “follow motion with laser”.
   - Click logging, model training, and water firing.
+
+## Automatic Aim Calibration
+- POST `/api/calibration/automatic` no longer requires four manually entered corner angles.
+- The daemon starts from the current learned model (or the built-in approximate field-of-view seed), aims at a normalized screen grid, detects the actual laser location, and records the observed angle-to-pixel samples.
+- Each point uses two independent laser-off/on capture cycles. Detection keeps only image changes that repeat in both laser-on frames and ranks candidates by distance from the requested screen target, suppressing wind and exposure changes.
+- Each full grid is scored before retraining, producing pixel mean error, RMSE, maximum error, and detection success rate.
+- It repeats screen-wide validation/training rounds until the configured RMSE and worst-point thresholds pass, or until the safety round limit is reached.
+- Measurements remain in memory until a later full-grid round validates the fitted model. A converged, axis-monotonic run is written and activated. When no prior model exists, a non-converged checkpoint may be activated only if it is monotonic, passes a conservative error ceiling, and has validation evidence spanning both axes and all four screen quadrants; otherwise the prior calibration remains unchanged.
+- The calibration UI requires one click. Accuracy and timing controls remain available under an advanced settings disclosure.
 
 ## Notes, Caveats, and Limits
 - Video codec/container: Uses `mp4v` in `.mp4`. If your OpenCV build lacks this codec, consider switching to `.avi` with `XVID` or `MJPG` for broad compatibility.

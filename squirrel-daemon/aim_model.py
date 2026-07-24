@@ -10,25 +10,21 @@ from sklearn.preprocessing import PolynomialFeatures
 
 @dataclass
 class LinearAimer:
-    # Absolute mapping model:
-    # pan  = a0 + a1*u + a2*v
-    # tilt = b0 + b1*u + b2*v
-    # where u = x/img_w in [0,1], v = y/img_h in [0,1]
+    # Absolute polynomial mapping from normalized image coordinates (u, v)
+    # to pan/tilt. Older three- and six-coefficient models remain supported;
+    # dense automatic calibration uses ten-coefficient cubic models.
     pan: List[float]
     tilt: List[float]
     path: Path | None = None
 
     @staticmethod
     def default() -> "LinearAimer":
-        # Defaults chosen for plausible behavior before training.
-        # Pan increases to the right; tilt decreases toward the bottom.
-        # Center (u=0.5,v=0.5) ~ (90,90).
-        # Use quadratic-compatible coefficient lengths (intercept + 5 terms):
-        # features = [u, v, u^2, u*v, v^2]
-        # Keep quadratic terms at zero so it behaves like linear initially.
+        # Bootstrap from the installation's known approximate field of view.
+        # Automatic calibration immediately replaces this seed with observations.
+        # Coefficients are [1, u, v, u^2, u*v, v^2].
         return LinearAimer(
-            pan=[60.0, 60.0, 0.0, 0.0, 0.0, 0.0],
-            tilt=[112.5, 0.0, -45.0, 0.0, 0.0, 0.0]
+            pan=[108.0, 65.0, 2.0, 0.0, -4.0, 0.0],
+            tilt=[57.0, 1.0, 32.0, 0.0, -1.0, 0.0],
         )
 
     @staticmethod
@@ -39,11 +35,12 @@ class LinearAimer:
             raise ValueError(f"Aim model must include pan and tilt coefficients: {path}")
         pan_list = list(map(float, data['pan']))
         tilt_list = list(map(float, data['tilt']))
-        # Backward compatibility: accept 3-coeff (linear) or 6-coeff (quadratic) models
-        if (len(pan_list) in (3, 6)) and (len(tilt_list) in (3, 6)):
+        # Backward compatibility: linear, quadratic, and cubic models.
+        if (len(pan_list) in (3, 6, 10)) and (len(tilt_list) in (3, 6, 10)):
             return LinearAimer(pan=pan_list, tilt=tilt_list, path=path)
         raise ValueError(
-            f"Aim model coefficient lengths must be 3 or 6: pan={len(pan_list)}, tilt={len(tilt_list)}"
+            f"Aim model coefficient lengths must be 3, 6, or 10: "
+            f"pan={len(pan_list)}, tilt={len(tilt_list)}"
         )
 
     def save(self) -> None:
@@ -56,8 +53,7 @@ class LinearAimer:
         return {'pan': self.pan, 'tilt': self.tilt}
 
     def predict(self, u: float, v: float) -> Tuple[float, float]:
-        # Predict absolute pan/tilt from normalized coordinates (u,v)
-        # Support both linear (3 coeffs) and quadratic (6 coeffs) models.
+        # Predict absolute pan/tilt from normalized coordinates (u,v).
         if len(self.pan) == 3 and len(self.tilt) == 3:
             a0, a1, a2 = self.pan
             b0, b1, b2 = self.tilt
@@ -65,17 +61,13 @@ class LinearAimer:
             tilt = b0 + b1 * u + b2 * v
             return pan, tilt
 
-        # Quadratic model: coefficients = [intercept, a_u, a_v, a_uu, a_uv, a_vv]
-        # features = [u, v, u^2, u*v, v^2]
-        if len(self.pan) == 6 and len(self.tilt) == 6:
-            a0, a_u, a_v, a_uu, a_uv, a_vv = self.pan
-            b0, b_u, b_v, b_uu, b_uv, b_vv = self.tilt
-            uu = u * u
-            vv = v * v
-            uv = u * v
-            pan = a0 + (a_u * u + a_v * v + a_uu * uu + a_uv * uv + a_vv * vv)
-            tilt = b0 + (b_u * u + b_v * v + b_uu * uu + b_uv * uv + b_vv * vv)
-            return pan, tilt
+        if len(self.pan) == len(self.tilt) and len(self.pan) in (6, 10):
+            features = [1.0, u, v, u * u, u * v, v * v]
+            if len(self.pan) == 10:
+                features.extend([u * u * u, u * u * v, u * v * v, v * v * v])
+            pan = sum(coef * feature for coef, feature in zip(self.pan, features))
+            tilt = sum(coef * feature for coef, feature in zip(self.tilt, features))
+            return float(pan), float(tilt)
 
         raise ValueError(
             f"Unexpected coefficient lengths: pan={len(self.pan)}, tilt={len(self.tilt)}"
@@ -114,8 +106,10 @@ class LinearAimer:
         if not X_base:
             return
 
-        # Polynomial features (degree=2): [u, v, u^2, u*v, v^2]
-        poly = PolynomialFeatures(degree=2, include_bias=False)
+        # Once enough observations exist, cubic terms capture lens and linkage
+        # non-linearity that a four-corner or quadratic mapping cannot.
+        degree = 3 if len(X_base) >= 20 else 2
+        poly = PolynomialFeatures(degree=degree, include_bias=False)
         X = poly.fit_transform(X_base)
 
         reg_pan = HuberRegressor(epsilon=1.35, alpha=1e-4, max_iter=1000)
@@ -123,17 +117,18 @@ class LinearAimer:
         reg_pan.fit(X, y_pan, sample_weight=weights)
         reg_tilt.fit(X, y_tilt, sample_weight=weights)
 
-        # Store as [intercept, coef_u, coef_v, coef_u2, coef_uv, coef_v2]
-        # PolynomialFeatures order for 2 inputs with include_bias=False is: [u, v, u^2, u*v, v^2]
+        # PolynomialFeatures order is:
+        # degree 2: [u, v, u^2, u*v, v^2]
+        # degree 3 adds [u^3, u^2*v, u*v^2, v^3].
         pan_coeffs = [float(reg_pan.intercept_)] + [float(c) for c in reg_pan.coef_.tolist()]
         tilt_coeffs = [float(reg_tilt.intercept_)] + [float(c) for c in reg_tilt.coef_.tolist()]
 
-        # Ensure expected length (6). If underdetermined, pad with zeros.
-        while len(pan_coeffs) < 6:
+        expected_length = 10 if degree == 3 else 6
+        while len(pan_coeffs) < expected_length:
             pan_coeffs.append(0.0)
-        while len(tilt_coeffs) < 6:
+        while len(tilt_coeffs) < expected_length:
             tilt_coeffs.append(0.0)
 
-        self.pan = pan_coeffs[:6]
-        self.tilt = tilt_coeffs[:6]
+        self.pan = pan_coeffs[:expected_length]
+        self.tilt = tilt_coeffs[:expected_length]
         self.save()

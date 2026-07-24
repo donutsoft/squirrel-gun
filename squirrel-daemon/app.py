@@ -6,6 +6,18 @@ from hardware_controllers.WaterController import WaterController
 from pathlib import Path
 from db import ClickStore
 from aim_model import LinearAimer
+from calibration_optimizer import (
+    has_converged,
+    has_monotonic_axes,
+    has_screen_coverage,
+    is_inconsistent_observation,
+    is_usable_checkpoint,
+    prioritize_targets,
+    screen_targets,
+    split_error_outliers,
+    summarize_round,
+    target_error_px,
+)
 from laser_dot_detector import LaserDotOptions, detect_laser_dot
 from event_bus import EventBus
 from recording_labeler import LabelingInProgress, RecordingLabelService
@@ -16,7 +28,6 @@ import math
 import threading
 import json
 import html
-import random
 import cv2  # type: ignore
 from typing import Optional
 
@@ -112,75 +123,25 @@ def _build_aimer(min_rows: int = 10) -> tuple[LinearAimer, int, bool]:
     Returns (model, n_rows, trained) where trained indicates whether
     the model was fitted from data (True) or is a default (False).
     """
-    rows = store.list(limit=5000)
+    rows = store.list(limit=1000)
+    calibration_min_id = store.get_setting('aim.calibration_min_id', None)
+    if calibration_min_id is not None:
+        try:
+            min_id = int(calibration_min_id)
+            rows = [row for row in rows if int(row.get('id', 0)) >= min_id]
+        except (TypeError, ValueError):
+            raise ValueError("aim.calibration_min_id must be an integer")
     if len(rows) >= max(1, int(min_rows)):
         m = LinearAimer.default()
-        # If a motion zone is set, use its center as focus for higher local accuracy
-        focus = None
-        try:
-            z = store.get_setting('motion.zone', None)
-            if isinstance(z, dict):
-                x = float(z.get('x', 0.5))
-                y = float(z.get('y', 0.5))
-                w = float(z.get('w', 0.0))
-                h = float(z.get('h', 0.0))
-                # Use center of zone; values are expected normalized 0..1
-                focus = (x + max(0.0, w) * 0.5, y + max(0.0, h) * 0.5)
-                # Clamp focus to bounds
-                fx = 0.0 if focus[0] < 0.0 else 1.0 if focus[0] > 1.0 else focus[0]
-                fy = 0.0 if focus[1] < 0.0 else 1.0 if focus[1] > 1.0 else focus[1]
-                focus = (fx, fy)
-        except Exception:
-            focus = None
-        # Use a modest sigma so points near the focus dominate (higher accuracy in small area)
-        m.fit_from_clicks(rows, focus=focus, sigma=0.2)
+        # Automatic calibration is scored over the entire image, so runtime
+        # aiming must use the same unweighted, screen-wide fit.
+        m.fit_from_clicks(rows)
         return m, len(rows), True
     return LinearAimer.default(), len(rows), False
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return hi if v > hi else lo if v < lo else v
-
-
-def _parse_degree_corner(data: dict, name: str) -> tuple[float, float]:
-    raw = data.get(name)
-    if not isinstance(raw, dict):
-        raise ValueError(f"{name} must include pan and tilt")
-    pan = float(raw.get("pan"))
-    tilt = float(raw.get("tilt"))
-    if not math.isfinite(pan) or not math.isfinite(tilt):
-        raise ValueError(f"{name} pan/tilt must be finite numbers")
-    pan = _clamp(pan, 0.0, float(getattr(pantilt, 'PAN_MAX_DEG', 270)))
-    tilt = _clamp(tilt, 0.0, float(getattr(pantilt, 'TILT_MAX_DEG', 180)))
-    return pan, tilt
-
-
-def _interpolate_calibration_grid(
-    *,
-    top_left: tuple[float, float],
-    top_right: tuple[float, float],
-    bottom_left: tuple[float, float],
-    bottom_right: tuple[float, float],
-    rows: int,
-    cols: int,
-) -> list[dict]:
-    points: list[dict] = []
-    for row in range(rows):
-        v = row / max(1, rows - 1)
-        left_pan = top_left[0] + ((bottom_left[0] - top_left[0]) * v)
-        left_tilt = top_left[1] + ((bottom_left[1] - top_left[1]) * v)
-        right_pan = top_right[0] + ((bottom_right[0] - top_right[0]) * v)
-        right_tilt = top_right[1] + ((bottom_right[1] - top_right[1]) * v)
-        col_range = range(cols - 1, -1, -1) if row % 2 else range(cols)
-        for col in col_range:
-            u = col / max(1, cols - 1)
-            points.append({
-                "row": row,
-                "col": col,
-                "pan": left_pan + ((right_pan - left_pan) * u),
-                "tilt": left_tilt + ((right_tilt - left_tilt) * u),
-            })
-    return points
 
 
 def _calibration_debug_url(path: Path) -> str:
@@ -208,18 +169,22 @@ def _write_calibration_debug_report(run_dir: Path, *, run_id: str, saved: list[d
         "button:disabled{background:#4b5563;cursor:not-allowed}",
         "</style></head><body>",
         f"<h1>Calibration Debug {html.escape(run_id)}</h1>",
-        f"<p class=\"meta\">Saved {len(saved)} point(s), missed {len(misses)} point(s).</p>",
+        f"<p class=\"meta\">Measured {len(saved)} point(s), missed {len(misses)} point(s).</p>",
         "<div class=\"grid\">",
     ]
     for row in rows:
         db_id = row.get("id")
-        status = "saved" if db_id is not None else "miss"
-        reason = row.get("reason", "saved")
+        status = "saved" if row.get("dot") is not None and row.get("reason") is None else "miss"
+        reason = row.get("reason", "measured")
         pan = float(row.get("pan", 0.0))
         tilt = float(row.get("tilt", 0.0))
         idx = int(row.get("index", 0))
         r = row.get("row", "")
         c = row.get("col", "")
+        round_number = row.get("round")
+        target_u = row.get("target_u")
+        target_v = row.get("target_v")
+        error_px = row.get("error_px")
         debug = row.get("debug", {}) if isinstance(row.get("debug"), dict) else {}
         dot = row.get("dot")
         dot_json = html.escape(json.dumps(dot, sort_keys=True)) if dot is not None else "null"
@@ -234,7 +199,24 @@ def _write_calibration_debug_report(run_dir: Path, *, run_id: str, saved: list[d
             f"<div class=\"meta {status}\">{html.escape(str(reason))}</div>",
             f"<div class=\"meta\">pan {pan:.2f}, tilt {tilt:.2f}; dot <code>{dot_json}</code></div>",
         ])
-        for label, key in (("Laser off", "off_url"), ("Laser on", "on_url"), ("Annotated", "annotated_url"), ("Mask", "mask_url"), ("Score", "score_url")):
+        if round_number is not None:
+            target_text = ""
+            if target_u is not None and target_v is not None:
+                target_text = f"; target ({float(target_u):.3f}, {float(target_v):.3f})"
+            error_text = f"; error {float(error_px):.1f}px" if error_px is not None else ""
+            parts.append(
+                f"<div class=\"meta\">round {html.escape(str(round_number))}"
+                f"{html.escape(target_text)}{html.escape(error_text)}</div>"
+            )
+        for label, key in (
+            ("Laser off 1", "off_url"),
+            ("Laser on 1", "on_url"),
+            ("Laser off 2", "verify_off_url"),
+            ("Laser on 2", "verify_on_url"),
+            ("Annotated", "annotated_url"),
+            ("Mask", "mask_url"),
+            ("Score", "score_url"),
+        ):
             url = debug.get(key)
             if not url:
                 continue
@@ -338,17 +320,23 @@ def _capture_calibration_sample(
     laser_settle_sec: float,
     capture_timeout_sec: float,
     discard_frames: int,
+    expected_uv: Optional[tuple[float, float]] = None,
+    max_expected_distance_fraction: Optional[float] = None,
 ) -> tuple[dict, dict]:
     global current
 
     off_path = run_dir / f"{prefix}_off.jpg"
     on_path = run_dir / f"{prefix}_on.jpg"
+    verify_off_path = run_dir / f"{prefix}_verify_off.jpg"
+    verify_on_path = run_dir / f"{prefix}_verify_on.jpg"
     annotated_path = run_dir / f"{prefix}_annotated.jpg"
     mask_path = run_dir / f"{prefix}_mask.png"
     score_path = run_dir / f"{prefix}_score.png"
     debug = {
         "off_url": _calibration_debug_url(off_path),
         "on_url": _calibration_debug_url(on_path),
+        "verify_off_url": _calibration_debug_url(verify_off_path),
+        "verify_on_url": _calibration_debug_url(verify_on_path),
         "annotated_url": _calibration_debug_url(annotated_path),
         "mask_url": _calibration_debug_url(mask_path),
         "score_url": _calibration_debug_url(score_path),
@@ -383,7 +371,30 @@ def _capture_calibration_sample(
         discard_frames=discard_frames,
     )
 
-    if not off_path.exists() or not on_path.exists():
+    laser.turn_off()
+    if laser_settle_sec > 0:
+        time.sleep(laser_settle_sec)
+    webcam.capture_after_discard(
+        verify_off_path,
+        timeout_sec=capture_timeout_sec,
+        raw=True,
+        discard_frames=discard_frames,
+    )
+
+    laser.turn_on()
+    if laser_settle_sec > 0:
+        time.sleep(laser_settle_sec)
+    webcam.capture_after_discard(
+        verify_on_path,
+        timeout_sec=capture_timeout_sec,
+        raw=True,
+        discard_frames=discard_frames,
+    )
+
+    if not all(
+        path.exists()
+        for path in (off_path, on_path, verify_off_path, verify_on_path)
+    ):
         return {
             "dot": None,
             "reason": "capture failed: image file not written",
@@ -400,6 +411,10 @@ def _capture_calibration_sample(
             "mask": mask_path,
             "score": score_path,
         },
+        expected_uv=expected_uv,
+        max_expected_distance_fraction=max_expected_distance_fraction,
+        verification_on_image_path=verify_on_path,
+        verification_off_image_path=verify_off_path,
     )
     return detected, debug
 
@@ -1227,44 +1242,51 @@ def automatic_calibration():
 
     data = request.get_json(silent=True) or {}
     try:
-        top_left = _parse_degree_corner(data, "top_left")
-        top_right = _parse_degree_corner(data, "top_right")
-        bottom_left = _parse_degree_corner(data, "bottom_left")
-        bottom_right = _parse_degree_corner(data, "bottom_right")
         rows = max(2, min(25, int(data.get("rows", 5))))
         cols = max(2, min(25, int(data.get("cols", 5))))
+        max_rounds = max(1, min(10, int(data.get("max_rounds", 6))))
+        min_rounds = max(1, min(max_rounds, int(data.get("min_rounds", 2))))
+        screen_margin = max(0.05, min(0.25, float(data.get("screen_margin", 0.08))))
+        target_rmse_px = max(1.0, min(250.0, float(data.get("target_rmse_px", 12.0))))
+        target_max_error_px = max(
+            target_rmse_px,
+            min(500.0, float(data.get("target_max_error_px", 30.0))),
+        )
+        min_success_rate = max(0.5, min(1.0, float(data.get("min_success_rate", 0.9))))
+        max_observation_error_fraction = max(
+            0.1,
+            min(1.0, float(data.get("max_observation_error_fraction", 0.4))),
+        )
         move_settle_sec = max(0.0, min(5.0, float(data.get("move_settle_sec", 0.35))))
         laser_settle_sec = max(0.0, min(5.0, float(data.get("laser_settle_sec", 0.5))))
         capture_timeout_sec = max(0.1, min(5.0, float(data.get("capture_timeout_sec", 2.0))))
         discard_frames = max(0, min(15, int(data.get("discard_frames", 4))))
         edge_margin_px = max(0.0, min(200.0, float(data.get("edge_margin_px", 20.0))))
         edge_margin_frac = max(0.0, min(0.25, float(data.get("edge_margin_frac", 0.03))))
-        phase2_count = max(0, min(50, int(data.get("phase2_count", 10))))
-
         options = _parse_laser_dot_options(data)
     except (TypeError, ValueError) as e:
         _calibration_lock.release()
         return jsonify({"error": str(e)}), 400
 
-    points = _interpolate_calibration_grid(
-        top_left=top_left,
-        top_right=top_right,
-        bottom_left=bottom_left,
-        bottom_right=bottom_right,
-        rows=rows,
-        cols=cols,
-    )
+    targets = screen_targets(rows, cols, screen_margin)
     original_current = current
     original_follow = bool(globals().get("follow_motion_enabled", False))
-    original_laser_enabled = bool(globals().get("laser_enabled", True))
+    original_laser_enabled = bool(globals().get("laser_enabled", False))
     saved: list[dict] = []
     misses: list[dict] = []
-    run_ts = time.time()
-    run_id = time.strftime("cal_%Y%m%d_%H%M%S", time.localtime(run_ts)) + f"_{int((run_ts % 1) * 1000):03d}"
-    run_dir = Path(__file__).parent / "static" / "calibration_runs" / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    session_rows: list[dict] = []
+    metrics_history: list[dict] = []
+    previous_errors: dict[tuple[float, float], float] = {}
+    run_id, run_dir = _new_calibration_run("cal")
+    model, bootstrap_rows, bootstrap_trained = _build_aimer()
+    activation_rows: list[dict] = []
+    best_activation_rows: list[dict] = []
+    best_checkpoint_metrics: Optional[dict] = None
+    best_checkpoint_rmse = float("inf")
+    activated_usable_checkpoint = False
+    converged = False
+    attempt_index = 0
 
-    trained_p2 = False
     try:
         follow_motion_enabled = False
         try:
@@ -1272,163 +1294,183 @@ def automatic_calibration():
         except Exception:
             pass
 
-        # Phase 1: Degree Bounds Sweep
-        for idx, point in enumerate(points):
-            pan = float(point["pan"])
-            tilt = float(point["tilt"])
-            prefix = f"p1_{idx:03d}_r{int(point['row']):02d}_c{int(point['col']):02d}"
+        for round_index in range(max_rounds):
+            round_number = round_index + 1
+            errors: list[float] = []
+            round_rows: list[dict] = []
+            round_error_by_target: dict[tuple[float, float], float] = {}
+            ordered_targets = prioritize_targets(targets, previous_errors, round_index)
+            evaluated_model_monotonic = has_monotonic_axes(model)
 
-            detected, debug = _capture_calibration_sample(
-                run_dir=run_dir,
-                prefix=prefix,
-                pan=pan,
-                tilt=tilt,
-                options=options,
-                move_settle_sec=move_settle_sec,
-                laser_settle_sec=laser_settle_sec,
-                capture_timeout_sec=capture_timeout_sec,
-                discard_frames=discard_frames,
-            )
+            for target_index, (u, v) in enumerate(ordered_targets):
+                pan, tilt = model.predict(u, v)
+                pan = _clamp(
+                    pan,
+                    float(getattr(pantilt, 'PAN_MIN_SAFE_DEG', 70)),
+                    float(getattr(pantilt, 'PAN_MAX_SAFE_DEG', 200)),
+                )
+                tilt = _clamp(
+                    tilt,
+                    float(getattr(pantilt, 'TILT_MIN_SAFE_DEG', 20)),
+                    float(getattr(pantilt, 'TILT_MAX_SAFE_DEG', 170)),
+                )
+                prefix = f"r{round_number:02d}_{target_index:03d}"
+                detected, debug = _capture_calibration_sample(
+                    run_dir=run_dir,
+                    prefix=prefix,
+                    pan=pan,
+                    tilt=tilt,
+                    options=options,
+                    move_settle_sec=move_settle_sec,
+                    laser_settle_sec=laser_settle_sec,
+                    capture_timeout_sec=capture_timeout_sec,
+                    discard_frames=discard_frames,
+                    expected_uv=(u, v),
+                    max_expected_distance_fraction=max_observation_error_fraction,
+                )
 
-            dot = detected.get("dot")
-            if dot is None:
-                misses.append({
-                    "index": idx,
-                    "phase": 1,
-                    "row": point["row"],
-                    "col": point["col"],
+                common = {
+                    "index": attempt_index,
+                    "round": round_number,
+                    "row": "target",
+                    "col": target_index,
+                    "target_u": u,
+                    "target_v": v,
                     "pan": pan,
                     "tilt": tilt,
-                    "reason": "dot not found",
                     "debug": debug,
                     "scene": detected.get("scene"),
                     "method": detected.get("method"),
-                })
-                continue
-
-            img_w = float(detected["image_width"])
-            img_h = float(detected["image_height"])
-            reason, effective_edge_margin = _dot_edge_reason(dot, img_w, img_h, edge_margin_px, edge_margin_frac)
-            if reason:
-                misses.append({
-                    "index": idx,
-                    "phase": 1,
-                    "row": point["row"],
-                    "col": point["col"],
-                    "pan": pan,
-                    "tilt": tilt,
-                    "reason": reason,
-                    "dot": dot,
-                    "debug": debug,
-                    "edge_margin_px": effective_edge_margin,
-                    "scene": detected.get("scene"),
-                    "method": detected.get("method"),
-                })
-                continue
-
-            x = float(dot["cx"])
-            y = float(dot["cy"])
-            click_id = store.record(pan, tilt, x, y, img_w, img_h)
-            saved.append({
-                "id": click_id,
-                "index": idx,
-                "phase": 1,
-                "row": point["row"],
-                "col": point["col"],
-                "pan": pan,
-                "tilt": tilt,
-                "x": x,
-                "y": y,
-                "width": img_w,
-                "height": img_h,
-                "dot": dot,
-                "debug": debug,
-                "scene": detected.get("scene"),
-                "method": detected.get("method"),
-            })
-
-        # Phase 2: Reverse-Mapping Random Point Validation
-        if phase2_count > 0:
-            # Re-train model from Phase 1 data
-            aimer, _, trained_p2 = _build_aimer()
-            if trained_p2:
-                for idx_p2 in range(phase2_count):
-                    # Random normalized coords, slightly inset to avoid edge issues
-                    u = random.uniform(0.1, 0.9)
-                    v = random.uniform(0.1, 0.9)
-                    pan, tilt = aimer.predict(u, v)
-                    pan = _clamp(pan, 0.0, float(getattr(pantilt, 'PAN_MAX_DEG', 270)))
-                    tilt = _clamp(tilt, 0.0, float(getattr(pantilt, 'TILT_MAX_DEG', 180)))
-
-                    prefix = f"p2_{idx_p2:03d}"
-                    detected, debug = _capture_calibration_sample(
-                        run_dir=run_dir,
-                        prefix=prefix,
-                        pan=pan,
-                        tilt=tilt,
-                        options=options,
-                        move_settle_sec=move_settle_sec,
-                        laser_settle_sec=laser_settle_sec,
-                        capture_timeout_sec=capture_timeout_sec,
-                        discard_frames=discard_frames,
-                    )
-
-                    dot = detected.get("dot")
-                    if dot is None:
-                        misses.append({
-                            "index": len(points) + idx_p2,
-                            "phase": 2,
-                            "row": "p2",
-                            "col": idx_p2,
-                            "pan": pan,
-                            "tilt": tilt,
-                            "reason": f"dot not found for image target ({u:.2f}, {v:.2f})",
-                            "debug": debug,
-                            "scene": detected.get("scene"),
-                            "method": detected.get("method"),
-                        })
-                        continue
-
-                    img_w = float(detected["image_width"])
-                    img_h = float(detected["image_height"])
-                    reason, effective_edge_margin = _dot_edge_reason(dot, img_w, img_h, edge_margin_px, edge_margin_frac)
-                    if reason:
-                        misses.append({
-                            "index": len(points) + idx_p2,
-                            "phase": 2,
-                            "row": "p2",
-                            "col": idx_p2,
-                            "pan": pan,
-                            "tilt": tilt,
-                            "reason": reason,
-                            "dot": dot,
-                            "debug": debug,
-                            "edge_margin_px": effective_edge_margin,
-                            "scene": detected.get("scene"),
-                            "method": detected.get("method"),
-                        })
-                        continue
-
-                    x = float(dot["cx"])
-                    y = float(dot["cy"])
-                    click_id = store.record(pan, tilt, x, y, img_w, img_h)
-                    saved.append({
-                        "id": click_id,
-                        "index": len(points) + idx_p2,
-                        "phase": 2,
-                        "row": "p2",
-                        "col": idx_p2,
-                        "pan": pan,
-                        "tilt": tilt,
-                        "x": x,
-                        "y": y,
-                        "width": img_w,
-                        "height": img_h,
-                        "dot": dot,
-                        "debug": debug,
-                        "scene": detected.get("scene"),
-                        "method": detected.get("method"),
+                }
+                attempt_index += 1
+                dot = detected.get("dot")
+                if dot is None:
+                    misses.append({
+                        **common,
+                        "reason": detected.get("reason") or "dot not found",
                     })
+                    round_error_by_target[(u, v)] = float("inf")
+                    continue
+
+                img_w = float(detected["image_width"])
+                img_h = float(detected["image_height"])
+                reason, effective_edge_margin = _dot_edge_reason(
+                    dot,
+                    img_w,
+                    img_h,
+                    edge_margin_px,
+                    edge_margin_frac,
+                )
+                if reason:
+                    misses.append({
+                        **common,
+                        "reason": reason,
+                        "dot": dot,
+                        "edge_margin_px": effective_edge_margin,
+                    })
+                    round_error_by_target[(u, v)] = float("inf")
+                    continue
+
+                x = float(dot["cx"])
+                y = float(dot["cy"])
+                error_px = target_error_px(
+                    (u, v),
+                    actual_x=x,
+                    actual_y=y,
+                    image_width=img_w,
+                    image_height=img_h,
+                )
+                saved_row = {
+                    **common,
+                    "x": x,
+                    "y": y,
+                    "width": img_w,
+                    "height": img_h,
+                    "error_px": error_px,
+                    "dot": dot,
+                }
+                training_row = {
+                    "pan": pan,
+                    "tilt": tilt,
+                    "x_px": x,
+                    "y_px": y,
+                    "img_w": img_w,
+                    "img_h": img_h,
+                    "error_px": error_px,
+                    "_saved_row": saved_row,
+                }
+                if is_inconsistent_observation(training_row, session_rows + round_rows):
+                    misses.append({
+                        **common,
+                        "reason": (
+                            "laser detection inconsistent: nearly the same image location "
+                            "was observed at substantially different angles"
+                        ),
+                        "dot": dot,
+                    })
+                    round_error_by_target[(u, v)] = float("inf")
+                    continue
+
+                round_rows.append(training_row)
+                round_error_by_target[(u, v)] = error_px
+
+            accepted_rows, outlier_rows, outlier_limit = split_error_outliers(round_rows)
+            for row in accepted_rows:
+                saved.append(row["_saved_row"])
+            for row in outlier_rows:
+                saved_row = row["_saved_row"]
+                misses.append({
+                    **saved_row,
+                    "reason": (
+                        f"laser detection rejected as round error outlier "
+                        f"({float(row['error_px']):.1f}px > {float(outlier_limit):.1f}px)"
+                    ),
+                })
+                round_error_by_target[
+                    (float(saved_row["target_u"]), float(saved_row["target_v"]))
+                ] = float("inf")
+            round_rows = accepted_rows
+            errors = [float(row["error_px"]) for row in round_rows]
+            metrics = summarize_round(errors, len(targets))
+            metrics_history.append({
+                "round": round_number,
+                "model_monotonic": evaluated_model_monotonic,
+                "error_outlier_limit_px": outlier_limit,
+                "error_outliers": len(outlier_rows),
+                **metrics.to_dict(),
+            })
+            previous_errors = round_error_by_target
+
+            # This round validates the model trained only on earlier rounds.
+            # Its own observations are not promoted until a later full-screen
+            # round proves that fitted model accurate and monotonic.
+            if round_number >= min_rounds and has_converged(
+                metrics,
+                target_rmse_px=target_rmse_px,
+                target_max_error_px=target_max_error_px,
+                min_success_rate=min_success_rate,
+            ) and evaluated_model_monotonic and len(session_rows) >= 10:
+                converged = True
+                activation_rows = list(session_rows)
+                break
+
+            if (
+                evaluated_model_monotonic
+                and len(session_rows) >= 10
+                and is_usable_checkpoint(metrics)
+                and has_screen_coverage(
+                    [row["_saved_row"] for row in round_rows]
+                )
+                and float(metrics.rmse_px) < best_checkpoint_rmse
+            ):
+                best_checkpoint_rmse = float(metrics.rmse_px)
+                best_activation_rows = list(session_rows)
+                best_checkpoint_metrics = dict(metrics_history[-1])
+
+            session_rows.extend(round_rows)
+            if len(session_rows) >= 10:
+                model = LinearAimer.default()
+                model.fit_from_clicks(session_rows)
 
     finally:
         try:
@@ -1446,20 +1488,74 @@ def automatic_calibration():
         follow_motion_enabled = original_follow
         _calibration_lock.release()
 
+    activated_count = 0
+    if not converged and not bootstrap_trained and best_activation_rows:
+        activation_rows = best_activation_rows
+        activated_usable_checkpoint = True
+    if converged:
+        activation_status = "converged"
+        activation_metrics = metrics_history[-1] if metrics_history else None
+    elif activated_usable_checkpoint:
+        activation_status = "usable_checkpoint"
+        activation_metrics = best_checkpoint_metrics
+    else:
+        activation_status = "previous_calibration_kept"
+        activation_metrics = None
+
+    if activation_rows:
+        click_ids = store.record_many(activation_rows)
+        for row, click_id in zip(activation_rows, click_ids):
+            row["_saved_row"]["id"] = click_id
+        activated_count = len(click_ids)
+        calibration_min_id = min(click_ids)
+        store.set_setting('aim.calibration_min_id', calibration_min_id)
+    store.set_setting('aim.calibration.last_result', {
+        "run_id": run_id,
+        "converged": converged,
+        "activation_status": activation_status,
+        "activation_metrics": activation_metrics,
+        "rounds_completed": len(metrics_history),
+        "activated_count": activated_count,
+        "metrics": metrics_history[-1] if metrics_history else None,
+    })
+
     report_path = _write_calibration_debug_report(run_dir, run_id=run_id, saved=saved, misses=misses)
     report_url = _calibration_debug_url(report_path)
 
     return jsonify({
         "status": "ok",
-        "requested": len(points) + (phase2_count if trained_p2 else 0),
-        "saved_count": len(saved),
+        "converged": converged,
+        "stop_reason": (
+            "target_error_reached"
+            if converged
+            else "best_validated_model_activated"
+            if activated_usable_checkpoint
+            else "max_rounds_reached"
+        ),
+        "requested": attempt_index,
+        "saved_count": activated_count,
+        "measured_count": len(saved),
+        "activated_count": activated_count,
+        "activation_status": activation_status,
+        "activation_metrics": activation_metrics,
+        "kept_previous_calibration": not bool(activation_rows),
         "miss_count": len(misses),
         "debug_run_id": run_id,
         "debug_report_url": report_url,
         "debug_dir_url": _calibration_debug_url(run_dir),
         "rows": rows,
         "cols": cols,
-        "phase2_count": phase2_count if trained_p2 else 0,
+        "rounds_completed": len(metrics_history),
+        "max_rounds": max_rounds,
+        "target_rmse_px": target_rmse_px,
+        "target_max_error_px": target_max_error_px,
+        "min_success_rate": min_success_rate,
+        "max_observation_error_fraction": max_observation_error_fraction,
+        "screen_margin": screen_margin,
+        "metrics": metrics_history,
+        "final_metrics": metrics_history[-1] if metrics_history else None,
+        "bootstrap_rows": bootstrap_rows,
+        "bootstrap_trained": bootstrap_trained,
         "edge_margin_px": edge_margin_px,
         "edge_margin_frac": edge_margin_frac,
         "laser_settle_sec": laser_settle_sec,
@@ -1687,25 +1783,8 @@ def prune_clicks():
             "candidates": 0,
         })
 
-    # Mirror training focus used by _build_aimer so residuals stay comparable
-    focus = None
-    try:
-        z = store.get_setting('motion.zone', None)
-        if isinstance(z, dict):
-            x = float(z.get('x', 0.5))
-            y = float(z.get('y', 0.5))
-            w = float(z.get('w', 0.0))
-            h = float(z.get('h', 0.0))
-            fx = x + max(0.0, w) * 0.5
-            fy = y + max(0.0, h) * 0.5
-            fx = 0.0 if fx < 0.0 else 1.0 if fx > 1.0 else fx
-            fy = 0.0 if fy < 0.0 else 1.0 if fy > 1.0 else fy
-            focus = (fx, fy)
-    except Exception:
-        focus = None
-
     model = LinearAimer.default()
-    model.fit_from_clicks(rows, focus=focus, sigma=0.2)
+    model.fit_from_clicks(rows)
 
     evaluated = 0
     outlier_ids: list[int] = []
@@ -1778,6 +1857,8 @@ def set_laser():
 @app.post('/api/clicks/clear')
 def clear_clicks():
     deleted = store.clear()
+    store.set_setting('aim.calibration_min_id', None)
+    store.set_setting('aim.calibration.last_result', None)
     return jsonify({"status": "ok", "deleted": deleted})
 
 
@@ -1792,7 +1873,13 @@ def train_model():
     # Stateless: build and return a fresh model from DB without persisting
     model, n_rows, trained = _build_aimer()
     if not trained:
-        return jsonify({"error": "not enough clicks to train (need >= 10)", "n_rows": n_rows}), 400
+        return jsonify({
+            "error": (
+                "not enough calibration observations to train (need >= 10); "
+                "run Automatic Calibration first"
+            ),
+            "n_rows": n_rows,
+        }), 400
     return jsonify({"status": "ok", "model": model.to_dict(), "n_rows": n_rows, "trained": trained})
 
 
