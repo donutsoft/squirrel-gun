@@ -5,14 +5,28 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Training Frames</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <style>
+      .training-card { width:min(1200px, 96vw); }
+      .review-layout { display:grid; grid-template-columns:minmax(0, 1fr) 250px; gap:16px; align-items:start; }
+      .canvas-shell { display:flex; justify-content:center; min-height:320px; background:#000; border-radius:10px; overflow:hidden; }
+      #positiveCanvas { display:block; width:100%; height:auto; align-self:center; cursor:default; touch-action:none; }
+      #positiveCanvas.drawing { cursor:crosshair; }
+      .review-controls { display:flex; flex-wrap:wrap; gap:8px; }
+      .review-controls button { flex:1 1 105px; }
+      .frame-name { font-weight:600; overflow-wrap:anywhere; }
+      .status-line { min-height:1.4em; }
+      @media (max-width: 800px) {
+        .review-layout { grid-template-columns:1fr; }
+      }
+    </style>
   </head>
   <body>
-    <div class="card">
+    <div class="card training-card">
       <header>
         <img src="{{ url_for('static', filename='logo.png') }}" alt="Sad Squirrel Logo" />
         <div>
           <h1>Training Frames</h1>
-          <div class="sub">Review mined frames and remove unsuitable training examples.</div>
+          <div class="sub">Review mined frames, correct their boxes, or remove unsuitable examples.</div>
           <div style="margin-top:6px; display:flex; gap:12px; flex-wrap:wrap;">
             <a href="/recordings" style="text-decoration:none;">⟵ Recordings</a>
             <a href="/" style="text-decoration:none;">Control</a>
@@ -26,46 +40,320 @@
         <div class="hint" style="overflow-wrap:anywhere;">Bounding boxes: {{ bbox_path }}</div>
       </section>
 
-      {% for kind, frames in [('positives', positives), ('negatives', negatives)] %}
       <section class="panel" style="margin-top:16px;">
-        <h2>{{ kind|capitalize }} ({{ frames|length }})</h2>
-        {% if frames %}
+        <h2>True Positives (<span id="positiveCount">{{ positives|length }}</span>)</h2>
+        <div id="positiveEmpty" class="hint" {% if positives %}hidden{% endif %}>No positives have been mined yet.</div>
+        <div id="positiveReviewer" class="review-layout" {% if not positives %}hidden{% endif %}>
+          <div class="canvas-shell">
+            <canvas id="positiveCanvas" width="320" height="320" aria-label="Positive training frame with its bounding box"></canvas>
+          </div>
+          <aside class="panel">
+            <div id="positivePosition" class="hint" style="margin-top:0;"></div>
+            <div id="positiveName" class="frame-name" style="margin-top:6px;"></div>
+            <div id="positiveConfidence" class="hint"></div>
+            <div id="positiveBoxes" class="hint"></div>
+            <div id="positiveSource" class="hint" style="overflow-wrap:anywhere;"></div>
+            <div id="positiveStatus" class="hint status-line" role="status"></div>
+
+            <div class="review-controls" style="margin-top:12px;">
+              <button id="previousPositive">Previous</button>
+              <button id="nextPositive">Next</button>
+            </div>
+            <div class="review-controls" style="margin-top:8px;">
+              <button id="drawPositive" class="accent">Draw New Box</button>
+              <button id="clearPositive">Delete All Boxes</button>
+            </div>
+            <button id="deletePositive" class="danger" style="width:100%; margin-top:8px;">Delete Image</button>
+            <div class="hint">Drag on the image to draw a box. Saving a new box replaces every existing box for this image.</div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="panel" style="margin-top:16px;">
+        <h2>Negatives ({{ negatives|length }})</h2>
+        {% if negatives %}
         <div class="training-grid" style="display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:12px;">
-          {% for frame in frames %}
-          <article class="panel training-frame" style="padding:8px;" data-kind="{{ kind }}" data-name="{{ frame.name }}">
-            <a href="/training-frames/{{ kind }}/{{ frame.name }}" target="_blank" style="display:block;">
+          {% for frame in negatives %}
+          <article class="panel training-frame" style="padding:8px;" data-kind="negatives" data-name="{{ frame.name }}">
+            <a href="/training-frames/negatives/{{ frame.name }}" target="_blank" style="display:block;">
               <img
-                src="/training-frames/{{ kind }}/{{ frame.name }}"
+                src="/training-frames/negatives/{{ frame.name }}"
                 alt="{{ frame.name }}"
                 style="display:block; width:100%; aspect-ratio:1; object-fit:contain; background:#000; border-radius:8px;"
               />
             </a>
-            <div style="font-weight:600; font-size:13px; margin-top:7px; overflow-wrap:anywhere;">{{ frame.name }}</div>
+            <div class="frame-name" style="font-size:13px; margin-top:7px;">{{ frame.name }}</div>
             <div class="hint" style="margin-top:4px;">
               {{ (frame.size // 1024) }} KB • {{ frame.display_time }}
-              {% if kind == 'positives' %} • {{ frame.boxes|length }} box(es){% endif %}
               {% if frame.score is not none %} • confidence {{ '%.3f'|format(frame.score) }}{% endif %}
             </div>
             {% if frame.source_recording %}<div class="hint" style="margin-top:4px; overflow-wrap:anywhere;">Source: {{ frame.source_recording }}</div>{% endif %}
-            {% if frame.boxes %}
-            <div class="hint" style="margin-top:4px;">
-              {% for box in frame.boxes %}
-                [{{ box.xmin }}, {{ box.ymin }}, {{ box.xmax }}, {{ box.ymax }}]{% if not loop.last %}<br>{% endif %}
-              {% endfor %}
-            </div>
-            {% endif %}
-            <button class="danger btn-delete-frame" style="margin-top:8px;">Delete Frame</button>
+            <button class="danger btn-delete-frame" style="margin-top:8px;">Delete Image</button>
           </article>
           {% endfor %}
         </div>
         {% else %}
-        <div class="hint">No {{ kind }} have been mined yet.</div>
+        <div class="hint">No negatives have been mined yet.</div>
         {% endif %}
       </section>
-      {% endfor %}
     </div>
 
     <script>
+      const positiveFrames = {{ positives|tojson }};
+      const canvas = document.getElementById('positiveCanvas');
+      const context = canvas.getContext('2d');
+      const reviewer = document.getElementById('positiveReviewer');
+      const emptyState = document.getElementById('positiveEmpty');
+      const countNode = document.getElementById('positiveCount');
+      const positionNode = document.getElementById('positivePosition');
+      const nameNode = document.getElementById('positiveName');
+      const confidenceNode = document.getElementById('positiveConfidence');
+      const boxesNode = document.getElementById('positiveBoxes');
+      const sourceNode = document.getElementById('positiveSource');
+      const statusNode = document.getElementById('positiveStatus');
+      const previousButton = document.getElementById('previousPositive');
+      const nextButton = document.getElementById('nextPositive');
+      const drawButton = document.getElementById('drawPositive');
+      const clearButton = document.getElementById('clearPositive');
+      const deleteButton = document.getElementById('deletePositive');
+      const image = new Image();
+      let positiveIndex = 0;
+      let drawing = false;
+      let dragStart = null;
+      let draftBox = null;
+      let imageLoaded = false;
+
+      function currentFrame() {
+        return positiveFrames[positiveIndex] || null;
+      }
+
+      function numberBox(box) {
+        return {
+          xmin: Number(box.xmin),
+          ymin: Number(box.ymin),
+          xmax: Number(box.xmax),
+          ymax: Number(box.ymax),
+        };
+      }
+
+      function confidenceText(frame) {
+        if (frame?.score === null || frame?.score === undefined) return 'Detector confidence unavailable';
+        const score = Number(frame.score);
+        return `Detector confidence: ${(score * 100).toFixed(1)}% (${score.toFixed(3)})`;
+      }
+
+      function drawBox(box, color, label) {
+        const parsed = numberBox(box);
+        const lineWidth = Math.max(2, Math.round(Math.min(canvas.width, canvas.height) / 160));
+        context.lineWidth = lineWidth;
+        context.strokeStyle = color;
+        context.strokeRect(
+          parsed.xmin,
+          parsed.ymin,
+          parsed.xmax - parsed.xmin,
+          parsed.ymax - parsed.ymin,
+        );
+        if (label) {
+          const fontSize = Math.max(12, Math.round(Math.min(canvas.width, canvas.height) / 22));
+          context.font = `600 ${fontSize}px ui-sans-serif, system-ui, sans-serif`;
+          const padding = Math.max(4, Math.round(fontSize / 3));
+          const textWidth = context.measureText(label).width;
+          const labelY = Math.max(fontSize + padding * 2, parsed.ymin);
+          context.fillStyle = 'rgba(0, 0, 0, 0.78)';
+          context.fillRect(parsed.xmin, labelY - fontSize - padding * 2, textWidth + padding * 2, fontSize + padding * 2);
+          context.fillStyle = color;
+          context.fillText(label, parsed.xmin + padding, labelY - padding);
+        }
+      }
+
+      function renderCanvas() {
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        if (!imageLoaded) return;
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        const frame = currentFrame();
+        const label = frame?.score === null || frame?.score === undefined
+          ? 'rat'
+          : `rat ${(Number(frame.score) * 100).toFixed(1)}%`;
+        (frame?.boxes || []).forEach(box => drawBox(box, '#22c55e', label));
+        if (draftBox) drawBox(draftBox, '#60a5fa', 'new box');
+      }
+
+      function setBusy(busy) {
+        previousButton.disabled = busy || positiveIndex === 0;
+        nextButton.disabled = busy || positiveIndex >= positiveFrames.length - 1;
+        drawButton.disabled = busy;
+        clearButton.disabled = busy || !(currentFrame()?.boxes || []).length;
+        deleteButton.disabled = busy;
+      }
+
+      function renderFrame() {
+        countNode.textContent = positiveFrames.length;
+        const frame = currentFrame();
+        reviewer.hidden = !frame;
+        emptyState.hidden = Boolean(frame);
+        drawing = false;
+        dragStart = null;
+        draftBox = null;
+        canvas.classList.remove('drawing');
+        statusNode.textContent = '';
+        if (!frame) return;
+
+        positionNode.textContent = `Image ${positiveIndex + 1} of ${positiveFrames.length}`;
+        nameNode.textContent = frame.name;
+        confidenceNode.textContent = confidenceText(frame);
+        const boxCount = (frame.boxes || []).length;
+        boxesNode.textContent = boxCount === 1
+          ? '1 bounding box'
+          : `${boxCount} bounding boxes`;
+        sourceNode.textContent = frame.source_recording ? `Source: ${frame.source_recording}` : '';
+        setBusy(false);
+        imageLoaded = false;
+        renderCanvas();
+        image.src = `/training-frames/positives/${encodeURIComponent(frame.name)}`;
+      }
+
+      image.addEventListener('load', () => {
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+        imageLoaded = true;
+        renderCanvas();
+      });
+
+      image.addEventListener('error', () => {
+        imageLoaded = false;
+        statusNode.textContent = 'Could not load this image.';
+      });
+
+      async function saveBoundingBox(box) {
+        const frame = currentFrame();
+        if (!frame) return;
+        setBusy(true);
+        statusNode.textContent = box ? 'Saving bounding box…' : 'Deleting bounding box…';
+        try {
+          const response = await fetch('/api/training-frames/bbox', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: frame.name, box }),
+          });
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.error || response.statusText);
+          frame.boxes = result.box ? [result.box] : [];
+          draftBox = null;
+          drawing = false;
+          canvas.classList.remove('drawing');
+          boxesNode.textContent = result.box ? '1 bounding box' : '0 bounding boxes';
+          statusNode.textContent = result.box ? 'Bounding box saved.' : 'Bounding box deleted.';
+          renderCanvas();
+        } catch (error) {
+          statusNode.textContent = `Failed: ${error.message || error}`;
+          renderCanvas();
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      function canvasPoint(event) {
+        const rect = canvas.getBoundingClientRect();
+        return {
+          x: Math.max(0, Math.min(canvas.width, Math.round((event.clientX - rect.left) * canvas.width / rect.width))),
+          y: Math.max(0, Math.min(canvas.height, Math.round((event.clientY - rect.top) * canvas.height / rect.height))),
+        };
+      }
+
+      drawButton.addEventListener('click', () => {
+        if (!imageLoaded) return;
+        drawing = true;
+        dragStart = null;
+        draftBox = null;
+        canvas.classList.add('drawing');
+        statusNode.textContent = 'Drag across the squirrel to draw one new box.';
+        renderCanvas();
+      });
+
+      canvas.addEventListener('pointerdown', event => {
+        if (!drawing || !imageLoaded) return;
+        event.preventDefault();
+        canvas.setPointerCapture(event.pointerId);
+        dragStart = canvasPoint(event);
+        draftBox = { xmin: dragStart.x, ymin: dragStart.y, xmax: dragStart.x, ymax: dragStart.y };
+        renderCanvas();
+      });
+
+      canvas.addEventListener('pointermove', event => {
+        if (!drawing || !dragStart || !canvas.hasPointerCapture(event.pointerId)) return;
+        const point = canvasPoint(event);
+        draftBox = {
+          xmin: Math.min(dragStart.x, point.x),
+          ymin: Math.min(dragStart.y, point.y),
+          xmax: Math.max(dragStart.x, point.x),
+          ymax: Math.max(dragStart.y, point.y),
+        };
+        renderCanvas();
+      });
+
+      canvas.addEventListener('pointerup', async event => {
+        if (!drawing || !dragStart) return;
+        const point = canvasPoint(event);
+        canvas.releasePointerCapture(event.pointerId);
+        draftBox = {
+          xmin: Math.min(dragStart.x, point.x),
+          ymin: Math.min(dragStart.y, point.y),
+          xmax: Math.max(dragStart.x, point.x),
+          ymax: Math.max(dragStart.y, point.y),
+        };
+        dragStart = null;
+        if (draftBox.xmax - draftBox.xmin < 2 || draftBox.ymax - draftBox.ymin < 2) {
+          statusNode.textContent = 'The box is too small. Drag a larger rectangle.';
+          draftBox = null;
+          renderCanvas();
+          return;
+        }
+        await saveBoundingBox(draftBox);
+      });
+
+      clearButton.addEventListener('click', async () => {
+        const frame = currentFrame();
+        if (!frame || !(frame.boxes || []).length) return;
+        if (!confirm(`Delete every bounding box for ${frame.name}?`)) return;
+        await saveBoundingBox(null);
+      });
+
+      previousButton.addEventListener('click', () => {
+        if (positiveIndex > 0) {
+          positiveIndex -= 1;
+          renderFrame();
+        }
+      });
+
+      nextButton.addEventListener('click', () => {
+        if (positiveIndex < positiveFrames.length - 1) {
+          positiveIndex += 1;
+          renderFrame();
+        }
+      });
+
+      deleteButton.addEventListener('click', async () => {
+        const frame = currentFrame();
+        if (!frame || !confirm(`Delete ${frame.name}?`)) return;
+        setBusy(true);
+        statusNode.textContent = 'Deleting image…';
+        try {
+          const response = await fetch('/api/training-frames/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind: 'positives', name: frame.name }),
+          });
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.error || response.statusText);
+          positiveFrames.splice(positiveIndex, 1);
+          if (positiveIndex >= positiveFrames.length) positiveIndex = Math.max(0, positiveFrames.length - 1);
+          renderFrame();
+        } catch (error) {
+          statusNode.textContent = `Failed to delete image: ${error.message || error}`;
+          setBusy(false);
+        }
+      });
+
       document.querySelectorAll('.btn-delete-frame').forEach(button => {
         button.addEventListener('click', async () => {
           const card = button.closest('.training-frame');
@@ -83,11 +371,19 @@
             if (!response.ok) throw new Error(result.error || response.statusText);
             card.remove();
           } catch (error) {
-            alert(`Failed to delete frame: ${error}`);
+            alert(`Failed to delete frame: ${error.message || error}`);
             button.disabled = false;
           }
         });
       });
+
+      document.addEventListener('keydown', event => {
+        if (drawing || event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
+        if (event.key === 'ArrowLeft') previousButton.click();
+        if (event.key === 'ArrowRight') nextButton.click();
+      });
+
+      renderFrame();
     </script>
   </body>
 </html>

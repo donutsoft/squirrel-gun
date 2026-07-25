@@ -59,15 +59,17 @@ This document captures the working knowledge added while extending the project: 
   - POST `/api/recordings/clear` → deletes all `.mp4` files in the recordings folder.
   - POST `/api/recordings/label` with `{ name, label }` → queues `true_positive` or `false_positive` mining.
   - GET `/api/recordings/label/status?name=...` → reports queued/running/completed labeling progress.
-  - GET `/training-frames` → persistent positive/negative frame review UI.
+  - GET `/training-frames` → persistent positive/negative frame review UI. Positives use a large annotated canvas with detector confidence, previous/next navigation, image deletion, and one-box replacement drawing.
   - POST `/api/training-frames/delete` with `{ kind, name }` → deletes a frame and its positive bbox rows.
+  - POST `/api/training-frames/bbox` with `{ name, box }` → replaces every box for a positive frame with one validated box; send `box: null` to clear all boxes.
 
 ## Persistent Training Data
 - Code lives entirely under `squirrel-daemon`; generated data does not.
 - The data root is `squirrel-training-data` beside `clicks.db` (normally `/home/pi/squirrel-training-data` on the Pi), so `deploy.sh` does not remove it.
 - False-positive labels analyze every frame and save the two frames with the highest squirrel confidence under `negatives/`.
-- True-positive labels analyze every frame at a lower mining threshold and save detections below the configured live threshold under `positives/`, with boxes in `bboxes.txt` using `image,label,xmin,ymin,xmax,ymax`.
+- True-positive labels analyze every frame at a lower mining threshold and save the highest-confidence below-live-threshold detection from each matching frame under `positives/`, with at most one box per new image in `bboxes.txt` using `image,label,xmin,ymin,xmax,ymax`.
 - `recording_labels.json` tracks completed labels and generated files. Relabeling a clip replaces its earlier derived files and bbox rows.
+- The labeling service recreates the dataset directories and empty bbox file when the persistent training-data root is removed while the daemon is running.
 
 ## Existing Control UI
 - Main page: `squirrel-daemon/templates/PanTiltControl.html`.

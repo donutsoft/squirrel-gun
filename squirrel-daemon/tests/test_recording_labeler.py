@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import shutil
 import sys
 import tempfile
 import time
@@ -53,6 +54,10 @@ class FakeCV2:
     @staticmethod
     def imwrite(path, image, options):
         return cv2.imwrite(path, image, options)
+
+    @staticmethod
+    def imread(path):
+        return cv2.imread(path)
 
 
 class FakeDetector:
@@ -128,7 +133,7 @@ class RecordingLabelServiceTests(unittest.TestCase):
         }, names)
         self.assertEqual([], service._read_bbox_rows())
 
-    def test_true_positive_saves_below_live_threshold_and_writes_boxes(self):
+    def test_true_positive_saves_below_live_threshold_and_writes_one_best_box(self):
         detector = FakeDetector({
             0: [detection(0.04)],
             1: [detection(0.10)],
@@ -148,9 +153,78 @@ class RecordingLabelServiceTests(unittest.TestCase):
             "rec_20260717_120000_123_frame00000003.jpg",
         }, names)
         rows = service._read_bbox_rows()
-        self.assertEqual(3, len(rows))
+        self.assertEqual(2, len(rows))
         self.assertEqual({"rat"}, {row["label"] for row in rows})
         self.assertEqual({"10", "50"}, {row["xmin"] for row in rows})
+        frames = {item["name"]: item for item in service.list_frames()["positives"]}
+        frame = frames["rec_20260717_120000_123_frame00000003.jpg"]
+        self.assertEqual(0.30, frame["score"])
+        self.assertEqual(1, len(frame["boxes"]))
+
+    def test_recreates_dataset_if_deleted_while_service_is_running(self):
+        detector = FakeDetector({1: [detection(0.80)]})
+        service = self.make_service(detector)
+        shutil.rmtree(service.data_root)
+
+        service.start(self.video, "false_positive")
+        status = self.wait_for_job(service, self.video.name)
+
+        self.assertEqual("complete", status["state"])
+        self.assertTrue(service.staging_dir.is_dir())
+        self.assertTrue(service.positives_dir.is_dir())
+        self.assertTrue(service.negatives_dir.is_dir())
+        self.assertTrue(service.bbox_path.is_file())
+        self.assertTrue(service.manifest_path.is_file())
+
+    def test_replacing_box_removes_all_old_boxes_and_clear_removes_replacement(self):
+        detector = FakeDetector({
+            1: [
+                detection(0.10),
+                detection(0.20, 50, 60, 70, 80),
+            ],
+        })
+        service = self.make_service(detector)
+        service.start(self.video, "true_positive")
+        self.assertEqual("complete", self.wait_for_job(service, self.video.name)["state"])
+        name = "rec_20260717_120000_123_frame00000001.jpg"
+        rows = service._read_bbox_rows()
+        rows.append({
+            "image": name,
+            "label": "rat",
+            "xmin": 1,
+            "ymin": 2,
+            "xmax": 3,
+            "ymax": 4,
+        })
+        service._write_bbox_rows(rows)
+
+        result = service.replace_bounding_box(
+            name,
+            {"xmin": 5, "ymin": 6, "xmax": 100, "ymax": 110},
+        )
+
+        self.assertEqual(2, result["removed_boxes"])
+        saved = [row for row in service._read_bbox_rows() if row["image"] == name]
+        self.assertEqual(1, len(saved))
+        self.assertEqual("5", saved[0]["xmin"])
+
+        result = service.replace_bounding_box(name, None)
+        self.assertEqual(1, result["removed_boxes"])
+        self.assertIsNone(result["box"])
+        self.assertEqual([], service._read_bbox_rows())
+
+    def test_rejects_box_outside_image(self):
+        detector = FakeDetector({1: [detection(0.10)]})
+        service = self.make_service(detector)
+        service.start(self.video, "true_positive")
+        self.assertEqual("complete", self.wait_for_job(service, self.video.name)["state"])
+        name = "rec_20260717_120000_123_frame00000001.jpg"
+
+        with self.assertRaisesRegex(ValueError, "within the 320x320 image"):
+            service.replace_bounding_box(
+                name,
+                {"xmin": 5, "ymin": 6, "xmax": 321, "ymax": 110},
+            )
 
     def test_deleting_positive_also_removes_its_bbox_rows(self):
         detector = FakeDetector({1: [detection(0.10)]})

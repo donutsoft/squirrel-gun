@@ -627,6 +627,25 @@ def training_frames_delete():
         return jsonify({'error': str(exc)}), 500
 
 
+@app.post('/api/training-frames/bbox')
+def training_frames_bbox():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'JSON object required'}), 400
+    name = str(data.get('name', '')).strip()
+    if 'box' not in data:
+        return jsonify({'error': 'box is required (object or null)'}), 400
+    try:
+        result = training_data.replace_bounding_box(name, data['box'])
+        return jsonify({'status': 'ok', **result})
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except FileNotFoundError:
+        return jsonify({'error': 'frame not found'}), 404
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
 @app.get('/snapshots')
 def snapshots_page():
     base = Path(__file__).parent / 'static' / 'recordings' / 'shots'

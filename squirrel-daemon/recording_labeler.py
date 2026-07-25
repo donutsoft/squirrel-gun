@@ -56,6 +56,10 @@ class RecordingLabelService:
         self._latest_job_by_recording: Dict[str, str] = {}
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="recording-label")
 
+        self._ensure_data_layout()
+
+    def _ensure_data_layout(self) -> None:
+        """Create the persistent dataset layout if it was removed at runtime."""
         self.positives_dir.mkdir(parents=True, exist_ok=True)
         self.negatives_dir.mkdir(parents=True, exist_ok=True)
         self.staging_dir.mkdir(parents=True, exist_ok=True)
@@ -71,6 +75,7 @@ class RecordingLabelService:
             raise FileNotFoundError(f"recording not found: {video_path}")
 
         with self._lock:
+            self._ensure_data_layout()
             for job in self._jobs.values():
                 if job["recording"] == video_path.name and job["state"] in ("queued", "running"):
                     raise LabelingInProgress(f"{video_path.name} is already being labeled")
@@ -123,6 +128,7 @@ class RecordingLabelService:
 
     def list_frames(self) -> Dict[str, Any]:
         with self._lock:
+            self._ensure_data_layout()
             bbox_rows = self._read_bbox_rows()
             boxes_by_image: Dict[str, List[Dict[str, Any]]] = {}
             for row in bbox_rows:
@@ -199,10 +205,33 @@ class RecordingLabelService:
                 self._write_manifest(manifest)
             return {"deleted": name, "kind": kind, "removed_boxes": removed_boxes}
 
+    def replace_bounding_box(self, name: str, box: Dict[str, Any] | None) -> Dict[str, Any]:
+        """Remove every box for a positive frame and optionally save one replacement."""
+        with self._lock:
+            self._ensure_data_layout()
+            path = self.frame_path("positives", name)
+            if not path.is_file():
+                raise FileNotFoundError(f"frame not found: {name}")
+
+            rows = self._read_bbox_rows()
+            kept = [row for row in rows if row["image"] != name]
+            removed_boxes = len(rows) - len(kept)
+            saved_box = None
+            if box is not None:
+                saved_box = self._validated_bbox(path, name, box)
+                kept.append(saved_box)
+            self._write_bbox_rows(kept)
+            return {
+                "name": name,
+                "box": saved_box,
+                "removed_boxes": removed_boxes,
+            }
+
     def _run_job(self, job_id: str, video_path: Path, label: str) -> None:
         stage_dir = self.staging_dir / job_id
         try:
             with self._lock:
+                self._ensure_data_layout()
                 self._update_job(job_id, state="running")
             stage_dir.mkdir(parents=True, exist_ok=False)
             summary = self._analyze(video_path, label, stage_dir, job_id)
@@ -271,11 +300,12 @@ class RecordingLabelService:
                         if mining_threshold <= float(item["score"]) < live_threshold
                     ]
                     if low_detections:
+                        detection = max(low_detections, key=lambda item: float(item["score"]))
+                        score = float(detection["score"])
                         name = f"{video_path.stem}_frame{frame_index:08d}.jpg"
                         self._write_image(stage_dir / name, letterboxed)
-                        images.append({"kind": "positives", "name": name})
-                        for detection in low_detections:
-                            bbox_rows.append(self._bbox_row(name, detection))
+                        images.append({"kind": "positives", "name": name, "score": score})
+                        bbox_rows.append(self._bbox_row(name, detection))
 
                 if frame_index % 5 == 0:
                     with self._lock:
@@ -299,6 +329,7 @@ class RecordingLabelService:
         }
 
     def _commit(self, recording_name: str, label: str, stage_dir: Path, summary: Dict[str, Any]) -> None:
+        self._ensure_data_layout()
         manifest = self._read_manifest()
         recordings = manifest.setdefault("recordings", {})
         previous = recordings.get(recording_name, {})
@@ -380,9 +411,35 @@ class RecordingLabelService:
         return value
 
     def _write_manifest(self, manifest: Dict[str, Any]) -> None:
+        self.data_root.mkdir(parents=True, exist_ok=True)
         temporary = self.manifest_path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         temporary.replace(self.manifest_path)
+
+    def _validated_bbox(self, path: Path, name: str, box: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(box, dict):
+            raise ValueError("box must be an object or null")
+        coordinates: Dict[str, int] = {}
+        for field in ("xmin", "ymin", "xmax", "ymax"):
+            value = box.get(field)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{field} must be an integer")
+            coordinates[field] = value
+
+        image = self._cv2.imread(str(path))
+        if image is None or not hasattr(image, "shape") or len(image.shape) < 2:
+            raise RuntimeError(f"could not read training frame: {name}")
+        height, width = int(image.shape[0]), int(image.shape[1])
+        if not (
+            0 <= coordinates["xmin"] < coordinates["xmax"] <= width
+            and 0 <= coordinates["ymin"] < coordinates["ymax"] <= height
+        ):
+            raise ValueError(f"box must be within the {width}x{height} image")
+        return {
+            "image": name,
+            "label": "rat",
+            **coordinates,
+        }
 
     def _frame_directory(self, kind: str) -> Path:
         if kind == "positives":
