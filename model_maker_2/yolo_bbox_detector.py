@@ -28,6 +28,7 @@ _VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _LETTERBOX_PAD_COLOR = 114
 _DEFAULT_BBOX_LIMITS_FILE = _SCRIPT_DIR.parent / "squirrel-daemon" / "yolo_bbox_limits.json"
+_DEFAULT_MODEL = "yolo26n.pt"
 _AUGMENTATION_PROFILES = ("default", "fixed_scene")
 _DEFAULT_AB_THRESHOLDS = (0.4, 0.5, 0.6, 0.7, 0.8)
 _FIXED_SCENE_TRAIN_OVERRIDES: Dict[str, Union[int, float]] = {
@@ -81,7 +82,7 @@ class YOLOBBoxDetector:
           yolo_root="yolo_data",
           seed=42,
       )
-      det.train(model="yolov8n.pt", epochs=50, imgsz=640)
+      det.train(model="yolo26n.pt", epochs=50, imgsz=640)
       results = det.predict("some.jpg")
     """
 
@@ -113,7 +114,7 @@ class YOLOBBoxDetector:
     # --------------- Public API ---------------
     def train(
         self,
-        model: str = "yolov8n.pt",
+        model: str = _DEFAULT_MODEL,
         epochs: int = 50,
         imgsz: int = 320,
         batch: int = 16,
@@ -1030,7 +1031,12 @@ if __name__ == "__main__":
         parser.add_argument("--bbox_file", type=Path, default=None, help="CSV with image,label,xmin,ymin,xmax,ymax")
         parser.add_argument("--yolo_root", type=Path, default=Path("yolo_data"), help="Output YOLO dataset root")
         parser.add_argument("--negatives_dir", type=Path, default=None, help="Optional directory of negative images (no boxes)")
-        parser.add_argument("--model", type=str, default="yolov8n.pt", help="Ultralytics model or config (e.g., yolov8n.pt)")
+        parser.add_argument(
+            "--model",
+            type=str,
+            default=_DEFAULT_MODEL,
+            help=f"Ultralytics model or config (default: {_DEFAULT_MODEL})",
+        )
         parser.add_argument("--epochs", type=int, default=50)
         parser.add_argument("--imgsz", type=int, default=320)
         parser.add_argument("--batch", type=int, default=16)

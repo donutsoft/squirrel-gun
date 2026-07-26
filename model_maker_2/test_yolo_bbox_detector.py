@@ -48,7 +48,8 @@ class FixedSceneProfileTests(unittest.TestCase):
 
     def test_train_passes_fixed_scene_profile_and_shared_seed_to_ultralytics(self) -> None:
         class FakeModel:
-            def __init__(self, _model: str) -> None:
+            def __init__(self, model: str) -> None:
+                self.model_name = model
                 self.train_args = None
 
             def train(self, **kwargs):
@@ -81,6 +82,7 @@ class FixedSceneProfileTests(unittest.TestCase):
                 )
 
         self.assertEqual(42, trained.train_args["seed"])
+        self.assertEqual("yolo26n.pt", trained.model_name)
         self.assertEqual(0.0, trained.train_args["mosaic"])
         self.assertEqual(0.0, trained.train_args["translate"])
         self.assertEqual(0.0, trained.train_args["scale"])

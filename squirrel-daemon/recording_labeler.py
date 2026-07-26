@@ -253,7 +253,7 @@ class RecordingLabelService:
     def _analyze(self, video_path: Path, label: str, stage_dir: Path, job_id: str) -> Dict[str, Any]:
         detector = self._detector_provider()
         config = detector.config()
-        live_threshold = float(config.get("score_thresh", 0.25))
+        live_threshold = float(config.get("score_thresh", 0.65))
         if not 0.0 < live_threshold <= 1.0:
             raise ValueError(f"invalid configured squirrel threshold: {live_threshold}")
 

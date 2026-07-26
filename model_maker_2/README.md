@@ -1,10 +1,23 @@
 ## YOLO bounding box detector
 
-Train the fixed-scene profile with the values in `settings.conf`:
+The active model is YOLO26n, replacing YOLOv8n while retaining the same 320px
+input, batch size, dataset split, fixed-scene augmentation, and confidence
+thresholds. Keeping those controls fixed makes the first deployed run a useful
+latency and accuracy comparison. Training and device inference are pinned to
+the same YOLO26-capable Ultralytics release.
+
+Train the full fixed-scene model with the values in `settings.conf`:
 
 ```bash
 uv run yolo_bbox_detector.py --conf settings.conf train
 ```
+
+This produces the named run `runs/detect/yolo26n_fixed_scene_full`. The
+pretrained `yolo26n.pt` checkpoint is downloaded automatically on first use,
+then all 50 configured epochs run against the complete prepared training split.
+Do not tune confidence thresholds from desktop `.pt` results; first export and
+deploy the Edge TPU model, compare its inference timing with the 21.5ms YOLOv8n
+baseline, and then evaluate thresholds on the device.
 
 `fixed_scene` is the normal training profile. It disables mosaic, flips,
 translation, scaling, rotation, shear, perspective, and image compositing.

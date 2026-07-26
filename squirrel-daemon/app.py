@@ -77,7 +77,12 @@ persisted = store.get_settings([
     'water_on_motion.enabled',
     'laser.enabled',
     'detector.type',
+    'yolo.score_thresh',
 ])
+# Restore the threshold before the detector type so lazy YOLO construction
+# starts with the persisted value.
+if 'yolo.score_thresh' in persisted:
+    webcam.set_yolo_score_threshold(persisted['yolo.score_thresh'])
 # Apply detector type
 if 'detector.type' in persisted:
     webcam.set_detector_type(persisted['detector.type'])
@@ -988,6 +993,12 @@ def motion_config():
     prefer_tracking = data.get('prefer_tracking')
     frame_skip = data.get('frame_skip')
     scale = data.get('scale')
+    yolo_score_thresh = data.get('yolo_score_thresh')
+    if yolo_score_thresh is not None:
+        try:
+            yolo_score_thresh = webcam.set_yolo_score_threshold(yolo_score_thresh)
+        except (TypeError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
     try:
         webcam.set_motion_detection(enabled=enabled, min_area=min_area, alpha=alpha, persist_ms=persist_ms,
                                     bg_mode=bg_mode, prefer_tracking=prefer_tracking,
@@ -1004,6 +1015,7 @@ def motion_config():
         if prefer_tracking is not None: store.set_setting('motion.prefer_tracking', bool(prefer_tracking))
         if frame_skip is not None: store.set_setting('motion.frame_skip', int(frame_skip))
         if scale is not None: store.set_setting('motion.scale', float(scale))
+        if yolo_score_thresh is not None: store.set_setting('yolo.score_thresh', yolo_score_thresh)
     except Exception:
         pass
     return jsonify({
@@ -1016,6 +1028,7 @@ def motion_config():
         "prefer_tracking": prefer_tracking,
         "frame_skip": frame_skip,
         "scale": scale,
+        "yolo_score_thresh": webcam.get_yolo_score_threshold(),
     })
 
 

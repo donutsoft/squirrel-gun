@@ -13,6 +13,16 @@ from .base import EventDetector, DetectionEvent, DetectionResult
 from ultralytics import YOLO  # type: ignore
 
 
+DEFAULT_YOLO_SCORE_THRESH = 0.65
+
+
+def validate_yolo_score_threshold(value: Any) -> float:
+    threshold = float(value)
+    if not 0.0 < threshold <= 1.0:
+        raise ValueError("YOLO score threshold must be greater than 0 and at most 1")
+    return threshold
+
+
 class YOLOEventDetector(EventDetector):
     """Ultralytics YOLO wrapper for TFLite model that emits bbox events.
 
@@ -23,12 +33,12 @@ class YOLOEventDetector(EventDetector):
 
     def __init__(self, model_filename: str = "best_full_integer_quant_edgetpu.tflite") -> None:
         self._enabled = True
-        # On-device calibration for the fixed-scene model found a clean gap:
-        # the strongest of 111 negative trials scored 0.191, while every held-
-        # out positive burst reached at least 0.326. Keep the live threshold
-        # inside that gap. Edge-TPU scores are not interchangeable with .pt
-        # model confidence values, so recalibrate after changing models.
-        self._score_thresh = 0.25
+        # On-device YOLO26n calibration found a clean gap: the strongest
+        # negative scored 0.6339 (a bird), while the next positive detections
+        # scored 0.6705. A 0.65 threshold rejected every negative burst while
+        # retaining a detection in every positive burst. Edge-TPU scores are
+        # model-specific, so recalibrate after changing models.
+        self._score_thresh = DEFAULT_YOLO_SCORE_THRESH
         self._frame_skip = 0
         self._allowed_classes: Optional[Sequence[int]] = None
         self._label_map: Optional[Dict[int, str]] = None
@@ -105,7 +115,7 @@ class YOLOEventDetector(EventDetector):
         if 'enabled' in kwargs:
             self._enabled = bool(kwargs['enabled'])
         if 'score_thresh' in kwargs and kwargs['score_thresh'] is not None:
-            self._score_thresh = float(kwargs['score_thresh'])
+            self._score_thresh = validate_yolo_score_threshold(kwargs['score_thresh'])
         if 'frame_skip' in kwargs and kwargs['frame_skip'] is not None:
             self._frame_skip = max(0, int(kwargs['frame_skip']))
         if 'classes' in kwargs and kwargs['classes'] is not None:
@@ -219,9 +229,7 @@ class YOLOEventDetector(EventDetector):
         detection so hard positives just below the configured live threshold
         are available for training.
         """
-        threshold = float(score_thresh)
-        if not 0.0 < threshold <= 1.0:
-            raise ValueError("score_thresh must be greater than 0 and at most 1")
+        threshold = validate_yolo_score_threshold(score_thresh)
         letterboxed, _scale, _left, _top = self._letterbox(frame)
         results = self._predict_tpu(letterboxed, score_thresh=threshold)
         detections = self._parse_ultralytics(

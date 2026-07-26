@@ -63,6 +63,12 @@
                 </select>
               </label>
               <label style="display:inline-flex; align-items:center; gap:6px;">
+                <span>YOLO threshold</span>
+                <input id="yolo-score-thresh" type="number" min="0.01" max="1" step="0.01" value="0.65"
+                       title="Minimum squirrel confidence required for a live YOLO detection"
+                       style="width: 82px;" />
+              </label>
+              <label style="display:inline-flex; align-items:center; gap:6px;">
                 <input id="motion-enable" type="checkbox" />
                 <span>Enable motion overlay</span>
               </label>
@@ -246,6 +252,7 @@
       const motionFollow = byId('motion-follow');
       const detectorType = byId('detector-type');
       const motionMinArea = byId('motion-min-area');
+      const yoloScoreThresh = byId('yolo-score-thresh');
       const laserEnabled = byId('laser-enabled');
       function imagePointFromEvent(e) {
         const rect = img.getBoundingClientRect();
@@ -462,13 +469,17 @@
       });
 
       // Motion config and follow
-      async function setMotionConfig({ enabled, min_area, alpha, persist_ms } = {}) {
+      async function setMotionConfig({ enabled, min_area, alpha, persist_ms, yolo_score_thresh } = {}) {
         try {
-          await fetch('/api/motion/config', {
+          const response = await fetch('/api/motion/config', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ enabled, min_area, alpha, persist_ms })
+            body: JSON.stringify({ enabled, min_area, alpha, persist_ms, yolo_score_thresh })
           });
+          if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            throw new Error(data.error || response.statusText);
+          }
         } catch (e) {
           console.error('Failed to set motion config', e);
         }
@@ -567,6 +578,20 @@
       motionPersist.addEventListener('change', sendPersist);
       motionPersist.addEventListener('input', sendPersist);
 
+      const sendYoloScoreThresh = debounce(() => {
+        const parsed = Number(yoloScoreThresh.value);
+        const threshold = Number.isFinite(parsed)
+          ? Math.max(0.01, Math.min(1, parsed))
+          : 0.65;
+        yoloScoreThresh.value = threshold.toFixed(2);
+        setMotionConfig({
+          enabled: motionEnable.checked,
+          yolo_score_thresh: threshold
+        });
+      }, 250);
+      yoloScoreThresh.addEventListener('change', sendYoloScoreThresh);
+      yoloScoreThresh.addEventListener('input', sendYoloScoreThresh);
+
       // Initialize UI from backend config
       (async function initMotionConfig() {
         try {
@@ -576,6 +601,9 @@
             if (typeof cfg.enabled === 'boolean') motionEnable.checked = cfg.enabled;
             if (typeof cfg.min_area === 'number') motionMinArea.value = String(cfg.min_area);
             if (typeof cfg.persist_ms === 'number') motionPersist.value = String(cfg.persist_ms);
+            if (typeof cfg.yolo_score_thresh === 'number') {
+              yoloScoreThresh.value = cfg.yolo_score_thresh.toFixed(2);
+            }
           }
         } catch (_) {}
         try {

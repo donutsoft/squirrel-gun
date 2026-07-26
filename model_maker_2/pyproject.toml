@@ -15,6 +15,6 @@ dependencies = [
     "torch>=2.8.0",
     "torchvision>=0.23.0",
     "tqdm>=4.67.1",
-    "ultralytics>=8.3.202",
+    "ultralytics==8.4.48",
     "websocket-client>=1.9.0",
 ]

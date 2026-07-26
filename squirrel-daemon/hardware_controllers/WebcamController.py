@@ -7,7 +7,11 @@ import cv2  # type: ignore
 from turbojpeg import TurboJPEG, TJPF_BGR, TJSAMP_420  # type: ignore
 from event_detection.combined import CombinedMotionYOLOEventDetector
 from event_detection.motion import MotionDetector
-from event_detection.yolo import YOLOEventDetector
+from event_detection.yolo import (
+    DEFAULT_YOLO_SCORE_THRESH,
+    YOLOEventDetector,
+    validate_yolo_score_threshold,
+)
 
 class WebcamController:
     def __init__(self, device: str = "/dev/video0", width: Optional[int] = None, height: Optional[int] = None):
@@ -33,6 +37,7 @@ class WebcamController:
         self._detector = MotionDetector()
         self._squirrel_detector: Optional[YOLOEventDetector] = None
         self._squirrel_detector_lock = threading.Lock()
+        self._yolo_score_thresh = DEFAULT_YOLO_SCORE_THRESH
         # Store motion zone centrally; applied only to motion detector
         self._zone: Optional[Tuple[float, float, float, float]] = None
         # Low-latency streaming mode flag (default ON)
@@ -869,7 +874,9 @@ class WebcamController:
 
     def motion_config(self) -> dict:
         """Return current detector configuration."""
-        return self._detector.config()
+        config = dict(self._detector.config())
+        config['yolo_score_thresh'] = self.get_yolo_score_threshold()
+        return config
 
     # Diagnostics helpers
     def motion_counters(self) -> dict:
@@ -969,8 +976,21 @@ class WebcamController:
         if self._squirrel_detector is None:
             with self._squirrel_detector_lock:
                 if self._squirrel_detector is None:
-                    self._squirrel_detector = YOLOEventDetector()
+                    detector = YOLOEventDetector()
+                    detector.configure(score_thresh=self.get_yolo_score_threshold())
+                    self._squirrel_detector = detector
         return self._squirrel_detector
+
+    def get_yolo_score_threshold(self) -> float:
+        return float(getattr(self, '_yolo_score_thresh', DEFAULT_YOLO_SCORE_THRESH))
+
+    def set_yolo_score_threshold(self, value: Any) -> float:
+        threshold = validate_yolo_score_threshold(value)
+        self._yolo_score_thresh = threshold
+        detector = getattr(self, '_squirrel_detector', None)
+        if detector is not None:
+            detector.configure(score_thresh=threshold)
+        return threshold
 
     def set_detector_type(self, kind: str) -> str:
         kind = str(kind).lower().strip()

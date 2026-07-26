@@ -938,7 +938,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.8.0" },
     { name = "torchvision", specifier = ">=0.23.0" },
     { name = "tqdm", specifier = ">=4.67.1" },
-    { name = "ultralytics", specifier = ">=8.3.202" },
+    { name = "ultralytics", specifier = "==8.4.48" },
     { name = "websocket-client", specifier = ">=1.9.0" },
 ]
 
