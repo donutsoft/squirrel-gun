@@ -1,10 +1,62 @@
 ## YOLO bounding box detector
 
-Train with the values in `settings.conf`:
+Train the fixed-scene profile with the values in `settings.conf`:
 
 ```bash
 uv run yolo_bbox_detector.py --conf settings.conf train
 ```
+
+`fixed_scene` is the normal training profile. It disables mosaic, flips,
+translation, scaling, rotation, shear, perspective, and image compositing.
+Only brightness augmentation remains, since camera geometry is invariant and
+the relevant scene change is day versus night.
+
+To run a paired augmentation A/B test using the existing images:
+
+```bash
+uv run yolo_bbox_detector.py --conf settings.conf train-ab
+```
+
+The command prepares the YOLO dataset once, then starts both models from the
+same base checkpoint with the same train/validation membership and random seed:
+
+- `control`: current Ultralytics default augmentations.
+- `fixed-scene`: invariant geometry plus brightness variation only.
+
+After training, both `best.pt` files are evaluated against the same validation
+images at confidence thresholds 0.4, 0.5, 0.6, 0.7, and 0.8. The comparison
+JSON reports positive-image recall, empty-background false-positive rate, and
+image-level precision, plus the fixed-scene-minus-control delta at each
+threshold. Use `--name EXPERIMENT_NAME` to set the paired run prefix,
+`--thresholds ...` to change thresholds, or `--report PATH` to select the JSON
+location.
+
+After exporting and deploying the fixed-scene model, stop the Flask daemon so
+it releases the Edge TPU, then evaluate the deployed model on the existing
+labeled recordings plus a deterministic sample of additional known-negative
+backyard images:
+
+```bash
+cd /home/pi/squirrel-daemon
+pkill -f 'python -m flask run' || true
+uv run python -B evaluate_thresholds.py \
+  --extra-positives-dir /home/pi/squirrel-training-data/threshold_holdout/positives \
+  --extra-negatives-dir /home/pi/squirrel-training-data/threshold_holdout/negatives \
+  --extra-negative-limit 100 \
+  --extra-negative-seed 42 \
+  --thresholds 0.2 0.25 0.3 0.4 0.5 0.6 0.7 0.8 \
+  --output-dir threshold_evaluation_fixed_scene
+```
+
+The holdout contains complete recording bursts removed before training, with
+both day and night examples. Keeping neighboring frames together avoids
+train/test leakage from nearly identical frames. The evaluator also excludes
+images already referenced by the recording manifest, so additional images are
+not double-counted. The console summary and
+`threshold_evaluation_fixed_scene/report.json` show true-positive recall and
+false-positive rate at each threshold. This existing holdout is useful for
+initial calibration, but it does not replace a later check on recordings
+captured after deployment.
 
 Run the trained model over videos that are expected to be negative, and save
 frames where the model still detects something:

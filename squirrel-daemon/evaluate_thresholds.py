@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import math
+import random
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 
-DEFAULT_THRESHOLDS = (0.4, 0.5, 0.6, 0.7, 0.75, 0.8)
+DEFAULT_THRESHOLDS = (0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
 VALID_LABELS = ("true_positive", "false_positive")
 TPU_TUNING_NOTE = (
     "Edge-TPU confidence values are not interchangeable with desktop .pt-model "
@@ -83,6 +84,49 @@ def generated_negative_paths(record: Dict[str, Any], data_root: Path) -> List[Pa
         if isinstance(name, str) and name:
             paths.append(data_root / "negatives" / name)
     return paths
+
+
+def select_extra_image_paths(
+    directory: Path,
+    *,
+    limit: Optional[int],
+    seed: int,
+    excluded_names: Iterable[str] = (),
+) -> List[Path]:
+    """Select a deterministic sample of additional labeled images."""
+    excluded = {str(name) for name in excluded_names}
+    extensions = {".jpg", ".jpeg", ".png", ".bmp"}
+    paths = sorted(
+        path for path in directory.iterdir()
+        if (
+            path.is_file()
+            and path.suffix.lower() in extensions
+            and not path.name.startswith(".")
+            and path.name not in excluded
+        )
+    )
+    if limit is None or limit >= len(paths):
+        return paths
+    if limit <= 0:
+        raise ValueError("extra image limit must be greater than 0")
+    selected = random.Random(int(seed)).sample(paths, int(limit))
+    return sorted(selected)
+
+
+def select_extra_negative_paths(
+    directory: Path,
+    *,
+    limit: Optional[int],
+    seed: int,
+    excluded_names: Iterable[str] = (),
+) -> List[Path]:
+    """Backward-compatible name for selecting additional negative images."""
+    return select_extra_image_paths(
+        directory,
+        limit=limit,
+        seed=seed,
+        excluded_names=excluded_names,
+    )
 
 
 def best_detection(detections: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -198,9 +242,9 @@ def analyze_images(
 
     error = None
     if processed == 0:
-        error = "no generated negative frames could be read"
+        error = "no image frames could be read"
     elif missing:
-        error = f"missing {len(missing)} generated negative frame(s)"
+        error = f"missing {len(missing)} image frame(s)"
 
     return RecordingResult(
         recording=recording,
@@ -401,6 +445,48 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Do not evaluate saved negative frames when a false-positive video is missing.",
     )
+    parser.add_argument(
+        "--extra-positives-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional directory of additional known-positive images. Each image "
+            "is scored as a separate true-positive trial."
+        ),
+    )
+    parser.add_argument(
+        "--extra-positive-limit",
+        type=int,
+        default=None,
+        help="Deterministically sample at most this many additional positive images.",
+    )
+    parser.add_argument(
+        "--extra-positive-seed",
+        type=int,
+        default=42,
+        help="Sampling seed used with --extra-positive-limit.",
+    )
+    parser.add_argument(
+        "--extra-negatives-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional directory of additional known-negative images. Each image "
+            "is scored as a separate false-positive trial."
+        ),
+    )
+    parser.add_argument(
+        "--extra-negative-limit",
+        type=int,
+        default=None,
+        help="Deterministically sample at most this many additional negative images.",
+    )
+    parser.add_argument(
+        "--extra-negative-seed",
+        type=int,
+        default=42,
+        help="Sampling seed used with --extra-negative-limit.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Print each recording result.")
     return parser.parse_args(argv)
 
@@ -422,6 +508,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     recordings_dir = args.recordings_dir.expanduser().resolve()
     model_path = args.model.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
+    extra_negatives_dir = (
+        args.extra_negatives_dir.expanduser().resolve()
+        if args.extra_negatives_dir is not None
+        else None
+    )
+    extra_positives_dir = (
+        args.extra_positives_dir.expanduser().resolve()
+        if args.extra_positives_dir is not None
+        else None
+    )
     every_n_frames = max(1, int(args.every))
 
     try:
@@ -434,6 +530,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     if not model_path.is_file():
         print(f"ERROR: model not found: {model_path}", file=sys.stderr)
+        return 2
+    if extra_positives_dir is not None and not extra_positives_dir.is_dir():
+        print(
+            f"ERROR: extra positives directory not found: {extra_positives_dir}",
+            file=sys.stderr,
+        )
+        return 2
+    if extra_negatives_dir is not None and not extra_negatives_dir.is_dir():
+        print(
+            f"ERROR: extra negatives directory not found: {extra_negatives_dir}",
+            file=sys.stderr,
+        )
         return 2
 
     import cv2  # type: ignore
@@ -518,6 +626,93 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("Stopping after an inference error; partial results will be written.", file=sys.stderr)
             break
 
+    inference_failed = any(result.source == "error" for result in results)
+    extra_specs = (
+        (
+            "positive",
+            "true_positive",
+            extra_positives_dir,
+            args.extra_positive_limit,
+            args.extra_positive_seed,
+        ),
+        (
+            "negative",
+            "false_positive",
+            extra_negatives_dir,
+            args.extra_negative_limit,
+            args.extra_negative_seed,
+        ),
+    )
+    for kind, label, directory, limit, seed in extra_specs:
+        if directory is None or inference_failed:
+            continue
+
+        represented_names = {
+            str(item["name"])
+            for record in records.values()
+            for item in record.get("generated", [])
+            if (
+                isinstance(item, dict)
+                and item.get("kind") == f"{kind}s"
+                and isinstance(item.get("name"), str)
+            )
+        }
+        try:
+            extra_paths = select_extra_image_paths(
+                directory,
+                limit=limit,
+                seed=seed,
+                excluded_names=represented_names,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"ERROR: could not select extra {kind}s: {exc}", file=sys.stderr)
+            return 2
+
+        print(
+            f"Additional {kind} images: {len(extra_paths)} "
+            f"from {directory}"
+        )
+        for extra_index, path in enumerate(extra_paths, start=1):
+            try:
+                result = analyze_images(
+                    f"extra-{kind}:{path.name}",
+                    label,
+                    [path],
+                    detector,
+                    cv2_module=cv2,
+                    mining_threshold=mining_threshold,
+                    stored_score=None,
+                )
+                result.source = f"extra_{kind}_image"
+            except Exception as exc:
+                result = RecordingResult(
+                    recording=f"extra-{kind}:{path.name}",
+                    label=label,
+                    source="error",
+                    frames_processed=0,
+                    detection_count=0,
+                    best_score=None,
+                    best_frame=None,
+                    best_image=None,
+                    stored_best_score=None,
+                    error=str(exc),
+                )
+            results.append(result)
+            if args.verbose or result.error:
+                score_text = "n/a" if result.best_score is None else f"{result.best_score:.6f}"
+                print(
+                    f"[extra {kind} {extra_index:03d}/{len(extra_paths):03d}] "
+                    f"{path.name} best={score_text}"
+                    + (f" error={result.error}" if result.error else "")
+                )
+            if result.source == "error":
+                print(
+                    "Stopping after an inference error; partial results will be written.",
+                    file=sys.stderr,
+                )
+                inference_failed = True
+                break
+
     source_counts: Dict[str, int] = {}
     for result in results:
         source_counts[result.source] = source_counts.get(result.source, 0) + 1
@@ -542,6 +737,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "manifest": str(manifest_path),
         "recordings_dir": str(recordings_dir),
         "data_root": str(data_root),
+        "extra_positives_dir": (
+            str(extra_positives_dir) if extra_positives_dir is not None else None
+        ),
+        "extra_positive_limit": args.extra_positive_limit,
+        "extra_positive_seed": args.extra_positive_seed,
+        "extra_negatives_dir": (
+            str(extra_negatives_dir) if extra_negatives_dir is not None else None
+        ),
+        "extra_negative_limit": args.extra_negative_limit,
+        "extra_negative_seed": args.extra_negative_seed,
         "threshold_tuning_note": TPU_TUNING_NOTE,
         "mining_threshold": mining_threshold,
         "every_n_frames": every_n_frames,

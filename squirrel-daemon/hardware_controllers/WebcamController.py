@@ -49,6 +49,10 @@ class WebcamController:
         from pathlib import Path as _P
         self._recordings_dir = _P(__file__).resolve().parents[1] / 'static' / 'recordings'
         self._recordings_dir.mkdir(parents=True, exist_ok=True)
+        # Lossless detector-ready frames used for later positive/negative
+        # mining. MP4 encoding can materially change detector confidence.
+        self._training_sources_dir = self._recordings_dir / '.training-source'
+        self._training_sources_dir.mkdir(parents=True, exist_ok=True)
         # Screenshots directory (per-motion snapshot)
         self._snapshots_dir = self._recordings_dir / 'shots'
         self._snapshots_dir.mkdir(parents=True, exist_ok=True)
@@ -320,6 +324,32 @@ class WebcamController:
             except Exception:
                 pass
             return None
+
+        source_dir = self._training_sources_dir / out_path.stem
+        staging_dir = self._training_sources_dir / f'.{out_path.stem}.tmp'
+        if source_dir.exists() or staging_dir.exists():
+            raise RuntimeError(f"training source already exists for recording: {out_path.name}")
+        staging_dir.mkdir(parents=False, exist_ok=False)
+        try:
+            for index, (_timestamp, frame) in enumerate(frames):
+                if frame is None or not hasattr(frame, 'shape'):
+                    raise RuntimeError(
+                        f"recording frame {index} is unavailable for training source: {out_path.name}"
+                    )
+                detector_frame = YOLOEventDetector.prepare_input_frame(frame)
+                frame_path = staging_dir / f'frame{index:08d}.png'
+                if not cv2.imwrite(
+                    str(frame_path),
+                    detector_frame,
+                    [cv2.IMWRITE_PNG_COMPRESSION, 3],
+                ):
+                    raise RuntimeError(f"could not write detector training source: {frame_path}")
+            staging_dir.replace(source_dir)
+        except Exception:
+            for frame_path in staging_dir.glob('frame*.png'):
+                frame_path.unlink()
+            staging_dir.rmdir()
+            raise
         return out_path
 
     def _persist_buffer_later(self) -> None:

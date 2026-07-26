@@ -16,6 +16,8 @@ from evaluate_thresholds import (  # noqa: E402
     analyze_images,
     analyze_video,
     generated_negative_paths,
+    parse_args,
+    select_extra_negative_paths,
     threshold_summary,
 )
 
@@ -173,6 +175,43 @@ class ThresholdEvaluatorTests(unittest.TestCase):
         self.assertEqual("generated_frames", actual.source)
         self.assertEqual(0.75, actual.best_score)
         self.assertEqual("two.jpg", actual.best_image)
+
+    def test_extra_negative_sampling_is_deterministic_and_excludes_manifest_images(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            for name in ("a.jpg", "b.jpg", "c.jpg", "d.jpg", "._a.jpg", "ignored.txt"):
+                (directory / name).write_bytes(b"image")
+
+            first = select_extra_negative_paths(
+                directory,
+                limit=2,
+                seed=42,
+                excluded_names={"b.jpg"},
+            )
+            second = select_extra_negative_paths(
+                directory,
+                limit=2,
+                seed=42,
+                excluded_names={"b.jpg"},
+            )
+
+        self.assertEqual(first, second)
+        self.assertEqual(2, len(first))
+        self.assertNotIn("b.jpg", {path.name for path in first})
+        self.assertNotIn("._a.jpg", {path.name for path in first})
+
+    def test_cli_accepts_positive_and_negative_holdout_directories(self):
+        args = parse_args([
+            "--extra-positives-dir",
+            "/data/holdout/positives",
+            "--extra-negatives-dir",
+            "/data/holdout/negatives",
+        ])
+
+        self.assertEqual(Path("/data/holdout/positives"), args.extra_positives_dir)
+        self.assertEqual(Path("/data/holdout/negatives"), args.extra_negatives_dir)
 
 
 if __name__ == "__main__":

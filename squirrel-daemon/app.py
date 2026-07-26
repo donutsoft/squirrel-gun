@@ -766,6 +766,11 @@ def recordings_delete():
         if not path.resolve().is_file() or base.resolve() not in path.resolve().parents:
             return jsonify({"error": "file not found"}), 404
         path.unlink()
+        source_dir = base / '.training-source' / path.stem
+        if source_dir.is_dir():
+            for source_frame in source_dir.glob('frame*.png'):
+                source_frame.unlink()
+            source_dir.rmdir()
         # Also delete associated snapshots (same timestamp)
         ts = m.group(1)[4:]
         base_ts = m.group(2)
@@ -804,6 +809,13 @@ def recordings_clear():
                 deleted += 1
             except Exception:
                 pass
+        source_root = base / '.training-source'
+        for source_dir in source_root.iterdir() if source_root.is_dir() else ():
+            if not source_dir.is_dir() or source_dir.name.startswith('.'):
+                continue
+            for source_frame in source_dir.glob('frame*.png'):
+                source_frame.unlink()
+            source_dir.rmdir()
         # Also clear all snapshots
         shots_dir = base / 'shots'
         for sp in shots_dir.glob('*.jpg'):

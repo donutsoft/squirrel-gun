@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import random
 import shutil
 import platform
 import math
+import time
 from pathlib import Path
 import sys
 import configparser
-from typing import Dict, List, Tuple, Optional, Iterable, Union, Sequence
+from typing import Any, Dict, List, Tuple, Optional, Iterable, Union, Sequence
 
 try:
     from ultralytics import YOLO  # type: ignore
@@ -26,6 +28,43 @@ _VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _LETTERBOX_PAD_COLOR = 114
 _DEFAULT_BBOX_LIMITS_FILE = _SCRIPT_DIR.parent / "squirrel-daemon" / "yolo_bbox_limits.json"
+_AUGMENTATION_PROFILES = ("default", "fixed_scene")
+_DEFAULT_AB_THRESHOLDS = (0.4, 0.5, 0.6, 0.7, 0.8)
+_FIXED_SCENE_TRAIN_OVERRIDES: Dict[str, Union[int, float]] = {
+    # The camera and scene geometry are invariant. Preserve that geometry so
+    # hard negatives teach the model about the exact background that caused a
+    # false detection. Brightness is the only augmentation retained to cover
+    # day/night exposure changes.
+    "mosaic": 0.0,
+    "mixup": 0.0,
+    "cutmix": 0.0,
+    "copy_paste": 0.0,
+    "degrees": 0.0,
+    "translate": 0.0,
+    "scale": 0.0,
+    "shear": 0.0,
+    "perspective": 0.0,
+    "flipud": 0.0,
+    "fliplr": 0.0,
+    "bgr": 0.0,
+    "hsv_h": 0.0,
+    "hsv_s": 0.0,
+    "hsv_v": 0.4,
+    "close_mosaic": 0,
+}
+
+
+def train_overrides_for_profile(profile: str) -> Dict[str, Union[int, float]]:
+    """Return Ultralytics training overrides for a named augmentation profile."""
+    normalized = str(profile).strip().lower()
+    if normalized == "default":
+        return {}
+    if normalized == "fixed_scene":
+        return dict(_FIXED_SCENE_TRAIN_OVERRIDES)
+    raise ValueError(
+        f"unknown augmentation profile {profile!r}; expected one of: "
+        f"{', '.join(_AUGMENTATION_PROFILES)}"
+    )
 
 
 class YOLOBBoxDetector:
@@ -83,6 +122,10 @@ class YOLOBBoxDetector:
         verbose: bool = True,
         workers: Optional[int] = None,
         amp: Optional[bool] = None,
+        augmentation_profile: str = "fixed_scene",
+        project: Optional[Union[str, Path]] = None,
+        name: Optional[str] = None,
+        plots: bool = False,
     ):
         """Prepare YOLO dataset and train using ultralytics.
 
@@ -98,7 +141,10 @@ class YOLOBBoxDetector:
 
         data_yaml = self.yolo_root / "dataset.yaml"
         if verbose:
-            print(f"[YOLO] Training model={model} data={data_yaml} epochs={epochs} imgsz={imgsz} batch={batch}")
+            print(
+                f"[YOLO] Training model={model} data={data_yaml} epochs={epochs} "
+                f"imgsz={imgsz} batch={batch} augmentation_profile={augmentation_profile}"
+            )
 
         self._model = YOLO(model)
         # On macOS, default to Metal (MPS) for speed if device not specified
@@ -112,16 +158,28 @@ class YOLOBBoxDetector:
         if amp is None:
             amp = False if (device in ("mps", None) and self._default_device == "mps") else True
 
+        train_args: Dict[str, Any] = {
+            "data": str(data_yaml),
+            "epochs": epochs,
+            "imgsz": imgsz,
+            "batch": batch,
+            "device": device,
+            "verbose": verbose,
+            "plots": plots,
+            "workers": workers,
+            "amp": amp,
+            # Use the same seed for the dataset membership and the optimizer /
+            # augmentation RNG. A paired A/B run then differs only by profile.
+            "seed": self.seed,
+            **train_overrides_for_profile(augmentation_profile),
+        }
+        if project is not None:
+            train_args["project"] = str(project)
+        if name:
+            train_args["name"] = str(name)
+
         self._model.train(
-            data=str(data_yaml),
-            epochs=epochs,
-            imgsz=imgsz,
-            batch=batch,
-            device=device,
-            verbose=verbose,
-            plots=False,
-            workers=workers,
-            amp=amp,
+            **train_args,
         )
         return self._model
 
@@ -235,6 +293,21 @@ class YOLOBBoxDetector:
         self._labels = classes
         self._label_to_id = {c: i for i, c in enumerate(classes)}
 
+        # A temporary external holdout may leave bbox rows whose source images
+        # are intentionally absent. Exclude those rows before shuffling so they
+        # neither create broken links nor distort the requested validation size.
+        missing_positives = [path for path in by_image if not path.is_file()]
+        if missing_positives:
+            print(
+                f"[INFO] Excluding {len(missing_positives)} bbox image(s) "
+                "whose source files are absent (external holdout)."
+            )
+            by_image = {
+                path: items
+                for path, items in by_image.items()
+                if path.is_file()
+            }
+
         imgs = list(by_image.keys())
         # Optionally add negative images (no boxes) from a separate directory
         if self.negatives_dir is not None and self.negatives_dir.exists():
@@ -317,6 +390,268 @@ class YOLOBBoxDetector:
         self._prepared = True
 
 
+def _validated_thresholds(thresholds: Sequence[float]) -> List[float]:
+    values = sorted({float(value) for value in thresholds})
+    if not values:
+        raise ValueError("at least one evaluation threshold is required")
+    if values[0] <= 0.0 or values[-1] > 1.0:
+        raise ValueError("evaluation thresholds must be greater than 0 and at most 1")
+    return values
+
+
+def summarize_image_scores(
+    samples: Sequence[Tuple[bool, float]],
+    thresholds: Sequence[float],
+) -> List[Dict[str, Union[int, float]]]:
+    """Calculate image-level recall and false-positive rate from max scores."""
+    threshold_values = _validated_thresholds(thresholds)
+    positive_scores = [float(score) for positive, score in samples if positive]
+    negative_scores = [float(score) for positive, score in samples if not positive]
+    rows: List[Dict[str, Union[int, float]]] = []
+    for threshold in threshold_values:
+        positive_detected = sum(score >= threshold for score in positive_scores)
+        negative_triggered = sum(score >= threshold for score in negative_scores)
+        triggered_total = positive_detected + negative_triggered
+        rows.append(
+            {
+                "threshold": threshold,
+                "positive_images": len(positive_scores),
+                "positive_detected": positive_detected,
+                "positive_recall": (
+                    positive_detected / len(positive_scores) if positive_scores else 0.0
+                ),
+                "negative_images": len(negative_scores),
+                "negative_triggered": negative_triggered,
+                "false_positive_rate": (
+                    negative_triggered / len(negative_scores) if negative_scores else 0.0
+                ),
+                "image_precision": (
+                    positive_detected / triggered_total if triggered_total else 0.0
+                ),
+            }
+        )
+    return rows
+
+
+def _dataset_split_fingerprint(yolo_root: Path, splits: Sequence[str] = ("train", "val")) -> str:
+    """Fingerprint dataset membership and labels used by a paired experiment."""
+    digest = hashlib.sha256()
+    for split in splits:
+        image_dir = yolo_root / "images" / split
+        label_dir = yolo_root / "labels" / split
+        for image_path in sorted(p for p in image_dir.iterdir() if p.is_file()):
+            label_path = label_dir / f"{image_path.stem}.txt"
+            digest.update(split.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(image_path.name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(label_path.read_bytes())
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def evaluate_weights_on_yolo_split(
+    weights: Union[str, Path],
+    yolo_root: Union[str, Path],
+    *,
+    split: str = "val",
+    thresholds: Sequence[float] = _DEFAULT_AB_THRESHOLDS,
+    imgsz: int = 320,
+    device: Optional[Union[int, str]] = None,
+    max_det: int = 5,
+) -> Dict[str, Any]:
+    """Evaluate positive recall and empty-image FP rate on one YOLO split."""
+    if YOLO is None:
+        raise RuntimeError("ultralytics is not installed. Install it to evaluate weights.")
+
+    threshold_values = _validated_thresholds(thresholds)
+    root = Path(yolo_root)
+    image_dir = root / "images" / split
+    label_dir = root / "labels" / split
+    exts = {".jpg", ".jpeg", ".png", ".bmp"}
+    image_paths = sorted(
+        path for path in image_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in exts
+    )
+    if not image_paths:
+        raise ValueError(f"no evaluation images found in {image_dir}")
+
+    positive_by_name: Dict[str, bool] = {}
+    for image_path in image_paths:
+        label_path = label_dir / f"{image_path.stem}.txt"
+        if not label_path.is_file():
+            raise FileNotFoundError(f"missing YOLO label for evaluation image: {label_path}")
+        positive_by_name[image_path.name] = bool(label_path.read_text().strip())
+
+    model = YOLO(str(weights))
+    results = model.predict(
+        source=[str(path) for path in image_paths],
+        conf=threshold_values[0],
+        iou=0.45,
+        imgsz=imgsz,
+        max_det=max_det,
+        classes=[0],
+        agnostic_nms=False,
+        device=device,
+        verbose=False,
+        stream=True,
+    )
+
+    samples: List[Tuple[bool, float]] = []
+    per_image: List[Dict[str, Union[str, bool, float]]] = []
+    for expected_path, result in zip(image_paths, results):
+        boxes = getattr(result, "boxes", None)
+        confidences = [] if boxes is None else boxes.conf.detach().cpu().tolist()
+        max_score = max((float(value) for value in confidences), default=0.0)
+        is_positive = positive_by_name[expected_path.name]
+        samples.append((is_positive, max_score))
+        per_image.append(
+            {
+                "image": expected_path.name,
+                "positive": is_positive,
+                "max_score": max_score,
+            }
+        )
+
+    if len(samples) != len(image_paths):
+        raise RuntimeError(
+            f"inference returned {len(samples)} results for {len(image_paths)} images"
+        )
+
+    return {
+        "weights": str(Path(weights).resolve()),
+        "split": split,
+        "images": len(samples),
+        "positive_images": sum(positive for positive, _score in samples),
+        "negative_images": sum(not positive for positive, _score in samples),
+        "thresholds": summarize_image_scores(samples, threshold_values),
+        "per_image": per_image,
+    }
+
+
+def _ab_deltas(
+    control: Dict[str, Any],
+    fixed_scene: Dict[str, Any],
+) -> List[Dict[str, float]]:
+    control_rows = {
+        float(row["threshold"]): row for row in control["thresholds"]
+    }
+    rows: List[Dict[str, float]] = []
+    for treatment_row in fixed_scene["thresholds"]:
+        threshold = float(treatment_row["threshold"])
+        control_row = control_rows[threshold]
+        rows.append(
+            {
+                "threshold": threshold,
+                "positive_recall_delta": (
+                    float(treatment_row["positive_recall"])
+                    - float(control_row["positive_recall"])
+                ),
+                "false_positive_rate_delta": (
+                    float(treatment_row["false_positive_rate"])
+                    - float(control_row["false_positive_rate"])
+                ),
+                "image_precision_delta": (
+                    float(treatment_row["image_precision"])
+                    - float(control_row["image_precision"])
+                ),
+            }
+        )
+    return rows
+
+
+def run_fixed_scene_ab(
+    detector: YOLOBBoxDetector,
+    *,
+    model: str,
+    epochs: int,
+    imgsz: int,
+    batch: int,
+    val_split: float,
+    device: Optional[Union[int, str]],
+    workers: Optional[int],
+    amp: Optional[bool],
+    thresholds: Sequence[float],
+    project: Optional[Union[str, Path]] = None,
+    name: Optional[str] = None,
+    report_path: Optional[Union[str, Path]] = None,
+) -> Path:
+    """Train default and fixed-scene profiles against one prepared dataset."""
+    if not detector._prepared:
+        detector._prepare_yolo(val_split=val_split)
+
+    run_prefix = name or time.strftime("fixed-scene-ab-%Y%m%d-%H%M%S")
+    trained: Dict[str, Dict[str, str]] = {}
+    for profile, suffix in (("default", "control"), ("fixed_scene", "fixed-scene")):
+        trained_model = detector.train(
+            model=model,
+            epochs=epochs,
+            imgsz=imgsz,
+            batch=batch,
+            val_split=val_split,
+            device=device,
+            verbose=True,
+            workers=workers,
+            amp=amp,
+            augmentation_profile=profile,
+            project=project,
+            name=f"{run_prefix}-{suffix}",
+            plots=True,
+        )
+        trainer = getattr(trained_model, "trainer", None)
+        save_dir_value = getattr(trainer, "save_dir", None)
+        if save_dir_value is None:
+            raise RuntimeError(f"could not resolve Ultralytics output directory for {profile}")
+        save_dir = Path(save_dir_value)
+        best = save_dir / "weights" / "best.pt"
+        if not best.is_file():
+            raise FileNotFoundError(f"best weights not found after {profile} training: {best}")
+        trained[profile] = {
+            "save_dir": str(save_dir.resolve()),
+            "weights": str(best.resolve()),
+        }
+
+    evaluations = {
+        profile: evaluate_weights_on_yolo_split(
+            details["weights"],
+            detector.yolo_root,
+            thresholds=thresholds,
+            imgsz=imgsz,
+            device=device,
+        )
+        for profile, details in trained.items()
+    }
+    report = {
+        "experiment": run_prefix,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "dataset": str(detector.yolo_root.resolve()),
+        "dataset_fingerprint": _dataset_split_fingerprint(detector.yolo_root),
+        "seed": detector.seed,
+        "model": model,
+        "epochs": epochs,
+        "imgsz": imgsz,
+        "batch": batch,
+        "profiles": {
+            "default": train_overrides_for_profile("default"),
+            "fixed_scene": train_overrides_for_profile("fixed_scene"),
+        },
+        "runs": trained,
+        "evaluation": evaluations,
+        "fixed_scene_minus_default": _ab_deltas(
+            evaluations["default"],
+            evaluations["fixed_scene"],
+        ),
+    }
+
+    if report_path is None:
+        report_parent = Path(trained["default"]["save_dir"]).parent
+        report_path = report_parent / f"{run_prefix}-comparison.json"
+    output = Path(report_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    return output
+
+
 def _iter_video_files(source: Path) -> List[Path]:
     """Return video files from a single file or recursively from a directory."""
     if source.is_file():
@@ -375,6 +710,12 @@ def write_bbox_size_limits(
         for row in reader:
             image_name = row["image"].strip()
             image_path = positives_path / image_name
+            # An external threshold-calibration holdout intentionally leaves
+            # bbox rows whose source image is absent. Check before Image.open:
+            # Ultralytics patches Pillow open failures as possible HEIF files
+            # and otherwise attempts an irrelevant pi-heif auto-install.
+            if not image_path.is_file():
+                continue
             try:
                 with Image.open(image_path) as im:
                     image_w, image_h = im.size
@@ -684,22 +1025,54 @@ if __name__ == "__main__":
         help="Optional .conf (INI) with parameters for selected subcommand; defaults to settings.conf when present",
     )
 
-    p_train = sub.add_parser("train", help="Prepare YOLO data from CSV and train")
-    p_train.add_argument("--positives_dir", type=Path, default=None, help="Directory containing images referenced by CSV")
-    p_train.add_argument("--bbox_file", type=Path, default=None, help="CSV with image,label,xmin,ymin,xmax,ymax")
-    p_train.add_argument("--yolo_root", type=Path, default=Path("yolo_data"), help="Output YOLO dataset root")
-    p_train.add_argument("--negatives_dir", type=Path, default=None, help="Optional directory of negative images (no boxes)")
-    p_train.add_argument("--model", type=str, default="yolov8n.pt", help="Ultralytics model or config (e.g., yolov8n.pt)")
-    p_train.add_argument("--epochs", type=int, default=50)
-    p_train.add_argument("--imgsz", type=int, default=320)
-    p_train.add_argument("--batch", type=int, default=16)
-    p_train.add_argument("--val_split", type=float, default=0.2)
-    p_train.add_argument("--device", type=str, default=_MAC_DEFAULT_DEVICE, help="Device id/name, e.g. '0', 'cpu', or 'mps'")
-    p_train.add_argument("--seed", type=int, default=0)
-    p_train.add_argument("--workers", type=int, default=None, help="Dataloader workers (default: 0 on mps, else 8)")
-    p_train.add_argument("--amp", type=lambda v: v.lower() in ("1","true","yes"), default=None, help="Use AMP mixed precision (default: False on mps, else True)")
-    p_train.add_argument("--bbox_limits_file", type=Path, default=_DEFAULT_BBOX_LIMITS_FILE, help="Daemon bbox size limits JSON written from training boxes")
-    p_train.add_argument("--bbox_size_multiplier", type=float, default=2.0, help="Linear multiplier applied to the largest annotated bbox")
+    def add_train_arguments(parser, *, ab: bool = False) -> None:
+        parser.add_argument("--positives_dir", type=Path, default=None, help="Directory containing images referenced by CSV")
+        parser.add_argument("--bbox_file", type=Path, default=None, help="CSV with image,label,xmin,ymin,xmax,ymax")
+        parser.add_argument("--yolo_root", type=Path, default=Path("yolo_data"), help="Output YOLO dataset root")
+        parser.add_argument("--negatives_dir", type=Path, default=None, help="Optional directory of negative images (no boxes)")
+        parser.add_argument("--model", type=str, default="yolov8n.pt", help="Ultralytics model or config (e.g., yolov8n.pt)")
+        parser.add_argument("--epochs", type=int, default=50)
+        parser.add_argument("--imgsz", type=int, default=320)
+        parser.add_argument("--batch", type=int, default=16)
+        parser.add_argument("--val_split", type=float, default=0.2)
+        parser.add_argument("--device", type=str, default=_MAC_DEFAULT_DEVICE, help="Device id/name, e.g. '0', 'cpu', or 'mps'")
+        parser.add_argument("--seed", type=int, default=0)
+        parser.add_argument("--workers", type=int, default=None, help="Dataloader workers (default: 0 on mps, else 8)")
+        parser.add_argument("--amp", type=lambda v: v.lower() in ("1","true","yes"), default=None, help="Use AMP mixed precision (default: False on mps, else True)")
+        parser.add_argument("--bbox_limits_file", type=Path, default=_DEFAULT_BBOX_LIMITS_FILE, help="Daemon bbox size limits JSON written from training boxes")
+        parser.add_argument("--bbox_size_multiplier", type=float, default=2.0, help="Linear multiplier applied to the largest annotated bbox")
+        parser.add_argument("--project", type=Path, default=None, help="Optional Ultralytics output project directory")
+        parser.add_argument("--name", type=str, default=None, help="Run name, or run-name prefix for train-ab")
+        parser.add_argument("--plots", type=lambda v: v.lower() in ("1","true","yes"), default=False, help="Write Ultralytics training plots")
+        if not ab:
+            parser.add_argument(
+                "--augmentation_profile",
+                choices=_AUGMENTATION_PROFILES,
+                default="fixed_scene",
+                help="Training augmentation profile",
+            )
+
+    p_train = sub.add_parser("train", help="Prepare YOLO data and train one augmentation profile")
+    add_train_arguments(p_train)
+
+    p_ab = sub.add_parser(
+        "train-ab",
+        help="Train default and fixed-scene augmentation profiles on identical image sets",
+    )
+    add_train_arguments(p_ab, ab=True)
+    p_ab.add_argument(
+        "--thresholds",
+        type=float,
+        nargs="+",
+        default=list(_DEFAULT_AB_THRESHOLDS),
+        help="Confidence thresholds for paired image-level evaluation",
+    )
+    p_ab.add_argument(
+        "--report",
+        type=Path,
+        default=None,
+        help="Comparison JSON path (default: alongside the paired training runs)",
+    )
 
     p_pred = sub.add_parser("predict", help="Run inference using trained weights")
     p_pred.add_argument("--weights", type=Path, default=None, help="Path to .pt weights (default: newest runs/detect weights)")
@@ -753,7 +1126,7 @@ if __name__ == "__main__":
     if args.config:
         cfg = configparser.ConfigParser()
         cfg.read(args.config)
-        sect = args.cmd
+        sect = "train" if args.cmd == "train-ab" else args.cmd
         if sect not in cfg and sect.replace("-", "_") in cfg:
             sect = sect.replace("-", "_")
         if sect not in cfg and args.cmd in ("extract-false-positives", "false-positives") and "false_positives" in cfg:
@@ -764,7 +1137,7 @@ if __name__ == "__main__":
                 if flag in c and not _attr_supplied(attr):
                     setattr(args, attr, cast(c[flag]))
 
-            if args.cmd == "train":
+            if args.cmd in ("train", "train-ab"):
                 set_if("positives_dir", "positives_dir", Path)
                 set_if("bbox_file", "bbox_file", Path)
                 set_if("yolo_root", "yolo_root", Path)
@@ -780,6 +1153,12 @@ if __name__ == "__main__":
                 set_if("seed", "seed", int)
                 set_if("bbox_limits_file", "bbox_limits_file", Path)
                 set_if("bbox_size_multiplier", "bbox_size_multiplier", float)
+                set_if("project", "project", Path)
+                set_if("name", "name", str)
+                if args.cmd == "train":
+                    set_if("augmentation_profile", "augmentation_profile", str)
+                if "plots" in c and not _attr_supplied("plots"):
+                    setattr(args, "plots", c.getboolean("plots"))
                 if "workers" in c and not _attr_supplied("workers"):
                     w = c["workers"].strip()
                     setattr(args, "workers", int(w) if w else None)
@@ -823,7 +1202,7 @@ if __name__ == "__main__":
                     setattr(args, "limit", int(lim) if lim else None)
 
     # Validate required args after applying config
-    if args.cmd == "train":
+    if args.cmd in ("train", "train-ab"):
         if args.positives_dir is None or args.bbox_file is None:
             ap.error("--positives_dir and --bbox_file are required (via CLI or --conf [train] section)")
     elif args.cmd == "predict":
@@ -843,7 +1222,7 @@ if __name__ == "__main__":
         if args.source is None:
             ap.error("--source is required (via CLI or --conf [extract_false_positives] section)")
     
-    if args.cmd == "train":
+    if args.cmd in ("train", "train-ab"):
         det = YOLOBBoxDetector(
             positives_dir=args.positives_dir,
             bbox_file=args.bbox_file,
@@ -858,18 +1237,40 @@ if __name__ == "__main__":
             size_multiplier=args.bbox_size_multiplier,
         )
         print(f"[BBOX] Wrote daemon bbox limits: {limits_path}")
-        model = det.train(
-            model=args.model,
-            epochs=args.epochs,
-            imgsz=args.imgsz,
-            batch=args.batch,
-            val_split=args.val_split,
-            device=args.device,
-            verbose=True,
-            workers=args.workers,
-            amp=args.amp,
-        )
-        print("[DONE] Training complete. Best weights saved under ultralytics runs directory.")
+        if args.cmd == "train":
+            model = det.train(
+                model=args.model,
+                epochs=args.epochs,
+                imgsz=args.imgsz,
+                batch=args.batch,
+                val_split=args.val_split,
+                device=args.device,
+                verbose=True,
+                workers=args.workers,
+                amp=args.amp,
+                augmentation_profile=args.augmentation_profile,
+                project=args.project,
+                name=args.name,
+                plots=args.plots,
+            )
+            print("[DONE] Training complete. Best weights saved under ultralytics runs directory.")
+        else:
+            report = run_fixed_scene_ab(
+                det,
+                model=args.model,
+                epochs=args.epochs,
+                imgsz=args.imgsz,
+                batch=args.batch,
+                val_split=args.val_split,
+                device=args.device,
+                workers=args.workers,
+                amp=args.amp,
+                thresholds=args.thresholds,
+                project=args.project,
+                name=args.name,
+                report_path=args.report,
+            )
+            print(f"[DONE] Paired fixed-scene A/B report: {report}")
 
     elif args.cmd == "predict":
         if YOLO is None:

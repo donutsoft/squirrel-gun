@@ -66,8 +66,9 @@ This document captures the working knowledge added while extending the project: 
 ## Persistent Training Data
 - Code lives entirely under `squirrel-daemon`; generated data does not.
 - The data root is `squirrel-training-data` beside `clicks.db` (normally `/home/pi/squirrel-training-data` on the Pi), so `deploy.sh` does not remove it.
-- False-positive labels analyze every frame and save the two frames with the highest squirrel confidence under `negatives/`.
-- True-positive labels analyze every frame at a lower mining threshold and save the highest-confidence below-live-threshold detection from each matching frame under `positives/`, with at most one box per new image in `bboxes.txt` using `image,label,xmin,ymin,xmax,ymax`.
+- New recordings retain lossless 320x320 detector-ready PNG frames under `static/recordings/.training-source/<recording-stem>/`; labeling uses these instead of confidence-distorting MP4 frames. Deleting recordings also deletes their retained detector frames.
+- False-positive labels save only the highest-confidence frame that meets the live detection threshold under `negatives/`, avoiding near-duplicate training images from the same recording.
+- True-positive labels run the retained frames at a lower mining threshold and save the highest-confidence detection from the hard-positive band below the live threshold under `positives/`, with at most one box per new image in `bboxes.txt` using `image,label,xmin,ymin,xmax,ymax`.
 - `recording_labels.json` tracks completed labels and generated files. Relabeling a clip replaces its earlier derived files and bbox rows.
 - The labeling service recreates the dataset directories and empty bbox file when the persistent training-data root is removed while the daemon is running.
 

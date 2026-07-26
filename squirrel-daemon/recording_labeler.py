@@ -253,16 +253,21 @@ class RecordingLabelService:
     def _analyze(self, video_path: Path, label: str, stage_dir: Path, job_id: str) -> Dict[str, Any]:
         detector = self._detector_provider()
         config = detector.config()
-        live_threshold = float(config.get("score_thresh", 0.6))
+        live_threshold = float(config.get("score_thresh", 0.25))
         if not 0.0 < live_threshold <= 1.0:
             raise ValueError(f"invalid configured squirrel threshold: {live_threshold}")
 
-        cap = self._cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            cap.release()
-            raise RuntimeError(f"could not open recording: {video_path.name}")
-
-        total = int(cap.get(self._cv2.CAP_PROP_FRAME_COUNT) or 0)
+        source_dir = video_path.parent / ".training-source" / video_path.stem
+        source_paths = sorted(source_dir.glob("frame*.png")) if source_dir.is_dir() else []
+        cap = None
+        if source_paths:
+            total = len(source_paths)
+        else:
+            cap = self._cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                cap.release()
+                raise RuntimeError(f"could not open recording: {video_path.name}")
+            total = int(cap.get(self._cv2.CAP_PROP_FRAME_COUNT) or 0)
         with self._lock:
             self._update_job(job_id, total_frames=total if total > 0 else None)
 
@@ -272,9 +277,20 @@ class RecordingLabelService:
         frame_index = -1
         try:
             while True:
-                ok, frame = cap.read()
-                if not ok or frame is None:
-                    break
+                if source_paths:
+                    next_index = frame_index + 1
+                    if next_index >= len(source_paths):
+                        break
+                    frame = self._cv2.imread(str(source_paths[next_index]))
+                    if frame is None:
+                        raise RuntimeError(
+                            f"could not read detector training source: {source_paths[next_index]}"
+                        )
+                else:
+                    assert cap is not None
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        break
                 frame_index += 1
                 mining_threshold = (
                     self._false_positive_mining_threshold
@@ -287,10 +303,14 @@ class RecordingLabelService:
                 )
 
                 if label == "false_positive":
-                    if detections:
-                        score = max(float(item["score"]) for item in detections)
+                    live_detections = [
+                        item for item in detections
+                        if float(item["score"]) >= live_threshold
+                    ]
+                    if live_detections:
+                        score = max(float(item["score"]) for item in live_detections)
                         entry = (score, frame_index, letterboxed.copy())
-                        if len(top_negatives) < 2:
+                        if len(top_negatives) < 1:
                             heapq.heappush(top_negatives, entry)
                         elif (score, frame_index) > (top_negatives[0][0], top_negatives[0][1]):
                             heapq.heapreplace(top_negatives, entry)
@@ -311,7 +331,8 @@ class RecordingLabelService:
                     with self._lock:
                         self._update_job(job_id, processed_frames=frame_index + 1)
         finally:
-            cap.release()
+            if cap is not None:
+                cap.release()
 
         if label == "false_positive":
             for score, index, image in sorted(top_negatives, key=lambda item: (item[0], item[1]), reverse=True):
@@ -326,6 +347,7 @@ class RecordingLabelService:
             "bbox_rows": bbox_rows,
             "processed_frames": frame_index + 1 if frame_index >= 0 else 0,
             "live_threshold": live_threshold,
+            "frame_source": "lossless_detector_frames" if source_paths else "mp4",
         }
 
     def _commit(self, recording_name: str, label: str, stage_dir: Path, summary: Dict[str, Any]) -> None:
@@ -360,6 +382,7 @@ class RecordingLabelService:
             "processed_frames": int(summary["processed_frames"]),
             "saved_frames": len(summary["images"]),
             "live_threshold": float(summary["live_threshold"]),
+            "frame_source": str(summary["frame_source"]),
             "generated": summary["images"],
             "updated_at": time.time(),
         }

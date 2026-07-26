@@ -112,12 +112,12 @@ class RecordingLabelServiceTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail("labeling job did not finish")
 
-    def test_false_positive_saves_only_two_highest_scoring_frames(self):
+    def test_false_positive_saves_only_frames_at_or_above_live_threshold(self):
         detector = FakeDetector({
             0: [detection(0.10)],
             1: [detection(0.80)],
-            2: [detection(0.30)],
-            3: [detection(0.20)],
+            2: [detection(0.70)],
+            3: [detection(0.60)],
         })
         service = self.make_service(detector)
 
@@ -125,13 +125,32 @@ class RecordingLabelServiceTests(unittest.TestCase):
         status = self.wait_for_job(service, self.video.name)
 
         self.assertEqual("complete", status["state"])
-        self.assertEqual(2, status["saved_frames"])
+        self.assertEqual(1, status["saved_frames"])
         names = {path.name for path in service.negatives_dir.glob("*.jpg")}
         self.assertEqual({
             "rec_20260717_120000_123_frame00000001.jpg",
-            "rec_20260717_120000_123_frame00000002.jpg",
         }, names)
         self.assertEqual([], service._read_bbox_rows())
+
+    def test_uses_lossless_detector_frames_instead_of_mp4_frames(self):
+        source_dir = self.video.parent / ".training-source" / self.video.stem
+        source_dir.mkdir(parents=True)
+        source_frame = np.full((320, 320, 3), 9, dtype=np.uint8)
+        self.assertTrue(cv2.imwrite(str(source_dir / "frame00000000.png"), source_frame))
+        detector = FakeDetector({
+            0: [detection(0.90)],
+            9: [detection(0.80)],
+        })
+        service = self.make_service(detector)
+
+        service.start(self.video, "false_positive")
+        status = self.wait_for_job(service, self.video.name)
+
+        self.assertEqual("complete", status["state"])
+        self.assertEqual(1, status["processed_frames"])
+        frames = service.list_frames()["negatives"]
+        self.assertEqual(1, len(frames))
+        self.assertEqual(0.80, frames[0]["score"])
 
     def test_true_positive_saves_below_live_threshold_and_writes_one_best_box(self):
         detector = FakeDetector({
@@ -257,7 +276,7 @@ class RecordingLabelServiceTests(unittest.TestCase):
         self.assertEqual("false_positive", status["label"])
         self.assertEqual([], list(service.positives_dir.glob("*.jpg")))
         self.assertEqual([], service._read_bbox_rows())
-        self.assertEqual(2, len(list(service.negatives_dir.glob("*.jpg"))))
+        self.assertEqual(1, len(list(service.negatives_dir.glob("*.jpg"))))
 
 
 if __name__ == "__main__":

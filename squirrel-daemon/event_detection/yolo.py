@@ -23,9 +23,12 @@ class YOLOEventDetector(EventDetector):
 
     def __init__(self, model_filename: str = "best_full_integer_quant_edgetpu.tflite") -> None:
         self._enabled = True
-        # Edge-TPU confidence tiers differ materially from desktop .pt inference.
-        # Tune this value only from on-device evaluation with the deployed model.
-        self._score_thresh = 0.6
+        # On-device calibration for the fixed-scene model found a clean gap:
+        # the strongest of 111 negative trials scored 0.191, while every held-
+        # out positive burst reached at least 0.326. Keep the live threshold
+        # inside that gap. Edge-TPU scores are not interchangeable with .pt
+        # model confidence values, so recalibrate after changing models.
+        self._score_thresh = 0.25
         self._frame_skip = 0
         self._allowed_classes: Optional[Sequence[int]] = None
         self._label_map: Optional[Dict[int, str]] = None
@@ -237,6 +240,12 @@ class YOLOEventDetector(EventDetector):
             )
         ]
         return letterboxed, detections
+
+    @classmethod
+    def prepare_input_frame(cls, frame: Any) -> Any:
+        """Return the exact 320px image format supplied to the detector."""
+        letterboxed, _scale, _left, _top = cls._letterbox(frame)
+        return letterboxed
 
     @staticmethod
     def _letterbox(frame: Any) -> Tuple[Any, float, int, int]:
