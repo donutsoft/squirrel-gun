@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -41,6 +42,13 @@ class FixedSceneProfileTests(unittest.TestCase):
 
     def test_default_profile_passes_no_augmentation_overrides(self) -> None:
         self.assertEqual({}, train_overrides_for_profile("default"))
+
+    def test_default_training_profile_uses_ultralytics_augmentations(self) -> None:
+        parameter = inspect.signature(YOLOBBoxDetector.train).parameters[
+            "augmentation_profile"
+        ]
+
+        self.assertEqual("default", parameter.default)
 
     def test_unknown_profile_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown augmentation profile"):

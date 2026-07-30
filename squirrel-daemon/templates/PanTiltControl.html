@@ -64,7 +64,7 @@
               </label>
               <label style="display:inline-flex; align-items:center; gap:6px;">
                 <span>YOLO threshold</span>
-                <input id="yolo-score-thresh" type="number" min="0.01" max="1" step="0.01" value="0.65"
+                <input id="yolo-score-thresh" type="number" min="0.01" max="1" step="0.01" value="0.05"
                        title="Minimum squirrel confidence required for a live YOLO detection"
                        style="width: 82px;" />
               </label>
@@ -582,7 +582,7 @@
         const parsed = Number(yoloScoreThresh.value);
         const threshold = Number.isFinite(parsed)
           ? Math.max(0.01, Math.min(1, parsed))
-          : 0.65;
+          : 0.05;
         yoloScoreThresh.value = threshold.toFixed(2);
         setMotionConfig({
           enabled: motionEnable.checked,

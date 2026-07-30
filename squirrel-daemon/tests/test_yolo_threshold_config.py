@@ -45,7 +45,7 @@ class FakeDetector:
 
 class YOLOThresholdTests(unittest.TestCase):
     def test_default_matches_calibrated_yolo26_threshold(self) -> None:
-        self.assertEqual(0.65, DEFAULT_YOLO_SCORE_THRESH)
+        self.assertEqual(0.05, DEFAULT_YOLO_SCORE_THRESH)
 
     def test_threshold_validation_rejects_out_of_range_values(self) -> None:
         for value in (0, -0.1, 1.01, math.nan, math.inf, "not-a-number"):

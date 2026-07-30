@@ -1,28 +1,27 @@
 ## YOLO bounding box detector
 
-The active model is YOLO26n, replacing YOLOv8n while retaining the same 320px
-input, batch size, dataset split, fixed-scene augmentation, and confidence
-thresholds. Keeping those controls fixed makes the first deployed run a useful
-latency and accuracy comparison. Training and device inference are pinned to
-the same YOLO26-capable Ultralytics release.
+The active model is YOLO26n at 320px with Ultralytics' standard augmentation
+recipe. A real external holdout showed that the brightness-only `fixed_scene`
+profile overfit the camera background and generalized poorly across new
+squirrel positions and poses. Training and device inference are pinned to the
+same YOLO26-capable Ultralytics release.
 
-Train the full fixed-scene model with the values in `settings.conf`:
+Train the full default-augmentation model with the values in `settings.conf`:
 
 ```bash
 uv run yolo_bbox_detector.py --conf settings.conf train
 ```
 
-This produces the named run `runs/detect/yolo26n_fixed_scene_full`. The
+This produces the named run `runs/detect/yolo26n_default_aug_full`. The
 pretrained `yolo26n.pt` checkpoint is downloaded automatically on first use,
 then all 50 configured epochs run against the complete prepared training split.
 Do not tune confidence thresholds from desktop `.pt` results; first export and
 deploy the Edge TPU model, compare its inference timing with the 21.5ms YOLOv8n
 baseline, and then evaluate thresholds on the device.
 
-`fixed_scene` is the normal training profile. It disables mosaic, flips,
-translation, scaling, rotation, shear, perspective, and image compositing.
-Only brightness augmentation remains, since camera geometry is invariant and
-the relevant scene change is day versus night.
+`default` is the normal training profile. It retains mosaic, translation,
+scaling, flipping, and the rest of Ultralytics' standard recipe. The
+`fixed_scene` profile remains available only for controlled comparisons.
 
 To run a paired augmentation A/B test using the existing images:
 
@@ -44,7 +43,7 @@ threshold. Use `--name EXPERIMENT_NAME` to set the paired run prefix,
 `--thresholds ...` to change thresholds, or `--report PATH` to select the JSON
 location.
 
-After exporting and deploying the fixed-scene model, stop the Flask daemon so
+After exporting and deploying the default-augmentation model, stop the Flask daemon so
 it releases the Edge TPU, then evaluate the deployed model on the existing
 labeled recordings plus a deterministic sample of additional known-negative
 backyard images:
@@ -58,7 +57,7 @@ uv run python -B evaluate_thresholds.py \
   --extra-negative-limit 100 \
   --extra-negative-seed 42 \
   --thresholds 0.2 0.25 0.3 0.4 0.5 0.6 0.7 0.8 \
-  --output-dir threshold_evaluation_fixed_scene
+  --output-dir threshold_evaluation_yolo26_default_aug
 ```
 
 The holdout contains complete recording bursts removed before training, with
@@ -66,7 +65,7 @@ both day and night examples. Keeping neighboring frames together avoids
 train/test leakage from nearly identical frames. The evaluator also excludes
 images already referenced by the recording manifest, so additional images are
 not double-counted. The console summary and
-`threshold_evaluation_fixed_scene/report.json` show true-positive recall and
+`threshold_evaluation_yolo26_default_aug/report.json` show true-positive recall and
 false-positive rate at each threshold. This existing holdout is useful for
 initial calibration, but it does not replace a later check on recordings
 captured after deployment.

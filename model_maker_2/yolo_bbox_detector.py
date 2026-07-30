@@ -30,6 +30,7 @@ _LETTERBOX_PAD_COLOR = 114
 _DEFAULT_BBOX_LIMITS_FILE = _SCRIPT_DIR.parent / "squirrel-daemon" / "yolo_bbox_limits.json"
 _DEFAULT_MODEL = "yolo26n.pt"
 _AUGMENTATION_PROFILES = ("default", "fixed_scene")
+_DEFAULT_AUGMENTATION_PROFILE = "default"
 _DEFAULT_AB_THRESHOLDS = (0.4, 0.5, 0.6, 0.7, 0.8)
 _FIXED_SCENE_TRAIN_OVERRIDES: Dict[str, Union[int, float]] = {
     # The camera and scene geometry are invariant. Preserve that geometry so
@@ -123,7 +124,7 @@ class YOLOBBoxDetector:
         verbose: bool = True,
         workers: Optional[int] = None,
         amp: Optional[bool] = None,
-        augmentation_profile: str = "fixed_scene",
+        augmentation_profile: str = _DEFAULT_AUGMENTATION_PROFILE,
         project: Optional[Union[str, Path]] = None,
         name: Optional[str] = None,
         plots: bool = False,
@@ -1054,7 +1055,7 @@ if __name__ == "__main__":
             parser.add_argument(
                 "--augmentation_profile",
                 choices=_AUGMENTATION_PROFILES,
-                default="fixed_scene",
+                default=_DEFAULT_AUGMENTATION_PROFILE,
                 help="Training augmentation profile",
             )
 

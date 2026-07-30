@@ -13,7 +13,7 @@ from .base import EventDetector, DetectionEvent, DetectionResult
 from ultralytics import YOLO  # type: ignore
 
 
-DEFAULT_YOLO_SCORE_THRESH = 0.65
+DEFAULT_YOLO_SCORE_THRESH = 0.05
 
 
 def validate_yolo_score_threshold(value: Any) -> float:
@@ -33,11 +33,10 @@ class YOLOEventDetector(EventDetector):
 
     def __init__(self, model_filename: str = "best_full_integer_quant_edgetpu.tflite") -> None:
         self._enabled = True
-        # On-device YOLO26n calibration found a clean gap: the strongest
-        # negative scored 0.6339 (a bird), while the next positive detections
-        # scored 0.6705. A 0.65 threshold rejected every negative burst while
-        # retaining a detection in every positive burst. Edge-TPU scores are
-        # model-specific, so recalibrate after changing models.
+        # On-device evaluation of the default-augmentation YOLO26n Edge-TPU
+        # model found that 0.05 rejected every available negative holdout while
+        # retaining 61/75 positive holdouts. Edge-TPU scores are model-specific,
+        # so recalibrate after changing models.
         self._score_thresh = DEFAULT_YOLO_SCORE_THRESH
         self._frame_skip = 0
         self._allowed_classes: Optional[Sequence[int]] = None
