@@ -183,7 +183,7 @@
         <h2>Water</h2>
         <div class="hint" style="margin-bottom:8px;">
           For recoil calibration, aim the laser near the center of a stationary surface. The calibration
-          fires water for two seconds, measures how far the laser moves, and saves the correction.
+          performs three two-second water pulses, uses the median laser movement, and saves the correction.
         </div>
         <div class="actions" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
           <button id="calibrate-recoil" class="secondary">Calibrate Recoil</button>
@@ -830,7 +830,9 @@
           recoilStatus.textContent = 'Not calibrated; firing uses the normal aim position.';
           return;
         }
-        recoilStatus.textContent = `Recoil #${calibration.id}: laser moved ${describePixelDirection(calibration.shift_x_px, calibration.shift_y_px)}; correction is applied while firing.`;
+        const sampleCount = Number(calibration.metadata?.sample_count || 1);
+        const sampleText = sampleCount > 1 ? ` (median of ${sampleCount})` : '';
+        recoilStatus.textContent = `Recoil #${calibration.id}${sampleText}: laser moved ${describePixelDirection(calibration.shift_x_px, calibration.shift_y_px)}; correction is applied while firing.`;
       }
 
       async function refreshRecoilCalibration() {
@@ -845,7 +847,7 @@
       }
 
       recoilBtn?.addEventListener('click', async () => {
-        if (!confirm('Recoil calibration will turn on the laser and fire water for two seconds. Continue?')) return;
+        if (!confirm('Recoil calibration will turn on the laser and perform three two-second water pulses. Continue?')) return;
         recoilBtn.disabled = true;
         const originalText = recoilBtn.textContent;
         recoilBtn.textContent = 'Calibrating…';
@@ -854,7 +856,7 @@
           const res = await fetch('/api/calibration/recoil', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ water_duration_sec: 2 })
+            body: JSON.stringify({ water_duration_sec: 2, sample_count: 3 })
           });
           const data = await res.json().catch(() => ({}));
           if (!res.ok) throw new Error(data.error || res.statusText);

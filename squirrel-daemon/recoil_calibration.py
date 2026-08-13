@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Protocol, Tuple
+import statistics
+from typing import Any, Dict, Protocol, Sequence, Tuple
 
 
 class AimModel(Protocol):
@@ -20,6 +21,45 @@ def _dot_center(name: str, dot: Dict[str, Any]) -> Tuple[float, float]:
     if not isinstance(dot, dict):
         raise ValueError(f"{name} laser dot is missing")
     return _finite(f"{name}.cx", dot.get("cx")), _finite(f"{name}.cy", dot.get("cy"))
+
+
+def median_recoil_sample(
+    samples: Sequence[Tuple[Dict[str, Any], Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """Combine repeated baseline/firing observations component by component.
+
+    The median of three displacement measurements rejects one errant laser-dot
+    observation. Baseline position is also medianed so small camera/dot jitter
+    does not bias the image position used to translate pixels into angles.
+    """
+    if not samples:
+        raise ValueError("at least one recoil sample is required")
+
+    baseline_xs = []
+    baseline_ys = []
+    shift_xs = []
+    shift_ys = []
+    for index, (baseline_dot, firing_dot) in enumerate(samples, start=1):
+        baseline_x, baseline_y = _dot_center(f"sample {index} baseline", baseline_dot)
+        firing_x, firing_y = _dot_center(f"sample {index} firing", firing_dot)
+        baseline_xs.append(baseline_x)
+        baseline_ys.append(baseline_y)
+        shift_xs.append(firing_x - baseline_x)
+        shift_ys.append(firing_y - baseline_y)
+
+    baseline_x = float(statistics.median(baseline_xs))
+    baseline_y = float(statistics.median(baseline_ys))
+    shift_x = float(statistics.median(shift_xs))
+    shift_y = float(statistics.median(shift_ys))
+    return {
+        "baseline_dot": {"cx": baseline_x, "cy": baseline_y},
+        "firing_dot": {"cx": baseline_x + shift_x, "cy": baseline_y + shift_y},
+        "sample_count": len(samples),
+        "shift_x_samples_px": shift_xs,
+        "shift_y_samples_px": shift_ys,
+        "shift_x_range_px": max(shift_xs) - min(shift_xs),
+        "shift_y_range_px": max(shift_ys) - min(shift_ys),
+    }
 
 
 def calculate_recoil_calibration(

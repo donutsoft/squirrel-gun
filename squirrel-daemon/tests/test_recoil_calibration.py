@@ -11,7 +11,11 @@ if str(DAEMON_ROOT) not in sys.path:
     sys.path.insert(0, str(DAEMON_ROOT))
 
 from db import ClickStore
-from recoil_calibration import calculate_recoil_calibration, compensated_angles
+from recoil_calibration import (
+    calculate_recoil_calibration,
+    compensated_angles,
+    median_recoil_sample,
+)
 
 
 class SimpleAimer:
@@ -20,6 +24,28 @@ class SimpleAimer:
 
 
 class RecoilCalibrationTests(unittest.TestCase):
+    def test_three_samples_use_median_displacement_and_reject_outlier(self) -> None:
+        aggregate = median_recoil_sample([
+            ({"cx": 500.0, "cy": 400.0}, {"cx": 503.0, "cy": 380.0}),
+            ({"cx": 501.0, "cy": 399.0}, {"cx": 504.5, "cy": 378.0}),
+            ({"cx": 499.0, "cy": 401.0}, {"cx": 560.0, "cy": 470.0}),
+        ])
+
+        self.assertEqual({"cx": 500.0, "cy": 400.0}, aggregate["baseline_dot"])
+        self.assertEqual({"cx": 503.5, "cy": 380.0}, aggregate["firing_dot"])
+        self.assertEqual([3.0, 3.5, 61.0], aggregate["shift_x_samples_px"])
+        self.assertEqual([-20.0, -21.0, 69.0], aggregate["shift_y_samples_px"])
+        self.assertEqual(3, aggregate["sample_count"])
+
+    def test_two_samples_use_midpoint_displacement(self) -> None:
+        aggregate = median_recoil_sample([
+            ({"cx": 100.0, "cy": 100.0}, {"cx": 104.0, "cy": 90.0}),
+            ({"cx": 102.0, "cy": 98.0}, {"cx": 108.0, "cy": 84.0}),
+        ])
+
+        self.assertEqual({"cx": 101.0, "cy": 99.0}, aggregate["baseline_dot"])
+        self.assertEqual({"cx": 106.0, "cy": 87.0}, aggregate["firing_dot"])
+
     def test_laser_rising_produces_downward_prefire_compensation(self) -> None:
         calibration = calculate_recoil_calibration(
             baseline_dot={"cx": 500.0, "cy": 400.0},

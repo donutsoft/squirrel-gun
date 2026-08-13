@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -28,6 +28,22 @@ class LaserDotOptions:
     min_on_mean: float = 80.0
     peak_window: int = 21
     peak_candidates: int = 8
+
+
+def recoil_laser_dot_options(options: LaserDotOptions) -> LaserDotOptions:
+    """Tune peak extraction for a laser dot intersecting a bright water streak.
+
+    At night the illuminated spray can connect the dot to a long diagonal
+    component. A smaller closing/window size keeps the impact end separable,
+    while examining more local peaks lets expected-position ranking find that
+    end instead of selecting a brighter point farther along the stream.
+    """
+    return replace(
+        options,
+        close_size=1,
+        peak_window=15,
+        peak_candidates=max(30, int(options.peak_candidates)),
+    )
 
 
 def _odd_size(size: int) -> int:

@@ -13,10 +13,48 @@ DAEMON_ROOT = Path(__file__).resolve().parents[1]
 if str(DAEMON_ROOT) not in sys.path:
     sys.path.insert(0, str(DAEMON_ROOT))
 
-from laser_dot_detector import LaserDotOptions, detect_laser_dot
+from laser_dot_detector import (
+    LaserDotOptions,
+    detect_laser_dot,
+    recoil_laser_dot_options,
+)
 
 
 class VerifiedLaserDotDetectorTests(unittest.TestCase):
+    def test_recoil_options_separate_dot_from_water_streak(self) -> None:
+        original = LaserDotOptions(close_size=9, peak_window=21, peak_candidates=8)
+
+        recoil = recoil_laser_dot_options(original)
+
+        self.assertEqual(1, recoil.close_size)
+        self.assertEqual(15, recoil.peak_window)
+        self.assertEqual(30, recoil.peak_candidates)
+        self.assertEqual(9, original.close_size)
+
+    def test_recoil_options_find_expected_end_of_bright_streak(self) -> None:
+        off = np.full((120, 160, 3), 20, dtype=np.uint8)
+        on = off.copy()
+        cv2.line(on, (80, 85), (159, 6), (255, 255, 255), 3)
+        cv2.circle(on, (80, 85), 4, (255, 255, 255), -1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            off_path = root / "off.png"
+            on_path = root / "on.png"
+            self.assertTrue(cv2.imwrite(str(off_path), off))
+            self.assertTrue(cv2.imwrite(str(on_path), on))
+
+            result = detect_laser_dot(
+                on_path,
+                off_path,
+                options=recoil_laser_dot_options(LaserDotOptions()),
+                expected_xy=(80.0, 85.0),
+                max_expected_distance=20.0,
+            )
+
+        self.assertIsNotNone(result["dot"])
+        self.assertLess(float(result["dot"]["expected_distance_px"]), 10.0)
+
     def test_two_cycle_verification_rejects_transient_motion(self) -> None:
         background = np.full((120, 160, 3), 20, dtype=np.uint8)
         off_one = background.copy()

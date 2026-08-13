@@ -18,10 +18,18 @@ from calibration_optimizer import (
     summarize_round,
     target_error_px,
 )
-from laser_dot_detector import LaserDotOptions, detect_laser_dot
+from laser_dot_detector import (
+    LaserDotOptions,
+    detect_laser_dot,
+    recoil_laser_dot_options,
+)
 from event_bus import EventBus
 from recording_labeler import LabelingInProgress, RecordingLabelService
-from recoil_calibration import calculate_recoil_calibration, compensated_angles
+from recoil_calibration import (
+    calculate_recoil_calibration,
+    compensated_angles,
+    median_recoil_sample,
+)
 from .aiming import Calculate_Hose_Angles
 import time
 import re
@@ -1450,7 +1458,10 @@ def recoil_calibration_run():
         discard_frames = max(0, min(10, int(data.get("discard_frames", 2))))
         edge_margin_px = max(0.0, min(200.0, float(data.get("edge_margin_px", 20.0))))
         edge_margin_frac = max(0.0, min(0.25, float(data.get("edge_margin_frac", 0.03))))
-        max_shift_fraction = max(0.01, min(0.5, float(data.get("max_shift_fraction", 0.2))))
+        max_shift_fraction = max(0.01, min(0.5, float(data.get("max_shift_fraction", 0.08))))
+        sample_count = int(data.get("sample_count", 3))
+        if sample_count not in (2, 3):
+            raise ValueError("recoil sample_count must be 2 or 3")
         options = _parse_laser_dot_options(data)
     except (TypeError, ValueError) as exc:
         _water_lock.release()
@@ -1467,8 +1478,8 @@ def recoil_calibration_run():
         _water_lock.release()
         _calibration_lock.release()
         return jsonify({"error": f"could not create recoil calibration run: {exc}"}), 500
-    baseline_debug = None
-    firing_debug = None
+    samples = []
+    sample_debug = []
     water_end_monotonic = None
 
     try:
@@ -1484,58 +1495,92 @@ def recoil_calibration_run():
             raise ValueError(
                 "automatic aim calibration is required before recoil calibration"
             )
+        firing_options = recoil_laser_dot_options(options)
 
-        baseline, baseline_debug = _capture_recoil_laser_dot(
-            run_dir=run_dir,
-            prefix="baseline",
-            options=options,
-            laser_settle_sec=laser_settle_sec,
-            capture_timeout_sec=capture_timeout_sec,
-            discard_frames=discard_frames,
-        )
-        baseline_dot = baseline.get("dot")
-        if not isinstance(baseline_dot, dict):
-            raise ValueError("laser dot was not detected before firing")
-        image_width = float(baseline.get("image_width", 0))
-        image_height = float(baseline.get("image_height", 0))
-        edge_reason, _ = _dot_edge_reason(
-            baseline_dot,
-            image_width,
-            image_height,
-            edge_margin_px,
-            edge_margin_frac,
-        )
-        if edge_reason:
-            raise ValueError("baseline laser dot is too close to the image edge; aim nearer the center")
+        image_width = 0.0
+        image_height = 0.0
+        for sample_index in range(sample_count):
+            prefix = f"sample_{sample_index + 1:02d}"
+            baseline, baseline_debug = _capture_recoil_laser_dot(
+                run_dir=run_dir,
+                prefix=f"{prefix}_baseline",
+                options=options,
+                laser_settle_sec=laser_settle_sec,
+                capture_timeout_sec=capture_timeout_sec,
+                discard_frames=discard_frames,
+            )
+            baseline_dot = baseline.get("dot")
+            if not isinstance(baseline_dot, dict):
+                raise ValueError(
+                    f"laser dot was not detected before firing sample {sample_index + 1}"
+                )
+            sample_width = float(baseline.get("image_width", 0))
+            sample_height = float(baseline.get("image_height", 0))
+            if sample_index == 0:
+                image_width = sample_width
+                image_height = sample_height
+            elif int(sample_width) != int(image_width) or int(sample_height) != int(image_height):
+                raise ValueError("camera resolution changed during recoil calibration")
+            edge_reason, _ = _dot_edge_reason(
+                baseline_dot,
+                image_width,
+                image_height,
+                edge_margin_px,
+                edge_margin_frac,
+            )
+            if edge_reason:
+                raise ValueError(
+                    "baseline laser dot is too close to the image edge; aim nearer the center"
+                )
 
-        water.startWatering(water_duration_sec)
-        water_end_monotonic = time.monotonic() + water_duration_sec
-        time.sleep(recoil_settle_sec)
-        firing, firing_debug = _capture_recoil_laser_dot(
-            run_dir=run_dir,
-            prefix="firing",
-            options=options,
-            laser_settle_sec=laser_settle_sec,
-            capture_timeout_sec=capture_timeout_sec,
-            discard_frames=discard_frames,
-            expected_uv=(
-                float(baseline_dot["cx"]) / image_width,
-                float(baseline_dot["cy"]) / image_height,
-            ),
-            max_expected_distance_fraction=max_shift_fraction,
-        )
-        firing_dot = firing.get("dot")
-        if not isinstance(firing_dot, dict):
-            raise ValueError("laser dot was not detected while the water was firing")
-        if (
-            int(firing.get("image_width", 0)) != int(image_width)
-            or int(firing.get("image_height", 0)) != int(image_height)
-        ):
-            raise ValueError("camera resolution changed during recoil calibration")
+            water.startWatering(water_duration_sec)
+            water_end_monotonic = time.monotonic() + water_duration_sec
+            time.sleep(recoil_settle_sec)
+            firing, firing_debug = _capture_recoil_laser_dot(
+                run_dir=run_dir,
+                prefix=f"{prefix}_firing",
+                options=firing_options,
+                laser_settle_sec=laser_settle_sec,
+                capture_timeout_sec=capture_timeout_sec,
+                discard_frames=discard_frames,
+                expected_uv=(
+                    float(baseline_dot["cx"]) / image_width,
+                    float(baseline_dot["cy"]) / image_height,
+                ),
+                max_expected_distance_fraction=max_shift_fraction,
+            )
+            firing_dot = firing.get("dot")
+            if not isinstance(firing_dot, dict):
+                raise ValueError(
+                    f"laser dot was not detected while firing sample {sample_index + 1}"
+                )
+            if (
+                int(firing.get("image_width", 0)) != int(image_width)
+                or int(firing.get("image_height", 0)) != int(image_height)
+            ):
+                raise ValueError("camera resolution changed during recoil calibration")
+
+            samples.append((baseline_dot, firing_dot))
+            sample_debug.append({
+                "sample": sample_index + 1,
+                "baseline_dot": baseline_dot,
+                "firing_dot": firing_dot,
+                "baseline_debug": baseline_debug,
+                "firing_debug": firing_debug,
+            })
+
+            remaining = water_end_monotonic - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+            water_end_monotonic = None
+            if sample_index + 1 < sample_count:
+                time.sleep(_WATER_RECOVERY_SETTLE_SEC)
+
+        aggregate = median_recoil_sample(samples)
 
         calibration = calculate_recoil_calibration(
-            baseline_dot=baseline_dot,
-            firing_dot=firing_dot,
+            baseline_dot=aggregate["baseline_dot"],
+            firing_dot=aggregate["firing_dot"],
             image_width=image_width,
             image_height=image_height,
             calibration_pan=calibration_pan,
@@ -1547,16 +1592,17 @@ def recoil_calibration_run():
             water_duration_sec=water_duration_sec,
             metadata={
                 "run_id": run_id,
-                "baseline_dot": baseline_dot,
-                "firing_dot": firing_dot,
-                "baseline_debug": baseline_debug,
-                "firing_debug": firing_debug,
+                "aggregation": "component_median",
+                "sample_count": sample_count,
+                "samples": sample_debug,
+                "aggregate": aggregate,
                 "recoil_settle_sec": recoil_settle_sec,
                 "laser_settle_sec": laser_settle_sec,
                 "discard_frames": discard_frames,
                 "aim_rows": aim_rows,
                 "aim_trained": aim_trained,
                 "dot_options": _calibration_dot_options_response(options),
+                "firing_dot_options": _calibration_dot_options_response(firing_options),
             },
         )
         stored = store.latest_recoil_calibration()
@@ -1570,15 +1616,13 @@ def recoil_calibration_run():
         return jsonify({
             "error": str(exc),
             "debug_run_id": run_id,
-            "baseline_debug": baseline_debug,
-            "firing_debug": firing_debug,
+            "samples": sample_debug,
         }), 422
     except Exception as exc:
         return jsonify({
             "error": f"recoil calibration failed: {exc}",
             "debug_run_id": run_id,
-            "baseline_debug": baseline_debug,
-            "firing_debug": firing_debug,
+            "samples": sample_debug,
         }), 500
     finally:
         if water_end_monotonic is not None:
