@@ -21,6 +21,7 @@ from calibration_optimizer import (
 from laser_dot_detector import LaserDotOptions, detect_laser_dot
 from event_bus import EventBus
 from recording_labeler import LabelingInProgress, RecordingLabelService
+from recoil_calibration import calculate_recoil_calibration, compensated_angles
 from .aiming import Calculate_Hose_Angles
 import time
 import re
@@ -60,12 +61,17 @@ current = (135.0, 90.0)
 # Default: don't aim the laser on motion (can be overridden by persisted setting)
 follow_motion_enabled = False
 _last_follow_ts = 0.0
+_FOLLOW_INTERVAL_SEC = 0.18
 
 # Water-on-motion control (disabled by default) with cooldown
 water_on_motion_enabled = False
 _last_water_fire_ts = 0.0
 _WATER_COOLDOWN_SEC = 60.0
+_WATER_PREFIRE_SETTLE_SEC = 0.25
+_WATER_RECOVERY_SETTLE_SEC = 0.25
+_CALIBRATION_POST_PANTILT_MIN_SETTLE_SEC = 0.05
 _calibration_lock = threading.Lock()
+_water_lock = threading.Lock()
 
 # Load persisted settings and apply to webcam and follow-motion
 persisted = store.get_settings([
@@ -350,8 +356,9 @@ def _capture_calibration_sample(
     laser.turn_off()
     pantilt.setPanTilt(pan, tilt)
     current = (pan, tilt)
-    if move_settle_sec > 0:
-        time.sleep(move_settle_sec)
+    # Keep the shared Arduino serial bus quiet briefly after PANTILT, even when
+    # the caller requests no physical servo settling delay.
+    time.sleep(max(move_settle_sec, _CALIBRATION_POST_PANTILT_MIN_SETTLE_SEC))
     try:
         webcam.suppress_motion(move_settle_sec + laser_settle_sec + 1.0)
     except Exception:
@@ -424,6 +431,69 @@ def _capture_calibration_sample(
     return detected, debug
 
 
+def _capture_recoil_laser_dot(
+    *,
+    run_dir: Path,
+    prefix: str,
+    options: LaserDotOptions,
+    laser_settle_sec: float,
+    capture_timeout_sec: float,
+    discard_frames: int,
+    expected_uv: Optional[tuple[float, float]] = None,
+    max_expected_distance_fraction: Optional[float] = None,
+) -> tuple[dict, dict]:
+    """Capture one efficient laser-off/on pair without moving the servos."""
+    off_path = run_dir / f"{prefix}_off.jpg"
+    on_path = run_dir / f"{prefix}_on.jpg"
+    annotated_path = run_dir / f"{prefix}_annotated.jpg"
+    mask_path = run_dir / f"{prefix}_mask.png"
+    score_path = run_dir / f"{prefix}_score.png"
+    debug = {
+        "off_url": _calibration_debug_url(off_path),
+        "on_url": _calibration_debug_url(on_path),
+        "annotated_url": _calibration_debug_url(annotated_path),
+        "mask_url": _calibration_debug_url(mask_path),
+        "score_url": _calibration_debug_url(score_path),
+    }
+
+    laser.turn_off()
+    if laser_settle_sec > 0:
+        time.sleep(laser_settle_sec)
+    webcam.capture_after_discard(
+        off_path,
+        timeout_sec=capture_timeout_sec,
+        raw=True,
+        discard_frames=discard_frames,
+    )
+
+    laser.turn_on()
+    if laser_settle_sec > 0:
+        time.sleep(laser_settle_sec)
+    webcam.capture_after_discard(
+        on_path,
+        timeout_sec=capture_timeout_sec,
+        raw=True,
+        discard_frames=discard_frames,
+    )
+
+    if not off_path.exists() or not on_path.exists():
+        raise RuntimeError("recoil calibration capture failed: image file not written")
+
+    detected = detect_laser_dot(
+        on_path,
+        off_path,
+        options=options,
+        debug_paths={
+            "annotated": annotated_path,
+            "mask": mask_path,
+            "score": score_path,
+        },
+        expected_uv=expected_uv,
+        max_expected_distance_fraction=max_expected_distance_fraction,
+    )
+    return detected, debug
+
+
 def _dot_edge_reason(dot: dict, img_w: float, img_h: float, edge_margin_px: float, edge_margin_frac: float) -> tuple[Optional[str], float]:
     dot_x = float(dot["x"])
     dot_y = float(dot["y"])
@@ -438,6 +508,78 @@ def _dot_edge_reason(dot: dict, img_w: float, img_h: float, edge_margin_px: floa
     ):
         return "dot clipped at image edge", effective_edge_margin
     return None, effective_edge_margin
+
+
+class WaterBusyError(RuntimeError):
+    pass
+
+
+def _fire_water(duration: float) -> dict:
+    """Fire once, applying the latest persisted recoil calibration if present."""
+    if _calibration_lock.locked():
+        raise WaterBusyError("calibration is running")
+    if not _water_lock.acquire(blocking=False):
+        raise WaterBusyError("water is already firing")
+
+    original_pan, original_tilt = current
+    compensated_pan = original_pan
+    compensated_tilt = original_tilt
+    calibration = None
+    moved_for_compensation = False
+    fired = False
+    try:
+        calibration = store.latest_recoil_calibration()
+        if calibration is not None:
+            compensated_pan, compensated_tilt = compensated_angles(
+                pan=original_pan,
+                tilt=original_tilt,
+                calibration=calibration,
+                pan_min=float(getattr(pantilt, "PAN_MIN_SAFE_DEG", 0.0)),
+                pan_max=float(
+                    getattr(
+                        pantilt,
+                        "PAN_MAX_SAFE_DEG",
+                        getattr(pantilt, "PAN_MAX_DEG", 180.0),
+                    )
+                ),
+                tilt_min=float(getattr(pantilt, "TILT_MIN_SAFE_DEG", 0.0)),
+                tilt_max=float(
+                    getattr(
+                        pantilt,
+                        "TILT_MAX_SAFE_DEG",
+                        getattr(pantilt, "TILT_MAX_DEG", 180.0),
+                    )
+                ),
+            )
+            pantilt.setPanTilt(compensated_pan, compensated_tilt)
+            moved_for_compensation = True
+            time.sleep(_WATER_PREFIRE_SETTLE_SEC)
+
+        water.startWatering(duration)
+        fired = True
+        # TIMED-ON returns after scheduling the valve close. Keep tracking from
+        # replacing the compensated aim until the physical spray is finished.
+        time.sleep(duration)
+        if moved_for_compensation:
+            time.sleep(_WATER_RECOVERY_SETTLE_SEC)
+    finally:
+        try:
+            if moved_for_compensation:
+                pantilt.setPanTilt(original_pan, original_tilt)
+        finally:
+            _water_lock.release()
+
+    return {
+        "duration": duration,
+        "fired": fired,
+        "compensated": calibration is not None,
+        "recoil_calibration_id": calibration.get("id") if calibration else None,
+        "original_pan": original_pan,
+        "original_tilt": original_tilt,
+        "firing_pan": compensated_pan,
+        "firing_tilt": compensated_tilt,
+    }
+
 
 ## DB initialized by ClickStore on import
 
@@ -836,6 +978,8 @@ def recordings_clear():
 
 @app.post('/api/pan-tilt')
 def set_pan_tilt():
+    if _water_lock.locked():
+        return jsonify({"error": "aim is locked while water is firing"}), 409
     data = request.get_json(silent=True) or {}
     if 'pan' not in data or 'tilt' not in data:
         return jsonify({"error": "pan and tilt required"}), 400
@@ -1277,12 +1421,191 @@ def motion_water_get():
     })
 
 
+@app.get('/api/calibration/recoil')
+def recoil_calibration_get():
+    calibration = store.latest_recoil_calibration()
+    return jsonify({
+        "status": "ok",
+        "calibrated": calibration is not None,
+        "calibration": calibration,
+    })
+
+
+@app.post('/api/calibration/recoil')
+def recoil_calibration_run():
+    global follow_motion_enabled, water_on_motion_enabled
+
+    if not _calibration_lock.acquire(blocking=False):
+        return jsonify({"error": "calibration is already running"}), 409
+    if not _water_lock.acquire(blocking=False):
+        _calibration_lock.release()
+        return jsonify({"error": "water is already firing"}), 409
+
+    data = request.get_json(silent=True) or {}
+    try:
+        water_duration_sec = max(1.0, min(5.0, float(data.get("water_duration_sec", 2.0))))
+        recoil_settle_sec = max(0.05, min(1.0, float(data.get("recoil_settle_sec", 0.25))))
+        laser_settle_sec = max(0.0, min(1.0, float(data.get("laser_settle_sec", 0.1))))
+        capture_timeout_sec = max(0.1, min(5.0, float(data.get("capture_timeout_sec", 2.0))))
+        discard_frames = max(0, min(10, int(data.get("discard_frames", 2))))
+        edge_margin_px = max(0.0, min(200.0, float(data.get("edge_margin_px", 20.0))))
+        edge_margin_frac = max(0.0, min(0.25, float(data.get("edge_margin_frac", 0.03))))
+        max_shift_fraction = max(0.01, min(0.5, float(data.get("max_shift_fraction", 0.2))))
+        options = _parse_laser_dot_options(data)
+    except (TypeError, ValueError) as exc:
+        _water_lock.release()
+        _calibration_lock.release()
+        return jsonify({"error": str(exc)}), 400
+
+    original_follow = bool(follow_motion_enabled)
+    original_water_on_motion = bool(water_on_motion_enabled)
+    original_laser_enabled = bool(globals().get("laser_enabled", False))
+    calibration_pan, calibration_tilt = current
+    try:
+        run_id, run_dir = _new_calibration_run("recoil")
+    except Exception as exc:
+        _water_lock.release()
+        _calibration_lock.release()
+        return jsonify({"error": f"could not create recoil calibration run: {exc}"}), 500
+    baseline_debug = None
+    firing_debug = None
+    water_end_monotonic = None
+
+    try:
+        follow_motion_enabled = False
+        water_on_motion_enabled = False
+        try:
+            webcam.suppress_motion(water_duration_sec + 1.0)
+        except Exception:
+            pass
+
+        aimer, aim_rows, aim_trained = _build_aimer()
+        if not aim_trained:
+            raise ValueError(
+                "automatic aim calibration is required before recoil calibration"
+            )
+
+        baseline, baseline_debug = _capture_recoil_laser_dot(
+            run_dir=run_dir,
+            prefix="baseline",
+            options=options,
+            laser_settle_sec=laser_settle_sec,
+            capture_timeout_sec=capture_timeout_sec,
+            discard_frames=discard_frames,
+        )
+        baseline_dot = baseline.get("dot")
+        if not isinstance(baseline_dot, dict):
+            raise ValueError("laser dot was not detected before firing")
+        image_width = float(baseline.get("image_width", 0))
+        image_height = float(baseline.get("image_height", 0))
+        edge_reason, _ = _dot_edge_reason(
+            baseline_dot,
+            image_width,
+            image_height,
+            edge_margin_px,
+            edge_margin_frac,
+        )
+        if edge_reason:
+            raise ValueError("baseline laser dot is too close to the image edge; aim nearer the center")
+
+        water.startWatering(water_duration_sec)
+        water_end_monotonic = time.monotonic() + water_duration_sec
+        time.sleep(recoil_settle_sec)
+        firing, firing_debug = _capture_recoil_laser_dot(
+            run_dir=run_dir,
+            prefix="firing",
+            options=options,
+            laser_settle_sec=laser_settle_sec,
+            capture_timeout_sec=capture_timeout_sec,
+            discard_frames=discard_frames,
+            expected_uv=(
+                float(baseline_dot["cx"]) / image_width,
+                float(baseline_dot["cy"]) / image_height,
+            ),
+            max_expected_distance_fraction=max_shift_fraction,
+        )
+        firing_dot = firing.get("dot")
+        if not isinstance(firing_dot, dict):
+            raise ValueError("laser dot was not detected while the water was firing")
+        if (
+            int(firing.get("image_width", 0)) != int(image_width)
+            or int(firing.get("image_height", 0)) != int(image_height)
+        ):
+            raise ValueError("camera resolution changed during recoil calibration")
+
+        calibration = calculate_recoil_calibration(
+            baseline_dot=baseline_dot,
+            firing_dot=firing_dot,
+            image_width=image_width,
+            image_height=image_height,
+            calibration_pan=calibration_pan,
+            calibration_tilt=calibration_tilt,
+            aimer=aimer,
+        )
+        calibration_id = store.record_recoil_calibration(
+            calibration,
+            water_duration_sec=water_duration_sec,
+            metadata={
+                "run_id": run_id,
+                "baseline_dot": baseline_dot,
+                "firing_dot": firing_dot,
+                "baseline_debug": baseline_debug,
+                "firing_debug": firing_debug,
+                "recoil_settle_sec": recoil_settle_sec,
+                "laser_settle_sec": laser_settle_sec,
+                "discard_frames": discard_frames,
+                "aim_rows": aim_rows,
+                "aim_trained": aim_trained,
+                "dot_options": _calibration_dot_options_response(options),
+            },
+        )
+        stored = store.latest_recoil_calibration()
+        return jsonify({
+            "status": "ok",
+            "calibrated": True,
+            "calibration_id": calibration_id,
+            "calibration": stored,
+        })
+    except ValueError as exc:
+        return jsonify({
+            "error": str(exc),
+            "debug_run_id": run_id,
+            "baseline_debug": baseline_debug,
+            "firing_debug": firing_debug,
+        }), 422
+    except Exception as exc:
+        return jsonify({
+            "error": f"recoil calibration failed: {exc}",
+            "debug_run_id": run_id,
+            "baseline_debug": baseline_debug,
+            "firing_debug": firing_debug,
+        }), 500
+    finally:
+        if water_end_monotonic is not None:
+            remaining = water_end_monotonic - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+        try:
+            if original_laser_enabled:
+                laser.turn_on()
+            else:
+                laser.turn_off()
+        finally:
+            follow_motion_enabled = original_follow
+            water_on_motion_enabled = original_water_on_motion
+            _water_lock.release()
+            _calibration_lock.release()
+
+
 @app.post('/api/calibration/automatic')
 def automatic_calibration():
-    global current, follow_motion_enabled
+    global current, follow_motion_enabled, water_on_motion_enabled
 
     if not _calibration_lock.acquire(blocking=False):
         return jsonify({"error": "automatic calibration is already running"}), 409
+    if not _water_lock.acquire(blocking=False):
+        _calibration_lock.release()
+        return jsonify({"error": "water is already firing"}), 409
 
     data = request.get_json(silent=True) or {}
     try:
@@ -1309,12 +1632,14 @@ def automatic_calibration():
         edge_margin_frac = max(0.0, min(0.25, float(data.get("edge_margin_frac", 0.03))))
         options = _parse_laser_dot_options(data)
     except (TypeError, ValueError) as e:
+        _water_lock.release()
         _calibration_lock.release()
         return jsonify({"error": str(e)}), 400
 
     targets = screen_targets(rows, cols, screen_margin)
     original_current = current
     original_follow = bool(globals().get("follow_motion_enabled", False))
+    original_water_on_motion = bool(globals().get("water_on_motion_enabled", False))
     original_laser_enabled = bool(globals().get("laser_enabled", False))
     saved: list[dict] = []
     misses: list[dict] = []
@@ -1332,7 +1657,11 @@ def automatic_calibration():
     attempt_index = 0
 
     try:
+        # Calibration owns the shared Arduino command channel. Prevent motion
+        # callbacks from interleaving servo or valve commands with laser
+        # capture commands; persisted user preferences are left unchanged.
         follow_motion_enabled = False
+        water_on_motion_enabled = False
         try:
             webcam.suppress_motion(move_settle_sec + laser_settle_sec + 1.0)
         except Exception:
@@ -1530,6 +1859,8 @@ def automatic_calibration():
         except Exception:
             pass
         follow_motion_enabled = original_follow
+        water_on_motion_enabled = original_water_on_motion
+        _water_lock.release()
         _calibration_lock.release()
 
     activated_count = 0
@@ -1640,6 +1971,8 @@ def aim_to_click():
     """
 
     global current
+    if _water_lock.locked():
+        return jsonify({"error": "aim is locked while water is firing"}), 409
     data = request.get_json(silent=True) or {}
     try:
         x = float(data.get('x'))
@@ -1707,7 +2040,7 @@ def aim_to_click():
 def _on_motion(evt: dict) -> None:
     global follow_motion_enabled, _last_follow_ts, current
     try:
-        if not follow_motion_enabled:
+        if _calibration_lock.locked() or _water_lock.locked() or not follow_motion_enabled:
             return
         u = evt.get('u')
         v = evt.get('v')
@@ -1715,7 +2048,7 @@ def _on_motion(evt: dict) -> None:
             return
         now = time.time()
         # Throttle movements to ~5 Hz
-        if (now - _last_follow_ts) < 0.18:
+        if (now - _last_follow_ts) < _FOLLOW_INTERVAL_SEC:
             return
         _last_follow_ts = now
 
@@ -1723,12 +2056,13 @@ def _on_motion(evt: dict) -> None:
         pred_pan, pred_tilt = aimer.predict(float(u), float(v))
         new_pan = _clamp(pred_pan, 0.0, float(getattr(pantilt, 'PAN_MAX_DEG', 180)))
         new_tilt = _clamp(pred_tilt, 0.0, float(getattr(pantilt, 'TILT_MAX_DEG', 180)))
-        pantilt.setPanTilt(new_pan, new_tilt)
-        # Briefly suppress motion to avoid feedback from the laser dot and servo motion
+        # Keep feedback suppression inside the same interval used to throttle
+        # aiming, rather than adding a separate dead period after every move.
         try:
-            webcam.suppress_motion(0.5)
+            webcam.suppress_motion(_FOLLOW_INTERVAL_SEC)
         except Exception:
             pass
+        pantilt.setPanTilt(new_pan, new_tilt)
         current = (new_pan, new_tilt)
     except Exception:
         # Avoid crashing the bus on handler errors
@@ -1742,7 +2076,7 @@ bus.subscribe('motion', _on_motion)
 def _on_motion_water(evt: dict) -> None:
     global water_on_motion_enabled, _last_water_fire_ts
     try:
-        if not water_on_motion_enabled:
+        if _calibration_lock.locked() or _water_lock.locked() or not water_on_motion_enabled:
             return
         if isinstance(evt, dict) and evt.get('detector') == 'combined' and not bool(evt.get('squirrel_detected')):
             return
@@ -1760,8 +2094,19 @@ def _on_motion_water(evt: dict) -> None:
         def _do_fire():
             water._serial.trace_event("auto-water-thread-start")
             try:
-                water.startWatering(2.0)
-                water._serial.trace_event("auto-water-thread-success")
+                # The calibration lock may have been acquired after the event
+                # callback launched this thread but before the thread ran.
+                if _calibration_lock.locked() or not water_on_motion_enabled:
+                    water._serial.trace_event("auto-water-thread-skipped-calibration")
+                    return
+                result = _fire_water(2.0)
+                water._serial.trace_event(
+                    "auto-water-thread-success "
+                    f"compensated={result['compensated']!r} "
+                    f"recoil_calibration_id={result['recoil_calibration_id']!r}"
+                )
+            except WaterBusyError as exc:
+                water._serial.trace_event(f"auto-water-thread-skipped-busy value={exc!r}")
             except Exception as exc:
                 water._serial.trace_event(
                     f"auto-water-thread-error type={type(exc).__name__} value={exc!r}"
@@ -1938,7 +2283,9 @@ def water_fire():
     # Clamp to a reasonable range to avoid accidents
     duration = _clamp(duration, 0.1, 10.0)
     try:
-        water.startWatering(duration)
+        result = _fire_water(duration)
+    except WaterBusyError as e:
+        return jsonify({"error": str(e)}), 409
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    return jsonify({"status": "ok", "duration": duration})
+    return jsonify({"status": "ok", **result})

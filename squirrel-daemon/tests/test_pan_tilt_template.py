@@ -24,6 +24,12 @@ class PanTiltTemplateInteractionTests(unittest.TestCase):
         self.assertNotIn('id="record-clicks"', self.template)
         self.assertNotIn("recordToggle", self.template)
 
+    def test_recoil_calibration_and_compensated_fire_controls_are_wired(self) -> None:
+        self.assertIn('id="calibrate-recoil"', self.template)
+        self.assertIn("fetch('/api/calibration/recoil'", self.template)
+        self.assertIn('id="recoil-calibration-status"', self.template)
+        self.assertIn("data.recoil_calibration_id", self.template)
+
 
 if __name__ == "__main__":
     unittest.main()

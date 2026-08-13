@@ -181,9 +181,14 @@
 
       <section class="panel" style="margin-top: 16px;">
         <h2>Water</h2>
-        <div class="actions" style="display:flex; gap:8px; align-items:center;">
+        <div class="hint" style="margin-bottom:8px;">
+          For recoil calibration, aim the laser near the center of a stationary surface. The calibration
+          fires water for two seconds, measures how far the laser moves, and saves the correction.
+        </div>
+        <div class="actions" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <button id="calibrate-recoil" class="secondary">Calibrate Recoil</button>
           <button id="fire-water" class="accent danger">Fire 💦 (2s)</button>
-          <div class="hint">Sends a command to spray water for 2 seconds.</div>
+          <div id="recoil-calibration-status" class="hint">Checking recoil calibration…</div>
         </div>
       </section>
 
@@ -811,7 +816,61 @@
         }
       });
 
-      // Fire water (2 seconds)
+      function describePixelDirection(x, y) {
+        const horizontal = Math.abs(x) < 0.05 ? '' : `${Math.abs(x).toFixed(1)}px ${x < 0 ? 'left' : 'right'}`;
+        const vertical = Math.abs(y) < 0.05 ? '' : `${Math.abs(y).toFixed(1)}px ${y < 0 ? 'up' : 'down'}`;
+        return [horizontal, vertical].filter(Boolean).join(', ') || 'less than 0.1px';
+      }
+
+      const recoilBtn = document.getElementById('calibrate-recoil');
+      const recoilStatus = document.getElementById('recoil-calibration-status');
+      function showRecoilCalibration(calibration) {
+        if (!recoilStatus) return;
+        if (!calibration) {
+          recoilStatus.textContent = 'Not calibrated; firing uses the normal aim position.';
+          return;
+        }
+        recoilStatus.textContent = `Recoil #${calibration.id}: laser moved ${describePixelDirection(calibration.shift_x_px, calibration.shift_y_px)}; correction is applied while firing.`;
+      }
+
+      async function refreshRecoilCalibration() {
+        try {
+          const res = await fetch('/api/calibration/recoil');
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || res.statusText);
+          showRecoilCalibration(data.calibration);
+        } catch (e) {
+          recoilStatus.textContent = `Could not load recoil calibration: ${e}`;
+        }
+      }
+
+      recoilBtn?.addEventListener('click', async () => {
+        if (!confirm('Recoil calibration will turn on the laser and fire water for two seconds. Continue?')) return;
+        recoilBtn.disabled = true;
+        const originalText = recoilBtn.textContent;
+        recoilBtn.textContent = 'Calibrating…';
+        recoilStatus.textContent = 'Capturing the stationary and firing laser positions…';
+        try {
+          const res = await fetch('/api/calibration/recoil', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ water_duration_sec: 2 })
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || res.statusText);
+          showRecoilCalibration(data.calibration);
+        } catch (e) {
+          recoilStatus.textContent = `Recoil calibration failed: ${e.message || e}`;
+          alert(recoilStatus.textContent);
+        } finally {
+          recoilBtn.disabled = false;
+          recoilBtn.textContent = originalText;
+        }
+      });
+
+      refreshRecoilCalibration();
+
+      // Fire water (2 seconds), with persisted recoil compensation when available.
       const fireBtn = document.getElementById('fire-water');
       fireBtn?.addEventListener('click', async () => {
         fireBtn.disabled = true;
@@ -821,13 +880,16 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ duration: 2 })
           });
-          if (!res.ok) console.error('Failed to fire water');
-          await res.json().catch(() => ({}));
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || res.statusText);
+          recoilStatus.textContent = data.compensated
+            ? `Fired with recoil calibration #${data.recoil_calibration_id}.`
+            : 'Fired without recoil compensation; calibrate recoil to enable it.';
         } catch (e) {
           console.error('Error firing water', e);
+          recoilStatus.textContent = `Water firing failed: ${e.message || e}`;
         } finally {
-          // Ensure button re-enables even if the request blocks briefly
-          setTimeout(() => { fireBtn.disabled = false; }, 2100);
+          fireBtn.disabled = false;
         }
       });
     </script>

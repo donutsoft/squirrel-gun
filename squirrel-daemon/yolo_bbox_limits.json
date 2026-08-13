@@ -1,7 +1,7 @@
 {
-  "bbox_count": 545,
-  "max_area_frac": 0.1128125,
-  "max_height_frac": 0.3,
-  "max_width_frac": 0.5,
+  "bbox_count": 570,
+  "max_area_frac": 0.16890624999999998,
+  "max_height_frac": 0.31875,
+  "max_width_frac": 0.7125,
   "size_multiplier": 2.0
 }

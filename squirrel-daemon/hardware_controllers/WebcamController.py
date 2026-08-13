@@ -77,7 +77,7 @@ class WebcamController:
         self._frame_buffer_lock = threading.Lock()
         self._frame_buffer_bytes = 0
         self._frame_buffer_max_bytes = 256 * 1024 * 1024
-        self._frame_buffer_target_fps = 3.0
+        self._frame_buffer_target_fps = 9.0
         self._last_buffered_frame_ts = 0.0
         self._pending_persist_timer: Optional[threading.Timer] = None
         self._persist_timer_lock = threading.Lock()

@@ -74,6 +74,37 @@ class ClickStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS recoil_calibrations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at REAL NOT NULL,
+                    baseline_x_px REAL NOT NULL,
+                    baseline_y_px REAL NOT NULL,
+                    firing_x_px REAL NOT NULL,
+                    firing_y_px REAL NOT NULL,
+                    shift_x_px REAL NOT NULL,
+                    shift_y_px REAL NOT NULL,
+                    shift_magnitude_px REAL NOT NULL,
+                    compensation_x_px REAL NOT NULL,
+                    compensation_y_px REAL NOT NULL,
+                    compensation_u REAL NOT NULL,
+                    compensation_v REAL NOT NULL,
+                    pan_offset_deg REAL NOT NULL,
+                    tilt_offset_deg REAL NOT NULL,
+                    img_w REAL NOT NULL,
+                    img_h REAL NOT NULL,
+                    calibration_pan REAL NOT NULL,
+                    calibration_tilt REAL NOT NULL,
+                    water_duration_sec REAL NOT NULL,
+                    metadata TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_recoil_calibrations_created_at "
+                "ON recoil_calibrations(created_at DESC)"
+            )
 
     def record(self, pan: float, tilt: float, x_px: float, y_px: float, img_w: float, img_h: float) -> int:
         with self._connect() as conn:
@@ -147,6 +178,45 @@ class ClickStore:
                 (limit, offset),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # --- Recoil calibration ---
+    def record_recoil_calibration(
+        self,
+        calibration: Dict[str, Any],
+        *,
+        water_duration_sec: float,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        columns = (
+            "baseline_x_px", "baseline_y_px", "firing_x_px", "firing_y_px",
+            "shift_x_px", "shift_y_px", "shift_magnitude_px",
+            "compensation_x_px", "compensation_y_px", "compensation_u", "compensation_v",
+            "pan_offset_deg", "tilt_offset_deg", "img_w", "img_h",
+            "calibration_pan", "calibration_tilt",
+        )
+        values = [float(calibration[name]) for name in columns]
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO recoil_calibrations("
+                "created_at, " + ", ".join(columns) + ", water_duration_sec, metadata"
+                ") VALUES (" + ", ".join(["?"] * (len(columns) + 3)) + ")",
+                [time.time(), *values, float(water_duration_sec), json.dumps(metadata or {})],
+            )
+            return int(cur.lastrowid)
+
+    def latest_recoil_calibration(self) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM recoil_calibrations ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            result["metadata"] = json.loads(result.get("metadata", "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("stored recoil calibration metadata is invalid")
+        return result
 
     # --- Settings ---
     def set_setting(self, key: str, value: Any) -> None:

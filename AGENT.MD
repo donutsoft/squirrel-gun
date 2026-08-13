@@ -89,6 +89,13 @@ This document captures the working knowledge added while extending the project: 
 - Measurements remain in memory until a later full-grid round validates the fitted model. A converged, axis-monotonic run is written and activated. When no prior model exists, a non-converged checkpoint may be activated only if it is monotonic, passes a conservative error ceiling, and has validation evidence spanning both axes and all four screen quadrants; otherwise the prior calibration remains unchanged.
 - The calibration UI requires one click. Accuracy and timing controls remain available under an advanced settings disclosure.
 
+## Water Recoil Calibration
+- The Water panel exposes a **Calibrate Recoil** button. Aim the laser near the center of a stationary surface before using it; the workflow deliberately fires water for two seconds.
+- POST `/api/calibration/recoil` captures the laser before and during the water pulse, measures the pixel displacement, and uses the trained aim model to convert the opposite displacement into local pan/tilt offsets.
+- Every successful measurement is appended to the `recoil_calibrations` table in `clicks.db`, including raw positions, pixel and normalized offsets, angle offsets, capture parameters, and debug-image metadata. GET `/api/calibration/recoil` returns the latest record.
+- Manual and motion-triggered water firing use the latest recoil record. The daemon prepositions to the compensated angles, keeps motion aiming locked for the valve duration, then restores the normal aim.
+- Automatic aim calibration and recoil calibration require exclusive access to the water and pan/tilt workflow so valve, servo, and laser commands cannot interleave.
+
 ## Notes, Caveats, and Limits
 - Video codec/container: Uses `mp4v` in `.mp4`. If your OpenCV build lacks this codec, consider switching to `.avi` with `XVID` or `MJPG` for broad compatibility.
 - Concurrency: Recording writes are guarded by `_recording_lock`. Frames are captured in the streaming thread; no additional thread for recording.

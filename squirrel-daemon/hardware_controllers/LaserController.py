@@ -14,7 +14,13 @@ class LaserController:
     def turn_on(self):
         self._serial.trace_event(f"laser-on-start pin={self._pin}")
         print("Turning on the laser.")
-        response = self._serial.command("ON", self._pin)
+        try:
+            response = self._serial.command("ON", self._pin)
+        except TimeoutError:
+            # ON is idempotent. The serial transport closes its descriptor on a
+            # timeout, so retrying also reopens the Arduino connection cleanly.
+            self._serial.trace_event(f"laser-on-retry pin={self._pin}")
+            response = self._serial.command("ON", self._pin)
         self._serial.trace_event(f"laser-on-complete pin={self._pin} response={response!r}")
 
     def turn_off(self):
